@@ -126,6 +126,11 @@ struct Status {
     var tcpipPort = ""
     var tcpipListen = false
     var autoTcpip = false
+    // 传输速率（Mac 视角：手机→Mac 为下行）
+    var rateDownHuman = ""
+    var rateUpHuman = ""
+    var rateTotalDown = ""
+    var rateTotalUp = ""
     // 结构化诊断结论（由脚本层统一给出，与 TUI 完全同源）
     var diagLevel = ""
     var diagTitle = ""
@@ -170,6 +175,10 @@ func loadStatus() -> Status {
     s.tcpipPort = kv["TCPIP_PORT"] ?? ""
     s.tcpipListen = (kv["TCPIP_LISTEN"] ?? "0") == "1"
     s.autoTcpip = (kv["AUTO_TCPIP"] ?? "0") == "1"
+    s.rateDownHuman = kv["RATE_DOWN_HUMAN"] ?? ""
+    s.rateUpHuman = kv["RATE_UP_HUMAN"] ?? ""
+    s.rateTotalDown = kv["RATE_TOTAL_DOWN_MB"] ?? ""
+    s.rateTotalUp = kv["RATE_TOTAL_UP_MB"] ?? ""
     s.diagLevel = kv["DIAG_LEVEL"] ?? ""
     s.diagTitle = kv["DIAG_TITLE"] ?? ""
     s.diagHint = kv["DIAG_HINT"] ?? ""
@@ -395,6 +404,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if !s.devModel.isEmpty {
             menu.addItem(disabledItem("  手机：" + s.devModel))
+        }
+        // 传输速率：只在有设备时显示，避免无连接时的无用信息
+        if !s.allDevices.isEmpty && !s.rateDownHuman.isEmpty {
+            menu.addItem(disabledItem(
+                "  ↓ \(s.rateDownHuman)   ↑ \(s.rateUpHuman)",
+                tooltip: "adb 传输速率（↓ 手机→Mac，↑ Mac→手机）"))
+            if !s.rateTotalDown.isEmpty {
+                menu.addItem(disabledItem(
+                    "  累计：收 \(s.rateTotalDown) MB / 发 \(s.rateTotalUp) MB"))
+            }
         }
 
         menu.addItem(.separator())

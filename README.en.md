@@ -316,6 +316,7 @@ After that the endpoint is remembered and automatic reconnection takes over.
 | `./bin/adb-wifi.sh open` | Open the **Wireless debugging** page on the phone |
 | `./bin/adb-wifi.sh open dev` | Open the **Developer options** page on the phone |
 | `./bin/adb-wifi.sh recover` | Actively restore the wireless connection (**no USB needed**) |
+| `./bin/adb-wifi.sh rate [secs]` | Show current adb transfer rate (default 1 s sample) |
 
 Log location: `~/Library/Application Support/adb-wifi-manager/logs/adb-wifi.log`
 
@@ -590,6 +591,56 @@ For full performance data and optimization details, see
 - When the phone switches to a Wi-Fi network that forbids client-to-client traffic (AP isolation)
 
 Otherwise drops, IP changes, and Mac sleep/wake are all recovered automatically.
+
+---
+
+## Transfer Rate Monitoring
+
+Displays bidirectional adb transfer rates in real time — no extra tools needed.
+
+| Entry point | Display |
+|---|---|
+| Menu bar | `↓ 1.2 MB/s   ↑ 0 KB/s` plus cumulative totals |
+| TUI | "Transfer: ↓ … ↑ …" in the status area, plus totals |
+| CLI | `./bin/adb-wifi.sh rate 2` |
+
+### Data source and trade-offs
+
+adb **has no built-in rate command**, so the rate must be sampled and computed locally.
+
+| Approach | Accuracy | Cost | Verdict |
+|---|---|---|---|
+| Read `netstat -anv` connection byte counters | High, available locally on the Mac | <10 ms per call, non-intrusive | ✅ **adopted** |
+| Read device `/proc/net/dev` | High, but includes all phone app traffic | Needs `adb shell`, which **blocks during pull/push** | ❌ rejected |
+| `nettop` | Medium, aggregated per process | Parsing overhead, coarse | ❌ rejected |
+
+The key reason: the device-side approach runs `adb shell`, which was measured to deadlock
+during a large `adb pull`, whereas netstat reads locally and never interferes with transfers.
+
+### Field mapping (measured, not assumed)
+
+The byte columns in macOS `netstat -anv -p tcp` are easy to get wrong. Verified with real transfers:
+
+| Operation | Field 7 | Field 8 | Conclusion |
+|---|---|---|---|
+| `adb pull` (phone → Mac) | **+4.38 MB** | +72 bytes | Field 7 = **downlink** |
+| `adb push` (Mac → phone) | +626 bytes | **+2.79 MB** | Field 8 = **uplink** |
+
+So `↓` uses field 7 and `↑` uses field 8. Note also that `$N` column access in macOS awk is
+unreliable — anchor on `ESTABLISHED` with a whole-line regex and use `split` instead.
+
+### Sampling strategy
+
+- **Non-blocking**: `diag` is called frequently by the menu bar, so it must never `sleep`;
+  each call takes one sample and computes the delta
+- **Interval guard**: returns 0 when two samples are less than 200 ms apart, avoiding
+  division by zero and jitter
+- **Rollback detection**: a reconnected link resets cumulative counters, so such deltas are
+  discarded rather than shown as negative or absurd values
+- **Millisecond precision**: timestamps come from `perl`, avoiding the truncation error of `date +%s`
+
+> The local wireless link shows large latency jitter (9–420 ms), so throughput fluctuates.
+> Taking several samples is more meaningful than trusting a single reading.
 
 ---
 

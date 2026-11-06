@@ -961,6 +961,117 @@ cmd_recover() {
     return 1
 }
 
+# ------------------------------------------------- 流量监控
+# 统计本机与手机 adb 端口之间的实时传输速率。
+#
+# 数据源：`netstat -anv -p tcp` 里的连接字节计数（第 7 列发送、第 8 列接收）。
+# 为什么不用设备端 /proc/net/dev：
+#   1) 那是手机 wlan0 的总流量，含所有 App，不纯粹是 adb
+#   2) 需要 `adb shell`，与正在进行的 adb pull/push 会互相阻塞（实测会卡死）
+# Mac 侧 netstat 完全零侵入，且单次 <10ms，适合常驻采样。
+#
+# 速率需要两次采样求差，因此用一个状态文件保存上次的值与时间。
+
+RATE_FILE="$STATE_DIR/rate_state"     # 格式: 时间戳 发送字节 接收字节
+
+# 取当前 adb 连接的累计字节数，输出 "下行 上行"（Mac 视角：手机→Mac 为下行）
+# 同一设备可能有多个 TCP 连接（控制连接 + 数据连接），全部累加。
+#
+# 字段映射来自实测（不是纸面定义），用 pull/push 分别验证：
+#   1) adb pull（手机→Mac）：字段 7 增长 4.38MB，字段 8 只增 72 字节
+#   2) adb push（Mac→手机）：字段 8 增长 2.79MB，字段 7 只增 626 字节
+# 因此：字段 7 = 下行（接收），字段 8 = 上行（发送）。
+#
+# 注意：不要用 awk 的 $N 取列——macOS 的字段切分与 netstat 列并非稳定对应，
+# 改用整行正则锚定「远端端口 + ESTABLISHED」再 split 取值。
+adb_conn_bytes() {
+    local port="${1:-$TCPIP_PORT}"
+    netstat -anv -p tcp 2>/dev/null | awk -v p="\\.$port" '
+        $0 ~ p "[[:space:]]+ESTABLISHED" {
+            n = split($0, f, /[[:space:]]+/)
+            # netstat 输出行首无前导空白，split 编号与列号一致：
+            #   第 7 列 = 下行 → f[7]      第 8 列 = 上行 → f[8]
+            down += f[7]; up += f[8]
+        }
+        END { printf "%.0f %.0f\n", down, up }'
+}
+
+# 采样一次并计算速率，输出: 下行KB/s 上行KB/s 累计下行MB 累计上行MB
+# 首次调用只建立基线，速率返回 0
+# 当前毫秒时间戳（perl 取，精度足够且无需额外依赖）
+now_ms() {
+    perl -MTime::HiRes=time -e 'printf "%.0f", time()*1000'
+}
+
+# 采样一次并计算速率，输出: 下行KB/s 上行KB/s 累计下行MB 累计上行MB
+# 首次调用只建立基线（速率返回 0）
+sample_rate() {
+    local port="${1:-$TCPIP_PORT}" now cur down up pdown pup pt dt_ms d_down d_up
+
+    now=$(now_ms)
+    cur=$(adb_conn_bytes "$port")
+    down=$(echo "$cur" | awk '{print $1}')
+    up=$(echo "$cur" | awk '{print $2}')
+    case "$down" in ''|*[!0-9]*) down=0 ;; esac
+    case "$up"   in ''|*[!0-9]*) up=0 ;; esac
+
+    if [ -f "$RATE_FILE" ]; then
+        read -r pt pdown pup < "$RATE_FILE" 2>/dev/null
+    fi
+    case "$pt"    in ''|*[!0-9]*) pt=$now ;; esac
+    case "$pdown" in ''|*[!0-9]*) pdown=$down ;; esac
+    case "$pup"   in ''|*[!0-9]*) pup=$up ;; esac
+
+    echo "$now $down $up" > "$RATE_FILE"
+
+    dt_ms=$(( now - pt ))
+    d_down=$(( down - pdown ))
+    d_up=$(( up - pup ))
+
+    # 间隔过短，或计数器回退（连接重建归零）→ 本次不给速率，只报累计
+    if [ "$dt_ms" -lt 200 ] || [ "$d_down" -lt 0 ] || [ "$d_up" -lt 0 ]; then
+        awk -v d="$down" -v u="$up" 'BEGIN{printf "0 0 %.2f %.2f\n", d/1048576, u/1048576}'
+        return 0
+    fi
+    awk -v dd="$d_down" -v du="$d_up" -v ms="$dt_ms" -v d="$down" -v u="$up" 'BEGIN {
+        sec = ms / 1000.0
+        printf "%.1f %.1f %.2f %.2f\n", dd/sec/1024, du/sec/1024, d/1048576, u/1048576
+    }'
+}
+
+# 把 KB/s 格式化成易读形式
+fmt_rate() {
+    awk -v v="$1" 'BEGIN {
+        if (v < 1)          printf "0 KB/s"
+        else if (v < 1024)  printf "%.0f KB/s", v
+        else                printf "%.2f MB/s", v/1024
+    }'
+}
+
+# 采样时长必须 >=1s，netstat 计数按秒级有意义，太短会剧烈抖动
+cmd_rate() {
+    local interval="${1:-1}" line dl ul rx tx
+    if [ -z "$(wifi_devices)" ] && [ -z "$(all_serial)" ]; then
+        echo "✗ 未检测到已连接的设备"
+        return 1
+    fi
+    case "$interval" in ''|*[!0-9]*) interval=1 ;; esac
+    [ "$interval" -lt 1 ] && interval=1
+
+    rm -f "$RATE_FILE"            # 从干净基线开始
+    _=$(sample_rate "$TCPIP_PORT")
+    sleep "$interval"
+    line=$(sample_rate "$TCPIP_PORT")
+    dl=$(echo "$line" | awk '{print $1}')
+    ul=$(echo "$line" | awk '{print $2}')
+    rx=$(echo "$line" | awk '{print $3}')
+    tx=$(echo "$line" | awk '{print $4}')
+    echo "  adb 端口: $TCPIP_PORT  (采样 ${interval}s)"
+    echo "  下行: $(fmt_rate "$dl")   上行: $(fmt_rate "$ul")"
+    echo "  累计: 收 ${rx} MB / 发 ${tx} MB"
+    return 0
+}
+
 # --------------------------------------------------------------- 诊断接口
 # 输出 KEY=VALUE 形式的机器可读状态，供 TUI 使用
 cmd_diag() {
@@ -1084,6 +1195,23 @@ cmd_diag() {
         level="error"; title="未发现设备，且此网络屏蔽 mDNS"; hint="插 USB 自动读端口 / 手动输入 IP:端口"; action="usb_help"
     fi
     # 事件序号：设备事件每发生一次 +1，UI 可据此判断"是否有变化"
+    # ---- 传输速率（非阻塞采样）----
+    # diag 被菜单栏频繁调用，绝不能在这里 sleep 等待。
+    # 做法：每次 diag 顺手采一个点，与上次采样的差值即为速率；
+    # 间隔不足 200ms 时沿用上次结果，避免抖动成 0。
+    local _r _dl _ul _crx _ctx
+    _r=$(sample_rate "$TCPIP_PORT" 2>/dev/null)
+    _dl=$(echo "$_r" | awk '{print $1}')
+    _ul=$(echo "$_r" | awk '{print $2}')
+    _crx=$(echo "$_r" | awk '{print $3}')
+    _ctx=$(echo "$_r" | awk '{print $4}')
+    echo "RATE_DOWN_KB=${_dl:-0}"
+    echo "RATE_UP_KB=${_ul:-0}"
+    echo "RATE_TOTAL_DOWN_MB=${_crx:-0}"
+    echo "RATE_TOTAL_UP_MB=${_ctx:-0}"
+    echo "RATE_DOWN_HUMAN=$(fmt_rate "${_dl:-0}")"
+    echo "RATE_UP_HUMAN=$(fmt_rate "${_ul:-0}")"
+
     echo "EVENT_SEQ=$(wc -l < "$STATE_DIR/events.log" 2>/dev/null | tr -d ' ' || echo 0)"
     echo "DIAG_LEVEL=$level"
     echo "DIAG_TITLE=$title"
@@ -1113,6 +1241,7 @@ case "${1:-}" in
     diag)    cmd_diag ;;
     open)    cmd_open "${2:-wireless}" ;;
     recover) cmd_recover ;;
+    rate)    cmd_rate "${2:-1}" ;;
     _daemon) main_loop ;;
     *)
         cat <<'USAGE'
@@ -1129,6 +1258,7 @@ adb-wifi-manager —— Android 无线调试自动连接守护
                               或「开发者选项」页面，省去手动点菜单
   adb-wifi.sh recover         主动恢复无线连接（无需 USB）
                               依次尝试：已有连接 → 记忆端点 → 扫描本网段
+  adb-wifi.sh rate [间隔秒]   查看当前 adb 传输速率（默认采样 1 秒）
 USAGE
         ;;
 esac

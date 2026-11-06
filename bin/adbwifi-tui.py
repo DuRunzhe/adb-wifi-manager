@@ -108,6 +108,23 @@ class State:
         return bool(self.raw.get("USB_SERIAL"))
 
     @property
+    def rate_down(self):
+        """当前下行速率（易读字符串，如 1.2 MB/s）"""
+        return self.raw.get("RATE_DOWN_HUMAN", "") or ""
+
+    @property
+    def rate_up(self):
+        """当前上行速率"""
+        return self.raw.get("RATE_UP_HUMAN", "") or ""
+
+    @property
+    def rate_total(self):
+        """累计收发 (下行 MB, 上行 MB)"""
+        d = self.raw.get("RATE_TOTAL_DOWN_MB", "0") or "0"
+        u = self.raw.get("RATE_TOTAL_UP_MB", "0") or "0"
+        return (d, u)
+
+    @property
     def mdns_works(self):
         """mDNS 是否真的能发现 adb 服务"""
         return int(self.raw.get("MDNS_ADB_COUNT", "0") or 0) > 0
@@ -686,6 +703,20 @@ class App:
                 note = "  ⚠ 与手机网段不同"
             self.addstr(y, 2, net_txt + note,
                         curses.color_pair(C_WARN) if note else curses.color_pair(C_DIM))
+            y += 1
+
+        # adb 传输速率（仅在有设备连接时显示）
+        if st.all_devices and st.rate_down:
+            rd, ru = st.rate_total
+            rate_txt = "传输: ↓ %s  ↑ %s" % (st.rate_down, st.rate_up)
+            # 有实际流量时用高亮色，空闲时用暗色，一眼看出是否在传输
+            idle = ("0 KB/s", "")
+            active = st.rate_down not in idle or st.rate_up not in idle
+            self.addstr(y, 2, rate_txt,
+                        curses.color_pair(C_OK) if active else curses.color_pair(C_DIM))
+            self.addstr(y, 2 + dwidth(rate_txt) + 3,
+                        "累计: 收 %s MB / 发 %s MB" % (rd, ru),
+                        curses.color_pair(C_DIM))
             y += 1
 
         # mDNS 被屏蔽时给出醒目横幅
