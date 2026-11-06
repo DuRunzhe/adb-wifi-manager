@@ -396,8 +396,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggle.target = self
         menu.addItem(toggle)
 
-        let reconnect = NSMenuItem(title: "立即重连一次", action: #selector(forceReconnect), keyEquivalent: "r")
+        // 恢复无线连接：无连接时也能用（依次尝试 记忆端点 → 扫描本网段）
+        // 前提：手机此前通过 USB 执行过 adb tcpip，adbd 会常驻监听 TCP 端口
+        let reconnect = NSMenuItem(
+            title: s.endpoints.isEmpty ? "立即恢复无线连接（无需 USB）" : "重新连接一次",
+            action: #selector(recoverConnection), keyEquivalent: "r")
         reconnect.target = self
+        reconnect.toolTip = s.endpoints.isEmpty
+            ? "无需 USB：自动查找并连接手机"
+            : "断开后按记忆端点/网段扫描重新连接"
         menu.addItem(reconnect)
 
         // 插着 USB 且尚未开启 TCP 模式时，提供一键触发（无需等守护的节流周期）
@@ -546,22 +553,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc func forceReconnect() {
+    /// 恢复无线连接。
+    /// 不需要 USB：只要手机此前通过 USB 执行过 adb tcpip，adbd 会常驻监听 TCP 端口，
+    /// 之后直接 connect 即可恢复。恢复顺序（由脚本层实现）：
+    ///   已有连接 → 记忆端点 → 扫描本网段找回换了 IP 的手机
+    @objc func recoverConnection() {
+        guard !busy else { return }
         busy = true
         DispatchQueue.global().async {
-            // 断开所有无线设备，让守护立刻重新建立连接
-            let list = self.status.endpoints
-            for ep in list {
-                _ = self.shell("/usr/bin/env", ["adb", "disconnect", ep])
-            }
-            var msg = list.isEmpty ? "当前无无线连接，守护会在发现问题后自动连接" : "已断开，守护将自动重连"
-            if !list.isEmpty {
-                _ = self.shell("/usr/bin/env", ["adb", "connect", list[0]])
-                msg = "已触发重连: \(list[0])"
-            }
+            let r = runScript(["recover"], timeout: 90)
+            let out = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            let ok = out.contains("✓")
             DispatchQueue.main.async {
                 self.busy = false
-                self.flash(title: "重连", text: msg)
+                if ok {
+                    // 成功：只闪一下，不弹窗打扰。取输出里带 ✓ 的那一行
+                    let line = out.components(separatedBy: "\n")
+                        .first(where: { $0.contains("✓") }) ?? "已恢复无线连接"
+                    let text = line.replacingOccurrences(of: "✓ ", with: "")
+                        .replacingOccurrences(of: "已恢复无线连接: ", with: "")
+                        .replacingOccurrences(of: "当前已有可用连接: ", with: "")
+                    self.flash(title: "已恢复", text: text)
+                } else {
+                    // 失败：弹窗给出可操作的排查提示
+                    self.showTextWindow(title: "未能恢复无线连接", content: out)
+                }
                 self.refresh()
             }
         }

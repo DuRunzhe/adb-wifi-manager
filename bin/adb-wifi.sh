@@ -42,12 +42,21 @@ AUTO_TCPIP="${AUTO_TCPIP:-1}"            # 1=插 USB 自动尝试，0=关闭
 TCPIP_PORT="${TCPIP_PORT:-5555}"         # tcpip 监听端口
 TCPIP_RETRY_INTERVAL="${TCPIP_RETRY_INTERVAL:-60}"  # 失败后重试间隔(秒)，避免频繁打扰手机
 
+# 记忆端点的清理阈值：连续探测失败多少次才丢弃。
+# 设得足够大，保证手机临时掉线/睡眠不会把"回家的路"忘掉。
+MAX_KNOWN_FAILS="${MAX_KNOWN_FAILS:-360}"  # 约 1 小时（按 CHECK_INTERVAL=10s 计）
+
+# 无 USB 自动恢复：手机换了网段后，扫描本网段找回
+AUTO_SCAN="${AUTO_SCAN:-1}"              # 1=允许自动扫描，0=关闭
+SCAN_INTERVAL="${SCAN_INTERVAL:-300}"    # 两次扫描的最小间隔(秒)，避免持续占用网络
+
 APP_SUPPORT="$HOME/Library/Application Support/adb-wifi-manager"
 STATE_DIR="$APP_SUPPORT/state"
 LOG_DIR="$APP_SUPPORT/logs"
 LOG_FILE="$LOG_DIR/adb-wifi.log"
 PID_FILE="$APP_SUPPORT/adb-wifi.pid"
 KNOWN_FILE="$STATE_DIR/known_endpoints.txt"   # 历史连接成功过的 IP:PORT（跨重启保留）
+SCAN_STAMP="$STATE_DIR/last_scan_attempt"     # 上次网段扫描时间，用于节流
 MAX_LOG_BYTES=1048576
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
@@ -281,36 +290,146 @@ ensure_tcpip() {
 }
 
 # ---------------------------------------------------------------- 发现: TCP
-# 对已知端点(历史成功记录)做 TCP 连通性探测；不通的直接从记忆里清除
+# 对已知端点(历史成功记录)做 TCP 连通性探测。
+#
+# 重要：不通时**不再立即删除**。手机临时掉线、睡眠、换网段都会让端口暂时不可达，
+# 早先的实现一探测失败就删掉记忆，导致"连不上就永远找不回来"，只能重新插 USB。
+# 现在改为：保留记忆，仅记录失败次数；连续失败超过 MAX_KNOWN_FAILS 次才清理。
 discover_known() {
     [ -f "$KNOWN_FILE" ] || return 0
-    local ep ip port
-    local -a stale=()
+    local ep ip port fails_file="$STATE_DIR/known_fails.txt"
+    [ -f "$fails_file" ] || : > "$fails_file"
+    local -a alive=() dead=()
+
     while read -r ep; do
         [ -z "$ep" ] && continue
         ip="${ep%%:*}"; port="${ep##*:}"
         if nc -z -G "$TCP_TIMEOUT" -w "$TCP_TIMEOUT" "$ip" "$port" 2>/dev/null; then
+            alive+=("$ep")
             echo "$ep"
         else
-            stale+=("$ep")
+            dead+=("$ep")
         fi
     done < "$KNOWN_FILE"
 
-    # 清理不通的历史端点（日志走 stderr，避免污染给调用方的 stdout）
-    if [ ${#stale[@]} -gt 0 ]; then
+    # 更新失败计数：通了的清零，不通的 +1
+    local newfails="$fails_file.tmp"
+    : > "$newfails"
+    local e n
+    while read -r e n; do
+        [ -z "$e" ] && continue
+        case " ${alive[*]} " in
+            *" $e "*) echo "$e 0" >> "$newfails"; continue ;;
+        esac
+        n=${n:-0}
+        case "$n" in ''|*[!0-9]*) n=0 ;; esac
+        echo "$e $((n + 1))" >> "$newfails"
+    done < "$fails_file" 2>/dev/null
+    for e in "${alive[@]:-}"; do
+        [ -z "$e" ] && continue
+        grep -q "^$e " "$newfails" || echo "$e 0" >> "$newfails"
+    done
+    for e in "${dead[@]:-}"; do
+        [ -z "$e" ] && continue
+        grep -q "^$e " "$newfails" || echo "$e 1" >> "$newfails"
+    done
+    mv -f "$newfails" "$fails_file"
+
+    # 仅清理"连续失败很多次"的端点
+    local pruned=""
+    while read -r e n; do
+        [ -z "$e" ] && continue
+        if [ "${n:-0}" -ge "$MAX_KNOWN_FAILS" ]; then
+            info "记忆端点 $e 连续失败 $n 次，清理" >&2
+            pruned="$pruned $e"
+        fi
+    done < "$fails_file"
+    if [ -n "$pruned" ]; then
         local keep="$KNOWN_FILE.keep"
         : > "$keep"
-        local e
         while read -r e; do
             [ -z "$e" ] && continue
-            case " ${stale[*]} " in
-                *" $e "*) info "清理失效记忆端点 $e" >&2 ;;
-                *) echo "$e" >> "$keep" ;;
-            esac
+            case " $pruned " in *" $e "*) continue ;; esac
+            echo "$e" >> "$keep"
         done < "$KNOWN_FILE"
         mv -f "$keep" "$KNOWN_FILE"
     fi
     return 0
+}
+
+# ------------------------------------------------- 发现: 网段扫描
+# 手机换了网段（例如 DHCP 重新分配）后，记下的旧 IP 必然失效。
+# 这里在当前 /24 网段内并发探测已知端口（默认 5555），找回手机的新地址。
+# 只在"有记忆但都不通"或"明确要求恢复"时触发，避免常态扫描占用网络。
+scan_lan_for_port() {
+    local port="${1:-$TCPIP_PORT}" prefix ip i found=""
+    prefix=$(lan_prefix)
+    [ -z "$prefix" ] && return 0
+
+    info "扫描本网段 ${prefix}.0/24 的 $port 端口 ..." >&2
+    # 并发探测，每台 0.6 秒超时；用后台任务 + 等待，避免串行耗时
+    local tmpf="$STATE_DIR/scan.tmp"
+    : > "$tmpf"
+    for i in $(seq 1 254); do
+        ip="$prefix.$i"
+        (
+            nc -z -G 1 -w 1 "$ip" "$port" 2>/dev/null && echo "$ip:$port" >> "$tmpf"
+        ) &
+        # 每 40 个等一次，控制并发数
+        if [ $((i % 40)) -eq 0 ]; then wait; fi
+    done
+    wait
+
+    if [ -s "$tmpf" ]; then
+        sort -u "$tmpf"
+    fi
+    rm -f "$tmpf"
+    return 0
+}
+
+# 主动恢复：依次尝试 记忆端点 → 网段扫描 → 连接。
+# 不需要 USB：只要手机此前通过 USB 执行过 adb tcpip，adbd 就会常驻监听 5555。
+# 供菜单栏「立即恢复无线连接」与命令行 `recover` 使用。
+recover_connection() {
+    local connected eps ep found=""
+    connected=$(wifi_devices)
+
+    if [ -n "$connected" ]; then
+        # 已连上但可能无响应，先校验一次
+        for ep in $connected; do
+            if tmo 5 "$ADB_BIN" -s "$ep" get-state >/dev/null 2>&1; then
+                echo "ALREADY $ep"
+                return 0
+            fi
+            adbw disconnect "$ep" >/dev/null 2>&1
+        done
+    fi
+
+    # ① 记忆端点（跳过计数为 0 但当前不通的，交给下面扫描）
+    eps=$(discover_known 2>/dev/null)
+    for ep in $eps; do
+        if try_connect "$ep" >/dev/null 2>&1; then
+            remember_endpoint "$ep"
+            echo "OK $ep"
+            return 0
+        fi
+    done
+
+    # ② 网段扫描找新 IP
+    info "记忆端点均不可用，尝试扫描本网段找回设备" 
+    found=$(scan_lan_for_port "$TCPIP_PORT" 2>/dev/null)
+    if [ -n "$found" ]; then
+        for ep in $found; do
+            if try_connect "$ep" >/dev/null 2>&1; then
+                remember_endpoint "$ep"
+                echo "OK $ep"
+                return 0
+            fi
+        done
+    fi
+
+    echo "FAIL"
+    return 1
 }
 
 # ------------------------------------------------------------- 连接 & 重连
@@ -457,8 +576,24 @@ main_loop() {
             tcpip_eps=$(ensure_tcpip)
         fi
 
+        # 都没有着落时扫描本网段，找回换了 IP 的手机（无需 USB）。
+        # 节流：每 SCAN_INTERVAL 秒最多扫一次，避免持续占满网络。
+        scan_eps=""
+        if [ -z "$connected_eps" ] && [ -z "$mdns_eps" ] && [ -z "$usb_eps" ] \
+           && [ -z "$known_eps" ] && [ -z "$tcpip_eps" ] && [ "$AUTO_SCAN" = "1" ]; then
+            _now=$(date +%s)
+            _last=0
+            [ -f "$SCAN_STAMP" ] && read -r _last < "$SCAN_STAMP" 2>/dev/null
+            case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+            if [ $((_now - _last)) -ge "$SCAN_INTERVAL" ]; then
+                echo "$_now" > "$SCAN_STAMP"
+                scan_eps=$(scan_lan_for_port "$TCPIP_PORT")
+                [ -n "$scan_eps" ] && info "网段扫描发现: $(echo $scan_eps | tr '\n' ' ')"
+            fi
+        fi
+
         # 只接受合法的 IP:PORT，过滤非端点输出（防止提示文本混入被误当成设备）
-        candidates=$(printf '%s\n%s\n%s\n%s\n' "$mdns_eps" "$usb_eps" "$known_eps" "$tcpip_eps" \
+        candidates=$(printf '%s\n%s\n%s\n%s\n%s\n' "$mdns_eps" "$usb_eps" "$known_eps" "$tcpip_eps" "$scan_eps" \
             | awk 'NF' \
             | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$' \
             | sort -u)
@@ -753,6 +888,47 @@ cmd_open() {
     return 0
 }
 
+# ------------------------------------------------- 主动恢复无线连接
+# 不需要 USB：只要手机此前通过 USB 执行过 adb tcpip，adbd 就会常驻监听 TCP 端口，
+# 之后无论 USB 是否插着，都能直接 connect 恢复。
+# 恢复顺序：已有连接 → 记忆端点 → 扫描本网段
+cmd_recover() {
+    echo "正在恢复无线连接 ..."
+    local r
+    r=$(recover_connection 2>/dev/null)
+    case "$r" in
+        ALREADY\ *)
+            echo "✓ 当前已有可用连接: ${r#ALREADY }"
+            return 0
+            ;;
+        OK\ *)
+            echo "✓ 已恢复无线连接: ${r#OK }"
+            return 0
+            ;;
+    esac
+
+    # 失败：区分"手机根本没在监听"与"网络不通"，给出可操作提示
+    local usb
+    usb="$(first_usb_serial)"
+    echo "✗ 未能恢复无线连接"
+    if [ -n "$usb" ]; then
+        echo "  检测到 USB 已连接，将自动切换 TCP 模式重试 ..."
+        local ep
+        ep=$(ensure_tcpip 2>/dev/null)
+        if [ -n "$ep" ]; then
+            echo "✓ 已通过 USB 恢复: $ep"
+            return 0
+        fi
+    fi
+    echo
+    echo "可能原因与处理："
+    echo "  1) 手机重启过 → tcpip 模式已失效，需插一次 USB（守护会自动恢复）"
+    echo "  2) 手机未连 Wi-Fi，或与 Mac 不在同一网段"
+    echo "     本机 IP 段: $(lan_prefix).0/24"
+    echo "  3) 手机改回 USB 模式了 → 插 USB 后会自动切换"
+    return 1
+}
+
 # --------------------------------------------------------------- 诊断接口
 # 输出 KEY=VALUE 形式的机器可读状态，供 TUI 使用
 cmd_diag() {
@@ -894,6 +1070,7 @@ case "${1:-}" in
     once)    cmd_once ;;
     diag)    cmd_diag ;;
     open)    cmd_open "${2:-wireless}" ;;
+    recover) cmd_recover ;;
     _daemon) main_loop ;;
     *)
         cat <<'USAGE'
@@ -908,6 +1085,8 @@ adb-wifi-manager —— Android 无线调试自动连接守护
   adb-wifi.sh open [wireless|dev]
                               在手机上直接打开「无线调试」页面（默认）
                               或「开发者选项」页面，省去手动点菜单
+  adb-wifi.sh recover         主动恢复无线连接（无需 USB）
+                              依次尝试：已有连接 → 记忆端点 → 扫描本网段
 USAGE
         ;;
 esac
