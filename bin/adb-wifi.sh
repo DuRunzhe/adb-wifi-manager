@@ -624,6 +624,135 @@ cmd_once() {
     echo "=== 当前 adb devices ==="; "$ADB_BIN" devices -l
 }
 
+# ------------------------------------------------- 手机上打开设置页
+# 一键把手机跳到「无线调试」页面，省去手动点 设置→开发者选项→无线调试。
+#
+# 各 ROM 差异很大，按可靠性从高到低逐级尝试：
+#   ① SubSettings + WirelessDebuggingFragment —— AOSP/原生及多数 ROM，精确到无线调试页
+#      在 MIUI 13/14（实测 Redmi K30 5G, Android 12）上同样有效
+#   ② Settings$WirelessDebuggingActivity —— 部分 ROM 的独立页面
+#   ③ 开发者选项页 —— 前面都失败时退一步，用户从这里自己点「无线调试」
+# 注意：部分 ROM（如 MIUI）的 WirelessDebuggingActivity 是空壳，
+#      启动后会被重定向到设置首页，因此必须放在 ① 之后作为兜底。
+open_settings_page() {
+    local serial="$1" page="${2:-wireless}" out
+
+    if [ -z "$serial" ]; then
+        echo "NEED_USB"
+        return 1
+    fi
+
+    if [ "$page" = "dev" ]; then
+        out=$(tmo 15 "$ADB_BIN" -s "$serial" shell am start \
+            -a android.settings.APPLICATION_DEVELOPMENT_SETTINGS 2>&1 | tr -d '\r')
+        if echo "$out" | grep -q "Starting:"; then
+            echo "OK 开发者选项"
+            return 0
+        fi
+        echo "FAIL $out"
+        return 1
+    fi
+
+    # ① AOSP 通用：SubSettings 内嵌 WirelessDebuggingFragment（精确到无线调试页）
+    out=$(tmo 15 "$ADB_BIN" -s "$serial" shell am start \
+        -n com.android.settings/.SubSettings \
+        --es ":settings:show_fragment" \
+        "com.android.settings.development.WirelessDebuggingFragment" 2>&1 | tr -d '\r')
+    if echo "$out" | grep -q "Starting:"; then
+        # 校验是否真的停在无线调试页：读界面文本，含"无线调试/Wireless debugging"且含开关项
+        sleep 1.5
+        if ui_page_is_wireless_debug "$serial"; then
+            echo "OK 无线调试"
+            return 0
+        fi
+    fi
+
+    # ② 独立 Activity（部分 ROM）
+    out=$(tmo 15 "$ADB_BIN" -s "$serial" shell am start \
+        -n 'com.android.settings/.Settings$WirelessDebuggingActivity' 2>&1 | tr -d '\r')
+    if echo "$out" | grep -q "Starting:"; then
+        sleep 1.5
+        if ui_page_is_wireless_debug "$serial"; then
+            echo "OK 无线调试"
+            return 0
+        fi
+    fi
+
+    # ③ 兜底：开发者选项页
+    out=$(tmo 15 "$ADB_BIN" -s "$serial" shell am start \
+        -a android.settings.APPLICATION_DEVELOPMENT_SETTINGS 2>&1 | tr -d '\r')
+    if echo "$out" | grep -q "Starting:"; then
+        echo "PARTIAL 开发者选项"
+        echo "该 ROM 未能直接定位无线调试页，已打开开发者选项，请手动点击「无线调试」" >&2
+        return 0
+    fi
+
+    echo "FAIL $out"
+    return 1
+}
+
+# 判断当前前台页面是否为「无线调试」页。
+# 做法：uiautomator dump 到文件再 grep。
+# 注意两个坑（均实测于 MIUI 13 / Android 12）：
+#   1. 不能用 `uiautomator dump /dev/tty`，该 ROM 会抛 FileNotFoundException，只输出异常堆栈
+#   2. 手机端 grep 对 'A\|B' 这种 BRE 交替写法不可靠，改用固定串分别匹配
+# 读取失败时保守返回 1，让调用方继续尝试下一种启动方式。
+ui_page_is_wireless_debug() {
+    local serial="$1" tmp="/sdcard/.adbwifi_ui.xml" n1 n2
+    n1=$(tmo 12 "$ADB_BIN" -s "$serial" shell \
+        "uiautomator dump $tmp >/dev/null 2>&1; \
+         grep -c '无线调试' $tmp 2>/dev/null; \
+         rm -f $tmp" 2>/dev/null | tr -d '\r' | tr -dc '0-9')
+    case "$n1" in ''|0) n1=0 ;; esac
+    if [ "$n1" -gt 0 ]; then
+        return 0
+    fi
+    # 英文系统或无中文串时，再试一次英文关键字
+    n2=$(tmo 12 "$ADB_BIN" -s "$serial" shell \
+        "uiautomator dump $tmp >/dev/null 2>&1; \
+         grep -ci 'wireless debugging' $tmp 2>/dev/null; \
+         rm -f $tmp" 2>/dev/null | tr -d '\r' | tr -dc '0-9')
+    case "$n2" in ''|0) return 1 ;; esac
+    return 0
+}
+
+# 选一个可用于跳转的设备：优先 USB（跳转不打断无线调试），没有再退回无线端点
+settings_serial() {
+    local s
+    s="$(first_usb_serial)"
+    if [ -n "$s" ]; then echo "$s"; return 0; fi
+    for s in $(wifi_devices); do echo "$s"; return 0; done
+    return 0
+}
+
+cmd_open() {
+    local page="${1:-wireless}" serial out qr
+    serial="$(settings_serial)"
+    if [ -z "$serial" ]; then
+        echo "✗ 未检测到已连接的设备（USB 或无线均可）"
+        echo "  请先连上手机再执行本命令"
+        return 1
+    fi
+    echo "使用设备: $serial"
+    out=$(open_settings_page "$serial" "$page" 2>/dev/null)
+    case "$out" in
+        OK*)      echo "✓ 已在手机上打开「${out#OK }」页面" ;;
+        PARTIAL*) echo "△ ${out#PARTIAL }"; echo "  未能直接定位到无线调试页，请在列表中手动点击「无线调试」" ;;
+        NEED_USB) echo "✗ 需要先连接手机"; return 1 ;;
+        *)        echo "✗ 打开失败: ${out#FAIL }"; return 1 ;;
+    esac
+
+    # 顺带打印当前无线调试开关状态，方便判断还要不要手动开
+    local en
+    en=$(adbw -s "$serial" shell settings get global adb_wifi_enabled 2>/dev/null | tr -d '\r')
+    case "$en" in
+        1) echo "  当前「无线调试」开关: 已开启" ;;
+        0) echo "  当前「无线调试」开关: 未开启（请在手机上点开）" ;;
+        *) echo "  当前「无线调试」开关: 无法读取（该 ROM 可能不暴露此设置）" ;;
+    esac
+    return 0
+}
+
 # --------------------------------------------------------------- 诊断接口
 # 输出 KEY=VALUE 形式的机器可读状态，供 TUI 使用
 cmd_diag() {
@@ -764,17 +893,21 @@ case "${1:-}" in
     log)     tail -f "$LOG_FILE" ;;
     once)    cmd_once ;;
     diag)    cmd_diag ;;
+    open)    cmd_open "${2:-wireless}" ;;
     _daemon) main_loop ;;
     *)
         cat <<'USAGE'
 adb-wifi-manager —— Android 无线调试自动连接守护
 
-  adb-wifi.sh start     后台常驻启动
-  adb-wifi.sh stop      停止
-  adb-wifi.sh restart   重启
-  adb-wifi.sh status    查看状态与在线设备
-  adb-wifi.sh log       实时查看日志
-  adb-wifi.sh once      前台执行一轮发现（排查用）
+  adb-wifi.sh start           后台常驻启动
+  adb-wifi.sh stop            停止
+  adb-wifi.sh restart         重启
+  adb-wifi.sh status          查看状态与在线设备
+  adb-wifi.sh log             实时查看日志
+  adb-wifi.sh once            前台执行一轮发现（排查用）
+  adb-wifi.sh open [wireless|dev]
+                              在手机上直接打开「无线调试」页面（默认）
+                              或「开发者选项」页面，省去手动点菜单
 USAGE
         ;;
 esac

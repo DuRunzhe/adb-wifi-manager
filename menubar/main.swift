@@ -413,6 +413,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         devs.target = self
         menu.addItem(devs)
 
+        // 一键跳转手机设置页：常驻入口，不依赖诊断结论
+        // 已连接设备（USB 或无线）时可用；跳转策略见 adb-wifi.sh 的 open 子命令
+        let connected = !s.allDevices.isEmpty
+        let openWireless = NSMenuItem(title: "在手机上打开「无线调试」…",
+                                      action: #selector(openPhoneWirelessSettings), keyEquivalent: "w")
+        openWireless.target = self
+        openWireless.isEnabled = connected
+        openWireless.toolTip = connected ? "直接在手机上定位到无线调试开关" : "请先连接手机"
+        menu.addItem(openWireless)
+
+        let openDev = NSMenuItem(title: "在手机上打开「开发者选项」…",
+                                 action: #selector(openPhoneDevSettings), keyEquivalent: "")
+        openDev.target = self
+        openDev.isEnabled = connected
+        openDev.toolTip = connected ? "打开开发者选项页" : "请先连接手机"
+        menu.addItem(openDev)
+
         let log = NSMenuItem(title: "查看日志…", action: #selector(showLog), keyEquivalent: "l")
         log.target = self
         menu.addItem(log)
@@ -485,21 +502,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSPasteboard.general.setString(cmd, forType: .string)
             showTextWindow(title: "手动连接（命令已复制到剪贴板）", content: msg)
         case "phone_dev_settings", "phone_wireless":
-            let serial = status.allDevices.first(where: { !$0.0.contains(":") })?.0 ?? ""
-            if serial.isEmpty {
-                showTextWindow(title: "需要 USB 连接",
-                               content: "该操作需要先插上 USB 线连接手机，\n才能在手机上自动跳转设置页面。")
-                return
+            // 跳转策略统一收敛在 adb-wifi.sh 的 open 子命令里（多 ROM 自适应），
+            // 菜单栏、TUI、命令行三处行为一致，避免各自实现导致体验不一。
+            let page = action == "phone_wireless" ? "wireless" : "dev"
+            let r = runScript(["open", page], timeout: 60)
+            let out = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            if out.contains("✓") {
+                flash(title: "已打开", text: page == "wireless" ? "无线调试页" : "开发者选项")
+                showTextWindow(title: "已在手机上打开", content: out)
+            } else if out.contains("△") {
+                showTextWindow(title: "已打开开发者选项", content: out
+                    + "\n\n该 ROM 未能直接定位到「无线调试」页，请在列表中手动点击。")
+            } else {
+                showTextWindow(title: "打开设置失败",
+                               content: out.isEmpty ? "未获取到输出，请确认手机已连接。" : out)
             }
-            let setting = action == "phone_wireless"
-                ? "com.android.settings/.Settings$WirelessDebuggingActivity"
-                : nil
-            let args: [String] = setting != nil
-                ? ["-s", serial, "shell", "am", "start", "-n", setting!]
-                : ["-s", serial, "shell", "am", "start", "-a", "android.settings.APPLICATION_DEVELOPMENT_SETTINGS"]
-            let out = shell("/usr/bin/env", ["adb"] + args)
-            showTextWindow(title: "在手机上打开设置",
-                           content: out.isEmpty ? "已发送跳转指令，请在手机上查看。" : out)
         default:
             let msg = """
             请打开终端 TUI 查看完整解决方案（支持点选操作）：
@@ -591,6 +608,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 self.busy = false
                 self.flash(title: ok ? "TCP 模式已开启" : "TCP 模式开启失败", text: msg)
+                self.refresh()
+            }
+        }
+    }
+
+    /// 一键在手机上打开「无线调试」页面并定位到开关。
+    /// 具体跳转策略（多 ROM 自适应）由 adb-wifi.sh 的 open 子命令实现，
+    /// 与 TUI、命令行共用同一套逻辑。
+    @objc func openPhoneWirelessSettings() {
+        jumpToPhoneSettings(page: "wireless")
+    }
+
+    @objc func openPhoneDevSettings() {
+        jumpToPhoneSettings(page: "dev")
+    }
+
+    func jumpToPhoneSettings(page: String) {
+        let label = page == "wireless" ? "无线调试" : "开发者选项"
+        busy = true
+        DispatchQueue.global().async {
+            let r = runScript(["open", page], timeout: 60)
+            let out = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            DispatchQueue.main.async {
+                self.busy = false
+                if out.contains("✓") {
+                    self.flash(title: "已打开\(label)", text: "请看手机屏幕")
+                } else if out.contains("△") {
+                    self.flash(title: "已打开开发者选项", text: "请手动点无线调试")
+                } else {
+                    self.flash(title: "打开失败", text: out.isEmpty ? "请确认手机已连接" : out)
+                }
+                self.showTextWindow(title: "在手机上打开「\(label)」",
+                                    content: out.isEmpty ? "未获取到输出。" : out)
                 self.refresh()
             }
         }

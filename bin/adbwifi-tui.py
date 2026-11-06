@@ -278,6 +278,16 @@ def usb_serial():
     return ""
 
 
+def wifi_serial():
+    """返回当前无线连接的端点（形如 192.168.1.5:5555），便于无 USB 时也能跳转设置页"""
+    code, out = adb("devices")
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device" and ":" in parts[0]:
+            return parts[0]
+    return ""
+
+
 def _am_start(serial, args):
     """在指定（USB）设备上执行 am start"""
     cmd = ["shell"]
@@ -286,44 +296,62 @@ def _am_start(serial, args):
     return adb(*(cmd + ["am", "start"] + args))
 
 
+def open_settings_page_via_script(page="wireless"):
+    """调用 adb-wifi.sh open，复用脚本里统一的多 ROM 跳转策略。
+
+    脚本会按可靠性依次尝试：
+      ① SubSettings + WirelessDebuggingFragment（AOSP 通用，MIUI 实测有效，精确到无线调试页）
+      ② Settings$WirelessDebuggingActivity（部分 ROM 的独立页面）
+      ③ 开发者选项页（兜底）
+    返回 (是否成功, 输出文本)
+    """
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adb-wifi.sh")
+    if not os.path.exists(script):
+        return (False, "未找到 adb-wifi.sh")
+    try:
+        r = subprocess.run(["/bin/bash", script, "open", page],
+                           capture_output=True, text=True, timeout=60)
+        out = (r.stdout or "") + (r.stderr or "")
+        return (r.returncode == 0, out.strip())
+    except Exception as e:  # noqa: BLE001
+        return (False, "调用失败: %s" % e)
+
+
 def open_android_dev_settings(serial=None):
-    """在手机上打开开发者选项页（需 USB，避免误操作日常使用的无线连接）"""
-    serial = serial or usb_serial()
+    """在手机上打开开发者选项页"""
+    serial = serial or usb_serial() or wifi_serial()
     if not serial:
-        return ("需要先用 USB 线连接手机。\n\n"
-                "该操作会向手机发送系统 Intent 直接跳转页面，"
-                "必须通过 USB 连接才稳定可靠。\n"
-                "插好 USB 后按 R 刷新，再点此按钮。")
-    code, out = _am_start(serial, ["-a", "android.settings.APPLICATION_DEVELOPMENT_SETTINGS"])
-    if "Error" in out:
-        return "打开失败：" + out.strip()[:150]
+        return ("需要先连接手机（USB 或无线均可）。\n"
+                "插好线后按 R 刷新，再点此按钮。")
+    ok, out = open_settings_page_via_script("dev")
+    if not ok:
+        return "打开失败：" + out[:200]
     return ("已在手机上打开「开发者选项」页面。\n\n"
             "接下来的路径：\n"
-            "  开发者选项 → 无线调试 → 打开开关 → 点击「使用配对码配对设备」\n"
+            "  开发者选项 → 无线调试 → 打开开关\n"
             "完成后回到本界面按 R 重新诊断。")
 
 
 def open_android_wireless_debug(serial=None):
-    """尝试直接在手机上打开无线调试页面（部分 ROM 支持）"""
-    serial = serial or usb_serial()
+    """直接在手机上打开「无线调试」页面（多 ROM 自适应）"""
+    serial = serial or usb_serial() or wifi_serial()
     if not serial:
-        return ("需要先用 USB 线连接手机才能自动跳转页面。\n\n"
+        return ("需要先连接手机（USB 或无线均可）才能自动跳转页面。\n\n"
                 "也可以手动操作：设置 → 开发者选项 → 无线调试")
-    candidates = [
-        "com.android.settings/.Settings$WirelessDebuggingActivity",
-        "com.android.settings/.development.WirelessDebuggingActivity",
-    ]
-    for c in candidates:
-        code, out = _am_start(serial, ["-n", c])
-        if "Error" not in out and "does not exist" not in out:
-            return "已在手机上打开「无线调试」页面"
-    # 小米等定制 ROM 无独立页面，退回到开发者选项
-    code, out = _am_start(serial, ["-a", "android.settings.APPLICATION_DEVELOPMENT_SETTINGS"])
-    if "Error" not in out:
+    ok, out = open_settings_page_via_script("wireless")
+    if not ok:
+        return ("无法自动打开，请手动进入：设置 → 开发者选项 → 无线调试\n\n"
+                "错误信息：" + out[:200])
+    if "▽" in out or "未能直接定位" in out:
         return ("已在手机上打开「开发者选项」。\n\n"
-                "该手机的 ROM 没有独立的「无线调试」页面，"
-                "请在列表中手动点击「无线调试」。")
-    return "无法自动打开，请手动进入：设置 → 开发者选项 → 无线调试"
+                "该 ROM 未能直接定位到「无线调试」页，请在列表中手动点击「无线调试」。")
+    # 附带开关状态提示
+    extra = ""
+    if "未开启" in out:
+        extra = "\n\n提示：「无线调试」开关当前是关闭的，请在手机上点开它。"
+    elif "已开启" in out:
+        extra = "\n\n「无线调试」开关当前已开启。"
+    return "已在手机上打开「无线调试」页面。" + extra
 
 
 def open_pairing_help():

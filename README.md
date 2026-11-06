@@ -118,6 +118,8 @@ mDNS: 被屏蔽 ✗   发现方式: 记忆端点
 | `./bin/adb-wifi.sh status` | 查看运行状态、在线设备、最近日志 |
 | `./bin/adb-wifi.sh log` | 实时跟随日志（Ctrl-C 退出） |
 | `./bin/adb-wifi.sh once` | 前台跑一轮发现，用于排查问题 |
+| `./bin/adb-wifi.sh open` | 在手机上直接打开「无线调试」页面 |
+| `./bin/adb-wifi.sh open dev` | 在手机上打开「开发者选项」页面 |
 
 日志位置：`~/Library/Application Support/adb-wifi-manager/logs/adb-wifi.log`
 
@@ -317,6 +319,53 @@ adb usb
 ```
 
 ---
+
+## 一键打开手机设置页
+
+手动去 设置 → 开发者选项 → 无线调试 很绕，这里提供一键直达。
+
+| 入口 | 操作 |
+|---|---|
+| 菜单栏 | 「在手机上打开「无线调试」…」（⌘W）／「在手机上打开「开发者选项」…」 |
+| 命令行 | `./bin/adb-wifi.sh open` 或 `./bin/adb-wifi.sh open dev` |
+| 终端 TUI | 诊断结论里的「在手机上自动打开无线调试页」 |
+| 诊断自动触发 | 检测到"无线调试开关未打开"时，点击「▸ 处理」即跳转 |
+
+### 兼容性做法
+
+各 ROM 的设置页结构差异很大，脚本按可靠性**逐级尝试**：
+
+| 顺序 | 方式 | 适用 |
+|---|---|---|
+| ① | `com.android.settings/.SubSettings` + `WirelessDebuggingFragment` | AOSP 通用；**MIUI 13/14 实测可精确命中** |
+| ② | `com.android.settings/.Settings$WirelessDebuggingActivity` | 部分 ROM 的独立页面 |
+| ③ | `android.settings.APPLICATION_DEVELOPMENT_SETTINGS` | 兜底：打开开发者选项，由用户点「无线调试」 |
+
+**关键点**：判断①是否真的停在无线调试页，靠 `uiautomator dump` 读界面文本匹配
+「无线调试」。因为部分 ROM（如 MIUI）的 `WirelessDebuggingActivity` 是空壳，
+启动后会被静默重定向到设置首页 —— 只判断 `am start` 是否报错是不够的。
+
+实测有效的跳转命令：
+
+```bash
+adb shell am start -n com.android.settings/.SubSettings \
+  --es ':settings:show_fragment' \
+  'com.android.settings.development.WirelessDebuggingFragment'
+```
+
+### 踩过的坑（均已规避）
+
+- `uiautomator dump /dev/tty` 在 MIUI 上抛 `FileNotFoundException`，只输出异常堆栈
+  → 改为 dump 到 `/sdcard/` 再 grep
+- 手机端 `grep` 对 `'A\|B'` 这种 BRE 交替写法不可靠
+  → 改为固定串分别匹配
+- 中文关键字在某些 Shell 转义下匹配不到
+  → 先试中文，失败再试 `wireless debugging`（英文系统覆盖）
+
+连接 USB 或无线都可以跳转；有 USB 时优先用 USB，避免打断正在使用的无线连接。
+
+---
+
 
 ## 常见问题
 
