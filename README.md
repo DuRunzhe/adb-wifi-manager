@@ -237,7 +237,9 @@ Android 11+ 的「无线调试」端口是**每次随机分配**的，因此脚�
 
 ## 配置
 
-编辑 `config.sh`（首次创建后生效）可调整：
+配置项在 `bin/adb-wifi.sh` 顶部的「可配置项」区块。
+
+也可在项目根目录新建 `config.sh`（脚本启动时自动加载，该文件不存在时无影响）：
 
 ```bash
 CHECK_INTERVAL=10        # 轮询间隔（秒）
@@ -245,19 +247,91 @@ TCP_TIMEOUT=3            # TCP 探测超时
 CONNECT_TIMEOUT=12       # 单次 adb connect 超时
 CANDIDATE_PORTS="..."    # TCP 兜底探测端口
 ENABLE_NOTIFY=1          # 连接成功时发系统通知
+
+# 插 USB 自动开启无线（见下文「免手动」章节）
+AUTO_TCPIP=1             # 1=插 USB 自动转 TCP 模式，0=关闭
+TCPIP_PORT=5555          # tcpip 监听端口
+TCPIP_RETRY_INTERVAL=60  # 切换失败后的重试间隔（秒）
 ```
 
-也可直接改脚本顶部的「可配置项」区块。
+> 直接改脚本顶部效果相同；`config.sh` 只是把个人配置与代码分离，方便后续 `git pull` 不被覆盖。
+
+---
+
+## 插上 USB 全自动连接（免手动开无线调试）
+
+**目标**：插上 USB 后，什么都不用点，自动建立无线 adb 连接。
+
+### 为什么不直接打开「无线调试」开关
+
+Android 要求写入 `adb_wifi_enabled` 需要 `WRITE_SECURE_SETTINGS` 权限，
+普通 adb shell 没有该权限，实测会抛：
+
+```
+java.lang.SecurityException: Permission denial: writing to settings requires:
+android.permission.WRITE_SECURE_SETTINGS
+```
+
+这是系统安全设计，**无法用 adb 命令绕过**，所以「一键打开无线调试开关」做不到。
+
+### 实际采用的方案：`adb tcpip`
+
+`adb tcpip <端口>` 让 adbd 在指定端口额外监听 TCP，**不需要任何特殊权限**，
+USB 连上且已授权即可执行。守护会自动完成整个链路：
+
+```
+插入 USB → 检测到无可用无线连接 → adb tcpip 5555 → 取手机 Wi-Fi IP
+        → adb connect IP:5555 → 后续掉线自动重连
+```
+
+实测日志：
+
+```
+[INFO] USB 设备 fbbd8bac 未开无线调试，自动切换 TCP 模式(端口 5555) ...
+[INFO]   ✓ 已通过 USB 自动建立无线连接: 192.168.17.212:5555
+```
+
+**生效后拔掉 USB 依然可用** —— TCP 监听与 USB 通道相互独立。
+
+### 两套发现方式并行
+
+| 方式 | 触发条件 | 特点 |
+|---|---|---|
+| 系统「无线调试」 | 手机上已手动开启 | 端口随机（10000+），重启手机端口会变 |
+| **`adb tcpip`** | 插着 USB 且尚未连上 | **端口固定 5555，免手动，推荐** |
+
+两者互不冲突：有无线调试端口就用现成的，没有再自动切 tcpip。
+
+### 注意事项
+
+- `adb tcpip` 会重启 adbd，当前 USB 连接会**短暂断开**（约 3 秒）后自动恢复
+- **重启手机后** tcpip 模式会失效，需重新插一次 USB（守护会自动处理）
+- 端口对同一 Wi-Fi 内的设备开放，首次连接需在手机上点「允许」。**公用网络慎用**
+- 想关闭此功能：设 `AUTO_TCPIP=0`
+- 手动触发：菜单栏「立即开启 TCP 模式」或 `adb tcpip 5555`
+
+### 恢复成 USB 模式
+
+```bash
+adb usb
+```
 
 ---
 
 ## 常见问题
 
 **Q：日志一直显示「未发现可用设备」？**
-1. 确认手机「无线调试」已打开（不是仅开「USB 调试」）
-2. 确认手机和 Mac 在**同一 Wi-Fi**（注意别连到访客网络 / 5G 与 2.4G 隔离网络）
-3. 企业网络可能屏蔽组播 → 参考上文，手动 `adb connect` 一次建立记忆端点
-4. 执行 `./bin/adb-wifi.sh once` 看三种发现方式的输出
+1. **最简单的办法：插上 USB**，守护会自动切换 TCP 模式并连上（见上文「插上 USB 全自动连接」）
+2. 若不用 USB，则确认手机「无线调试」已打开（不是仅开「USB 调试」）
+3. 确认手机和 Mac 在**同一 Wi-Fi**（注意别连到访客网络 / 5G 与 2.4G 隔离网络）
+4. 企业网络可能屏蔽组播 → 参考上文，手动 `adb connect` 一次建立记忆端点
+5. 执行 `./bin/adb-wifi.sh once` 看三种发现方式的输出
+
+**Q：插了 USB 但还是没连上？**
+1. 确认手机已允许「USB 调试」弹窗，`adb devices` 能看到设备且状态为 `device`
+2. 查看日志里的 tcpip 输出：`grep tcpip ~/Library/Application\ Support/adb-wifi-manager/logs/adb-wifi.log`
+3. 部分厂商 ROM 会限制 `adb tcpip`，此时只能手动开「无线调试」
+4. 手机未连 Wi-Fi 时无法转 TCP，守护会跳过并提示
 
 **Q：连接上了但 `adb devices` 显示 `unauthorized`？**
 在手机上确认「允许 USB 调试」弹窗。若无效，删除 `~/.android/adbkey*` 后重启守护并重新授权。

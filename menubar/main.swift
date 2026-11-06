@@ -122,6 +122,10 @@ struct Status {
     var knownFound: [String] = []
     var macIP = ""
     var devModel = ""
+    // 插 USB 自动转 TCP 模式的状态
+    var tcpipPort = ""
+    var tcpipListen = false
+    var autoTcpip = false
     // 结构化诊断结论（由脚本层统一给出，与 TUI 完全同源）
     var diagLevel = ""
     var diagTitle = ""
@@ -163,6 +167,9 @@ func loadStatus() -> Status {
     s.mdnsOK = (kv["MDNS_OK"] ?? kv["MDNS_ADB_COUNT"] ?? "0") != "0"
     s.macIP = kv["MAC_IP"] ?? ""
     s.devModel = kv["DEV_MODEL"] ?? ""
+    s.tcpipPort = kv["TCPIP_PORT"] ?? ""
+    s.tcpipListen = (kv["TCPIP_LISTEN"] ?? "0") == "1"
+    s.autoTcpip = (kv["AUTO_TCPIP"] ?? "0") == "1"
     s.diagLevel = kv["DIAG_LEVEL"] ?? ""
     s.diagTitle = kv["DIAG_TITLE"] ?? ""
     s.diagHint = kv["DIAG_HINT"] ?? ""
@@ -354,6 +361,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var env: [String] = []
         env.append("mDNS：" + (s.mdnsOK ? "可用" : "被屏蔽"))
         env.append("USB：" + (s.hasUSB ? "已连接" : "未连接"))
+        // 插 USB 自动转 TCP：状态一目了然
+        if s.autoTcpip {
+            if s.tcpipListen {
+                env.append("TCP 模式：已开启（端口 \(s.tcpipPort)）")
+            } else if s.hasUSB {
+                env.append("TCP 模式：待开启（插着 USB，稍候自动切换）")
+            } else {
+                env.append("TCP 模式：未开启（插 USB 可自动开启）")
+            }
+        } else {
+            env.append("TCP 模式：已关闭（AUTO_TCPIP=0）")
+        }
         var how: [String] = []
         if !s.usbFound.isEmpty { how.append("USB 读取") }
         if !s.knownFound.isEmpty { how.append("记忆端点") }
@@ -380,6 +399,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let reconnect = NSMenuItem(title: "立即重连一次", action: #selector(forceReconnect), keyEquivalent: "r")
         reconnect.target = self
         menu.addItem(reconnect)
+
+        // 插着 USB 且尚未开启 TCP 模式时，提供一键触发（无需等守护的节流周期）
+        if s.hasUSB && s.autoTcpip && !s.tcpipListen {
+            let tcp = NSMenuItem(title: "立即开启 TCP 模式（免手动开无线调试）",
+                                 action: #selector(enableTcpipNow), keyEquivalent: "t")
+            tcp.target = self
+            tcp.toolTip = "通过 USB 执行 adb tcpip \(s.tcpipPort)，之后即可无线连接"
+            menu.addItem(tcp)
+        }
 
         let devs = NSMenuItem(title: "打开 adb devices", action: #selector(openDevices), keyEquivalent: "d")
         devs.target = self
@@ -517,6 +545,52 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 self.busy = false
                 self.flash(title: "重连", text: msg)
+                self.refresh()
+            }
+        }
+    }
+
+    /// 一键开启 TCP 模式：通过 USB 对手机执行 adb tcpip，然后立即无线连接。
+    /// 这是「插上 USB 就自动搞定」的手动触发版，主要给想立刻生效的场景用，
+    /// 不必等守护那边的节流周期。真正的自动化由守护的 ensure_tcpip 完成。
+    @objc func enableTcpipNow() {
+        guard let serial = status.allDevices.first(where: { !$0.0.contains(":") })?.0,
+              !serial.isEmpty else {
+            showTextWindow(title: "未检测到 USB 设备",
+                           content: "请先用 USB 线连接手机并允许 USB 调试，\n再点击此菜单项。")
+            return
+        }
+        let port = status.tcpipPort.isEmpty ? "5555" : status.tcpipPort
+        busy = true
+        DispatchQueue.global().async {
+            let out = self.shell("/usr/bin/env", ["adb", "-s", serial, "tcpip", port])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            var msg = out
+            var ok = out.contains("restarting in TCP mode")
+            if ok {
+                // 等 adbd 重启后取手机 IP 并连接
+                var ip = self.shell("/usr/bin/env", ["adb", "-s", serial, "shell",
+                    "ip -4 addr show wlan0 | grep -oE 'inet [0-9.]+' | head -1 | cut -d' ' -f2"])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if ip.isEmpty {
+                    ip = self.shell("/usr/bin/env", ["adb", "-s", serial, "shell",
+                        "ip -4 route get 1.1.1.1 | grep -oE 'src [0-9.]+' | cut -d' ' -f2"])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                sleep(3)
+                if !ip.isEmpty {
+                    let c = self.shell("/usr/bin/env", ["adb", "connect", "\(ip):\(port)"])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    msg = c
+                    ok = c.contains("connected")
+                } else {
+                    msg = "已切换 TCP 模式，但未取到手机 Wi-Fi IP"
+                    ok = false
+                }
+            }
+            DispatchQueue.main.async {
+                self.busy = false
+                self.flash(title: ok ? "TCP 模式已开启" : "TCP 模式开启失败", text: msg)
                 self.refresh()
             }
         }

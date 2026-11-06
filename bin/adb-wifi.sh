@@ -34,6 +34,14 @@ MAX_TRIES="${MAX_TRIES:-3}"              # 单设备连续失败上限
 CANDIDATE_PORTS="${CANDIDATE_PORTS:-5555 39795 39796 40795 41795 37075 38075 43075 44075 45075 46075 47075 35075 36075 39075}"
 CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-12}" # 单次 adb connect 超时(秒)
 
+# 插 USB 自动开启无线调试（TCP 模式）
+# 原理：`adb tcpip <端口>` 让 adbd 额外监听一个 TCP 端口，不需要「无线调试」开关，
+#      也不需要 WRITE_SECURE_SETTINGS 权限，因此可以完全免手动。
+# 关闭「无线调试」或重启手机后，重新插一次 USB 即可恢复。
+AUTO_TCPIP="${AUTO_TCPIP:-1}"            # 1=插 USB 自动尝试，0=关闭
+TCPIP_PORT="${TCPIP_PORT:-5555}"         # tcpip 监听端口
+TCPIP_RETRY_INTERVAL="${TCPIP_RETRY_INTERVAL:-60}"  # 失败后重试间隔(秒)，避免频繁打扰手机
+
 APP_SUPPORT="$HOME/Library/Application Support/adb-wifi-manager"
 STATE_DIR="$APP_SUPPORT/state"
 LOG_DIR="$APP_SUPPORT/logs"
@@ -124,8 +132,11 @@ discover_usb() {
         [ -z "$port_line" ] && continue
 
         # ① 从 /proc/net/tcp{,6} 中取 LISTEN(0A) 状态的监听端口。
-        #    adbd 的无线调试端口由 Android 随机分配，因此取「非回环、10000-65535」的监听端口，
-        #    再通过 TCP 探测逐一验证。
+        #    adbd 的端口有两种来源：
+        #      - 系统「无线调试」：Android 随机分配，一般落在 10000-65535
+        #      - `adb tcpip N`：由我们指定，默认 5555（也可能被配置成其他值）
+        #    因此不能只认 10000+，否则 tcpip 5555 建立的端口会被漏掉。
+        #    这里取「非回环」的所有监听端口，再通过 TCP 探测逐一验证。
         #    注意：macOS 自带 bash 3.2 在 $(...) 内解析 case 会报语法错误，
         #    这里统一用 if 替代 case，保证在任何 macOS 上开箱可用。
         ports=$(echo "$port_line" | awk 'NR>1 && $4=="0A"{split($2,a,":"); print a[1], a[2]}' | while read -r laddr hport; do
@@ -133,7 +144,7 @@ discover_usb() {
             # 排除回环监听：IPv4 0100007F / IPv6 ::1 编码为 ...0100007F
             if [ "$laddr" = "0100007F" ] || [ "$laddr" = "0000000000000000000000000100007F" ]; then
                 :
-            elif [ "$p" -ge 10000 ] && [ "$p" -le 65535 ]; then
+            elif [ "$p" -ge 1024 ] && [ "$p" -le 65535 ]; then
                 echo "$p"
             fi
         done | sort -un)
@@ -157,6 +168,116 @@ discover_usb() {
             warn "USB 设备 $serial 未能验证出无线调试端口" >&2
         fi
     done
+}
+
+# ------------------------------------------------- 插 USB 自动开启无线（tcpip）
+# 这是「插上 USB 就自动完成」的关键路径。
+#
+# 为什么不用 settings put global adb_wifi_enabled 1：
+#   该写入需要 android.permission.WRITE_SECURE_SETTINGS，普通 adb shell 没有该权限，
+#   实测会抛 SecurityException。所以系统「无线调试」开关无法用 adb 直接打开。
+#
+# 改用 `adb tcpip <端口>`：它让 adbd 在指定端口上额外监听 TCP，命令本身不需要特殊权限，
+# 只要 USB 已连接且已授权即可。之后 adb connect IP:端口 就能走无线。
+# 注意：切换 tcpip 会重启 adbd，导致当前 USB 连接短暂断开后自动恢复。
+TCPIP_STAMP="$STATE_DIR/last_tcpip_attempt"   # 记录上次尝试的时间戳与结果
+
+# 从 USB 设备取 Wi-Fi IP（wlan0 优先，退化到默认路由源地址）
+device_wifi_ip() {
+    local serial="$1" ip
+    ip=$(adbw -s "$serial" shell 'ip -4 addr show wlan0 2>/dev/null | grep -oE "inet [0-9.]+" | head -1 | cut -d" " -f2' | tr -d '\r')
+    [ -z "$ip" ] && ip=$(adbw -s "$serial" shell 'ip -4 route get 1.1.1.1 2>/dev/null | grep -oE "src [0-9.]+" | cut -d" " -f2' | tr -d '\r')
+    echo "$ip"
+}
+
+# 设备端是否已在指定端口监听（非回环）
+device_listening_port() {
+    local serial="$1" want="$2" out p
+    out=$(adbw -s "$serial" shell "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null" | tr -d '\r')
+    [ -z "$out" ] && return 1
+    for p in $(echo "$out" | awk 'NR>1 && $4=="0A"{split($2,a,":"); print a[2]}' | sort -u); do
+        if [ "$((16#$p))" = "$want" ]; then return 0; fi
+    done
+    return 1
+}
+
+# 取第一台 USB（非网络）设备序列号
+# USB 序列号不带冒号（如 fbbd8bac），网络设备形如 192.168.1.5:5555
+first_usb_serial() {
+    local s
+    for s in $(all_serial); do
+        if [ "${s#*:}" = "$s" ]; then echo "$s"; return 0; fi
+    done
+    return 0
+}
+
+# 插着 USB 时，尝试切换到 TCP 模式并直连。
+# 成功时输出端点 ip:port 到 stdout（供主循环作为候选），失败返回 1。
+# 重试节流：同一台设备在 TCPIP_RETRY_INTERVAL 秒内不重复打扰（adb tcpip 会闪断 USB）。
+ensure_tcpip() {
+    [ "$AUTO_TCPIP" = "1" ] || return 1
+
+    local serial ip ep now last next_expire=""
+    serial="$(first_usb_serial)"
+    [ -z "$serial" ] && return 1
+
+    ip="$(device_wifi_ip "$serial")"
+    if [ -z "$ip" ]; then
+        info "USB 设备 $serial 无 Wi-Fi IP，跳过 tcpip（手机可能未连 Wi-Fi）" >&2
+        return 1
+    fi
+    ep="$ip:$TCPIP_PORT"
+
+    # 已经连上该端点，直接返回
+    if wifi_devices | grep -qxF "$ep"; then
+        echo "$ep"; return 0
+    fi
+
+    # 设备端已在监听 → 直接连，无需再切 tcpip
+    if device_listening_port "$serial" "$TCPIP_PORT"; then
+        info "USB 设备 $serial 已在监听 $TCPIP_PORT，直接连接 $ep" >&2
+        if try_connect "$ep" >&2; then echo "$ep"; return 0; fi
+        return 1
+    fi
+
+    # 节流：避免每轮都切 tcpip 导致 USB 反复闪断
+    now=$(date +%s)
+    if [ -f "$TCPIP_STAMP" ]; then
+        read -r last next_expire < "$TCPIP_STAMP" 2>/dev/null || last=0
+        case "$last" in ''|*[!0-9]*) last=0 ;; esac
+        if [ $((now - last)) -lt "$TCPIP_RETRY_INTERVAL" ]; then
+            info "tcpip 上次尝试在 $((now - last))s 前，$TCPIP_RETRY_INTERVAL 秒内不重复切换" >&2
+            return 1
+        fi
+    fi
+    echo "$now" > "$TCPIP_STAMP"
+
+    info "USB 设备 $serial 未开无线调试，自动切换 TCP 模式(端口 $TCPIP_PORT) ..." >&2
+    local out
+    out=$(tmo 15 "$ADB_BIN" -s "$serial" tcpip "$TCPIP_PORT" 2>&1 | tr -d '\r')
+    info "  -> $out" >&2
+    if ! echo "$out" | grep -q "restarting in TCP mode"; then
+        warn "  切换 TCP 模式失败（部分系统需在手机上确认，或已被厂商限制）" >&2
+        return 1
+    fi
+
+    # adbd 重启需要时间恢复
+    sleep 3
+    local i
+    for i in 1 2 3 4 5 6; do
+        if nc -z -G 2 -w 2 "$ip" "$TCPIP_PORT" 2>/dev/null; then break; fi
+        sleep 1
+    done
+
+    if try_connect "$ep" >&2; then
+        info "  ✓ 已通过 USB 自动建立无线连接: $ep" >&2
+        remember_endpoint "$ep"
+        echo "$ep"
+        return 0
+    fi
+
+    warn "  端口已切换但连接失败，稍后重试" >&2
+    return 1
 }
 
 # ---------------------------------------------------------------- 发现: TCP
@@ -305,7 +426,7 @@ main_loop() {
     trap 'info "收到停止信号，退出"; [ -n "${TRACKER_PID:-}" ] && kill "$TRACKER_PID" 2>/dev/null; [ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ] && rm -f "$PID_FILE"; exit 0' INT TERM
 
     local last_prefix="" last_usb_listing="" prefix="" fails=0
-    local ep mdns_eps usb_eps known_eps candidates connected_eps
+    local ep mdns_eps usb_eps known_eps candidates connected_eps tcpip_eps
 
     info "========== adb-wifi-manager 启动 =========="
     info "adb: $ADB_BIN ($("$ADB_BIN" version 2>/dev/null | head -1))"
@@ -330,9 +451,14 @@ main_loop() {
         mdns_eps=$(discover_mdns)
         usb_eps=$(discover_usb)
         known_eps=$(discover_known)
+        # 插着 USB 且还没有可用无线连接时，自动切换 TCP 模式（免手动开无线调试）
+        tcpip_eps=""
+        if [ -z "$connected_eps" ]; then
+            tcpip_eps=$(ensure_tcpip)
+        fi
 
         # 只接受合法的 IP:PORT，过滤非端点输出（防止提示文本混入被误当成设备）
-        candidates=$(printf '%s\n%s\n%s\n' "$mdns_eps" "$usb_eps" "$known_eps" \
+        candidates=$(printf '%s\n%s\n%s\n%s\n' "$mdns_eps" "$usb_eps" "$known_eps" "$tcpip_eps" \
             | awk 'NF' \
             | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$' \
             | sort -u)
@@ -548,13 +674,20 @@ cmd_diag() {
         _dev_opts=$(adbw -s "$usb_serial" shell settings get global development_settings_enabled 2>/dev/null | tr -d '\r')
         echo "DEV_ADB_WIFI_ENABLED=$_adb_wifi"
         echo "DEV_DEV_OPTS=$_dev_opts"
-        wifi_ip=$(adbw -s "$usb_serial" shell 'ip -4 addr show wlan0 2>/dev/null | grep -oE "inet [0-9.]+" | head -1 | cut -d" " -f2' | tr -d '\r')
+        wifi_ip=$(device_wifi_ip "$usb_serial" | tr -d '\r')
         echo "DEV_WIFI_IP=${wifi_ip}"
         echo "USB_FOUND=$(discover_usb 2>/dev/null | tr '\n' ',')"
+        # tcpip 相关：是否已在监听指定端口（决定能否免手动直连）
+        _tcpip_listen=0
+        device_listening_port "$usb_serial" "$TCPIP_PORT" && _tcpip_listen=1
+        echo "TCPIP_PORT=$TCPIP_PORT"
+        echo "TCPIP_LISTEN=$_tcpip_listen"
+        echo "AUTO_TCPIP=$AUTO_TCPIP"
     else
         echo "DEV_SDK="; echo "DEV_MODEL="; echo "DEV_ANDROID="
         echo "DEV_ADB_WIFI_ENABLED="; echo "DEV_DEV_OPTS="; echo "DEV_WIFI_IP="
         echo "USB_FOUND="
+        echo "TCPIP_PORT=$TCPIP_PORT"; echo "TCPIP_LISTEN=0"; echo "AUTO_TCPIP=$AUTO_TCPIP"
     fi
 
     known_eps=$(discover_known 2>/dev/null)
@@ -568,9 +701,32 @@ cmd_diag() {
     elif [ -n "$(wifi_devices)" ] && [ "${raw_mdns:-0}" -gt 0 ]; then
         level="ok"; title="连接正常"; hint="mDNS 自动发现可用"; action=""
     elif [ -n "$(wifi_devices)" ]; then
-        level="ok"; title="设备已连接（mDNS 被屏蔽）"; hint="靠记忆端点维持，端口变化后需重连"; action="manual_connect"
+        # 区分：是靠 tcpip 端口连上的，还是记忆端点维持的
+        local _wdev _tcpip_conn=0
+        for _wdev in $(wifi_devices); do
+            if [ "${_wdev##*:}" = "$TCPIP_PORT" ]; then _tcpip_conn=1; fi
+        done
+        if [ "$_tcpip_conn" = "1" ]; then
+            # tcpip 模式下 USB 只是"最初把它们连起来"的手段，之后无线独立工作，
+            # 因此按当前有没有插 USB 给出不同文案，避免拔线后仍显示"USB 已连接"造成误解
+            if [ -n "$usb_serial" ]; then
+                level="ok"; title="设备已连接（USB 自动转 TCP）"
+                hint="TCP 端口 $TCPIP_PORT 已开启，可安全拔掉 USB"
+            else
+                level="ok"; title="设备已连接（无线 $TCPIP_PORT 端口）"
+                hint="USB 已拔出，无线连接独立保持正常"
+            fi
+            action=""
+        else
+            level="ok"; title="设备已连接（mDNS 被屏蔽）"; hint="靠记忆端点维持，端口变化后需重连"; action="manual_connect"
+        fi
     elif [ -n "$usb_serial" ] && [ "${_dev_opts:-}" = "0" ]; then
         level="error"; title="手机「开发者选项」未开启"; hint="插着 USB，可在手机上自动打开设置页"; action="phone_dev_settings"
+    elif [ -n "$usb_serial" ] && [ "$AUTO_TCPIP" = "1" ]; then
+        # 插着 USB 且开启自动 tcpip：守护会自动切换，无需用户去设置里手动开
+        level="warn"; title="USB 已连接，正在自动建立无线连接"
+        hint="守护将自动切换 TCP 模式(端口 $TCPIP_PORT)，无需手动开无线调试"
+        action="reconnect_now"
     elif [ -n "$usb_serial" ] && [ "${_adb_wifi:-}" = "0" ]; then
         level="error"; title="手机「无线调试」开关未打开"; hint="插着 USB，可在手机上自动打开设置页"; action="phone_wireless"
     elif [ -n "$usb_serial" ]; then
