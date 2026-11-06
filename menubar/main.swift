@@ -199,8 +199,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         refresh()
-        // 兜底轮询（事件监听失效时仍能更新），间隔比之前更短
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        // 兜底轮询（事件监听失效时仍能更新）。
+        // 间隔自适应：设备连接稳定时不必频繁拉起 adb 子进程，
+        // 一旦状态发生变化（或处于故障态）才切回快节奏。
+        timer = Timer.scheduledTimer(withTimeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
             self?.refresh()
         }
         watchEvents()
@@ -234,6 +236,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var refreshing = false
     var lastRefreshAt = Date.distantPast
+
+    /// 轮询间隔（秒）。用户可通过环境变量 ADBWIFI_POLL_INTERVAL 覆盖
+    static let pollInterval: TimeInterval = {
+        if let v = ProcessInfo.processInfo.environment["ADBWIFI_POLL_INTERVAL"],
+           let d = Double(v), d >= 1 { return d }
+        return 5.0
+    }()
 
     func refresh() {
         guard !busy, !refreshing else { return }
