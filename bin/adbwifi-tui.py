@@ -1,0 +1,1264 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+adb-wifi TUI —— Android 无线调试，全菜单操作，无需记忆任何命令。
+
+特点：
+  * 状态一目了然：守护进程 / 已连接设备 / 发现方式（mDNS、USB、记忆端点）
+  * 自动诊断：识别"网络屏蔽 mDNS"等场景，给出可点击的解决方案
+  * 半自动化修复：在手机上自动打开开发者选项页、自动连接、自动配对准入
+  * 纯 Python 标准库 curses，零第三方依赖
+
+启动： ./adbwifi  或  python3 bin/adbwifi-tui.py
+"""
+
+import os
+import re
+import sys
+import unicodedata
+import time
+import signal
+import subprocess
+import threading
+import curses
+
+APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPT = os.path.join(APP_DIR, "bin", "adb-wifi.sh")
+SUPPORT = os.path.expanduser("~/Library/Application Support/adb-wifi-manager")
+LOG_FILE = os.path.join(SUPPORT, "logs", "adb-wifi.log")
+
+ADB = os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")
+if not os.path.exists(ADB):
+    try:
+        ADB = subprocess.run(["which", "adb"], capture_output=True, text=True).stdout.strip() or "adb"
+    except Exception:
+        ADB = "adb"
+
+ENV = dict(os.environ)
+ENV["PATH"] = ("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:"
+               + os.path.dirname(ADB))
+
+
+# ============================== 基础工具 ==============================
+
+def run(cmd, timeout=30, shell=False):
+    """执行命令，返回 (returncode, stdout+stderr)"""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, env=ENV,
+                           shell=shell, errors="replace")
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except subprocess.TimeoutExpired:
+        return -1, "执行超时"
+    except Exception as e:  # noqa
+        return -1, str(e)
+
+
+def script(*args, timeout=40):
+    return run(["/bin/bash", SCRIPT] + list(args), timeout=timeout)
+
+
+def adb(*args, timeout=20):
+    return run([ADB] + list(args), timeout=timeout)
+
+
+def parse_kv(text):
+    d = {}
+    for line in text.splitlines():
+        if "=" in line and not line.startswith(" "):
+            k, _, v = line.partition("=")
+            d[k.strip()] = v.strip()
+    return d
+
+
+# ============================== 状态采集 ==============================
+
+class State:
+    """一次诊断快照"""
+    def __init__(self):
+        self.raw = {}
+        self.ts = 0.0
+        self.error = ""
+
+    @property
+    def daemon_running(self):
+        return bool(self.raw.get("DAEMON_PID"))
+
+    @property
+    def daemon_mode(self):
+        return self.raw.get("DAEMON_MODE", "stopped")
+
+    @property
+    def wifi_devices(self):
+        v = self.raw.get("WIFI_DEVICES", "")
+        return [x for x in v.split(",") if x]
+
+    @property
+    def all_devices(self):
+        v = self.raw.get("ALL_DEVICES", "")
+        out = []
+        for item in v.split(","):
+            if "|" in item:
+                name, st = item.split("|", 1)
+                out.append((name, st))
+        return out
+
+    @property
+    def has_usb(self):
+        return bool(self.raw.get("USB_SERIAL"))
+
+    @property
+    def mdns_works(self):
+        """mDNS 是否真的能发现 adb 服务"""
+        return int(self.raw.get("MDNS_ADB_COUNT", "0") or 0) > 0
+
+    @property
+    def mdns_found(self):
+        return [x for x in self.raw.get("MDNS_FOUND", "").split(",") if x]
+
+    @property
+    def usb_found(self):
+        return [x for x in self.raw.get("USB_FOUND", "").split(",") if x]
+
+    @property
+    def known_found(self):
+        return [x for x in self.raw.get("KNOWN_FOUND", "").split(",") if x]
+
+    @property
+    def known_list(self):
+        return [x for x in self.raw.get("KNOWN_LIST", "").split(",") if x]
+
+
+EVENTS_LOG = os.path.join(SUPPORT, "state", "events.log")
+
+
+def event_seq():
+    """轻量读取设备事件序号（只 stat 文件，不跑 adb），用于判断是否需要刷新"""
+    try:
+        st = os.stat(EVENTS_LOG)
+        return (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return (0, 0)
+
+
+def collect_state():
+    st = State()
+    code, out = script("diag", timeout=45)
+    if code != 0 and not out.strip():
+        st.error = "无法执行诊断脚本"
+    st.raw = parse_kv(out)
+    st.ts = time.time()
+    if not st.raw:
+        st.error = out.strip()[:200] or "诊断无输出"
+    return st
+
+
+# ============================== 诊断引擎 ==============================
+
+class Issue:
+    """一条诊断结论 + 可执行的解决方案"""
+    def __init__(self, level, title, detail, actions):
+        self.level = level       # "error" / "warn" / "info" / "ok"
+        self.title = title
+        self.detail = detail
+        self.actions = actions   # [(label, callable)]
+
+
+def diagnose(st):
+    """返回 Issue 列表"""
+    issues = []
+
+    if st.error:
+        issues.append(Issue("error", "诊断失败", st.error,
+                            [("重新诊断", "reconnect_now"),
+                             ("查看守护日志", "show_log")]))
+        return issues
+
+    if not st.raw:
+        issues.append(Issue("warn", "尚未获取到设备状态",
+                            "正在采集状态，请稍候；若长时间无变化请按 R 重试。",
+                            [("重新诊断", "reconnect_now")]))
+        return issues
+
+    connected = st.wifi_devices
+    mdns_ok = st.mdns_works
+    has_usb = st.has_usb
+    dev_opts = st.raw.get("DEV_DEV_OPTS", "")
+    adb_wifi = st.raw.get("DEV_ADB_WIFI_ENABLED", "")
+
+    # ---- 情况 1：一切正常 ----
+    if connected and mdns_ok:
+        issues.append(Issue("ok", "连接正常",
+                            "无线设备已连接，mDNS 自动发现工作正常。", []))
+        return issues
+
+    if connected and not mdns_ok:
+        issues.append(Issue(
+            "ok", "设备已连接（但 mDNS 不可用）",
+            "当前连接依靠「记忆端点」维持。此网络的 mDNS 组播被屏蔽，"
+            "手机重启或端口变化后需重新连接一次。",
+            [("手动添加新端口", "manual_connect")]))
+        issues.append(Issue(
+            "info", "当前网络屏蔽了 mDNS 组播广播",
+            "这是导致「自动发现失效」的根因，不是配置错误。\n"
+            "企业 Wi-Fi 常用客户端隔离/组播过滤，而 Android 无线调试依赖 mDNS 广播端口。\n"
+            "推荐方案：① 插上 USB 线让工具直接读取真实端口（最可靠）\n"
+            "          ② 换到手机热点或家庭网络\n"
+            "          ③ 保持当前记忆端点连接，端口变化时手动补一次",
+            [("① 插 USB 自动读取端口（说明）", "usb_help"),
+             ("③ 手动添加新端口", "manual_connect"),
+             ("② 查看完整操作指引", "help")]))
+        return issues
+
+    # ---- 情况 2：未连接 ----
+    if not connected:
+        # 2a 有 USB 但开发者选项没开
+        if has_usb and dev_opts == "0":
+            issues.append(Issue(
+                "error", "手机的「开发者选项」未开启",
+                "工具已检测到 USB 连接，但开发者选项处于关闭状态。\n"
+                "建议按下面任一步骤操作，完成后回到本界面按 R 刷新。",
+                [("① 在手机上自动打开开发者选项页", "phone_dev_settings"),
+                 ("② 查看开启步骤", "help_devopts")]))
+        elif has_usb and adb_wifi == "0":
+            issues.append(Issue(
+                "error", "手机的「无线调试」开关未打开",
+                "开发者选项已开启，但无线调试处于关闭状态。\n"
+                "该开关必须打开，本工具才能通过 Wi-Fi 连接。",
+                [("① 在手机上自动打开无线调试页", "phone_wireless"),
+                 ("② 查看开启步骤", "help_wireless")]))
+        elif has_usb:
+            issues.append(Issue(
+                "warn", "已检测到 USB 设备，但尚未建立无线连接",
+                "正在尝试读取手机的真实无线调试端口。按 R 重新诊断。",
+                [("立即重试连接", "reconnect_now")]))
+        elif not mdns_ok:
+            issues.append(Issue(
+                "error", "未发现任何设备，且此网络屏蔽了 mDNS 广播",
+                "这是最常见的情况：网络环境导致自动发现失效。\n"
+                "请选择下面的解决方案。",
+                [("① 用 USB 线插上手机（自动读取端口）", "usb_help"),
+                 ("② 手动输入手机上显示的 IP:端口", "manual_connect"),
+                 ("③ 查看完整操作指引", "help")]))
+        else:
+            issues.append(Issue(
+                "warn", "mDNS 正常，但没有发现已打开无线调试的设备",
+                "请确认手机「开发者选项 → 无线调试」已打开，且与本机在同一 Wi-Fi。",
+                [("在手机上打开开发者选项页", "phone_dev_settings"),
+                 ("手动输入 IP:端口", "manual_connect")]))
+
+    # ---- 守护进程 ----
+    if not st.daemon_running:
+        issues.append(Issue(
+            "warn", "后台守护进程未运行",
+            "开启后无需手动操作，掉线会自动重连。",
+            [("启动守护（含开机自启）", "start_daemon")]))
+
+    return issues
+
+
+# ============================== 修复动作 ==============================
+
+def open_mac_settings():
+    """打开 macOS 网络设置（排查 Wi-Fi / 网络隔离）"""
+    for url in ["x-apple.systempreferences:com.apple.wifi-settings-extension",
+                "x-apple.systempreferences:com.apple.preference.network"]:
+        run(["/usr/bin/open", url])
+        time.sleep(0.4)
+    return "已打开 macOS 网络设置"
+
+
+def usb_serial():
+    """返回当前 USB 连接的设备序列号（无线设备不算）"""
+    code, out = adb("devices")
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device" and ":" not in parts[0]:
+            return parts[0]
+    return ""
+
+
+def _am_start(serial, args):
+    """在指定（USB）设备上执行 am start"""
+    cmd = ["shell"]
+    if serial:
+        cmd = ["-s", serial, "shell"]
+    return adb(*(cmd + ["am", "start"] + args))
+
+
+def open_android_dev_settings(serial=None):
+    """在手机上打开开发者选项页（需 USB，避免误操作日常使用的无线连接）"""
+    serial = serial or usb_serial()
+    if not serial:
+        return ("需要先用 USB 线连接手机。\n\n"
+                "该操作会向手机发送系统 Intent 直接跳转页面，"
+                "必须通过 USB 连接才稳定可靠。\n"
+                "插好 USB 后按 R 刷新，再点此按钮。")
+    code, out = _am_start(serial, ["-a", "android.settings.APPLICATION_DEVELOPMENT_SETTINGS"])
+    if "Error" in out:
+        return "打开失败：" + out.strip()[:150]
+    return ("已在手机上打开「开发者选项」页面。\n\n"
+            "接下来的路径：\n"
+            "  开发者选项 → 无线调试 → 打开开关 → 点击「使用配对码配对设备」\n"
+            "完成后回到本界面按 R 重新诊断。")
+
+
+def open_android_wireless_debug(serial=None):
+    """尝试直接在手机上打开无线调试页面（部分 ROM 支持）"""
+    serial = serial or usb_serial()
+    if not serial:
+        return ("需要先用 USB 线连接手机才能自动跳转页面。\n\n"
+                "也可以手动操作：设置 → 开发者选项 → 无线调试")
+    candidates = [
+        "com.android.settings/.Settings$WirelessDebuggingActivity",
+        "com.android.settings/.development.WirelessDebuggingActivity",
+    ]
+    for c in candidates:
+        code, out = _am_start(serial, ["-n", c])
+        if "Error" not in out and "does not exist" not in out:
+            return "已在手机上打开「无线调试」页面"
+    # 小米等定制 ROM 无独立页面，退回到开发者选项
+    code, out = _am_start(serial, ["-a", "android.settings.APPLICATION_DEVELOPMENT_SETTINGS"])
+    if "Error" not in out:
+        return ("已在手机上打开「开发者选项」。\n\n"
+                "该手机的 ROM 没有独立的「无线调试」页面，"
+                "请在列表中手动点击「无线调试」。")
+    return "无法自动打开，请手动进入：设置 → 开发者选项 → 无线调试"
+
+
+def open_pairing_help():
+    return ("配对步骤：\n"
+            "1. 手机上：设置 → 开发者选项 → 无线调试\n"
+            "2. 点击「使用配对码配对设备」，记下 6 位码和 IP:端口\n"
+            "3. 在本工具按 P，输入配对码和端口\n"
+            "4. 配对成功后，再按 C 输入 IP:无线调试端口")
+
+
+def adb_connect(endpoint):
+    code, out = adb("connect", endpoint, timeout=20)
+    return out.strip()
+
+
+def adb_pair(endpoint, code_):
+    p = subprocess.Popen([ADB, "pair", endpoint], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, env=ENV)
+    try:
+        out, _ = p.communicate(input=code_ + "\n", timeout=25)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        return "配对超时"
+    return out.strip()
+
+
+def read_log_tail(n=500):
+    try:
+        with open(LOG_FILE, "r", errors="replace") as f:
+            lines = f.readlines()
+        return lines[-n:]
+    except FileNotFoundError:
+        return []
+
+
+# ============================== TUI 组件 ==============================
+
+C_HEADER = 1
+C_BORDER = 2
+C_OK = 3
+C_WARN = 4
+C_ERR = 5
+C_INFO = 6
+C_DIM = 7
+C_SEL = 8
+C_TITLE = 9
+
+
+# ---------------- 鼠标事件兼容层 ----------------
+# macOS 自带 Python 3.9 + 系统 ncurses 缺少 BUTTON5_* 常量，
+# 而滚轮「向下」恰恰会以该位上报（值为 0x8000000）。
+# 这里按掩码直接定义，不依赖属性是否存在，避免 AttributeError 崩溃。
+def _btn(attr, mask):
+    return int(getattr(curses, attr, mask))
+
+MOUSE_LEFT = (_btn("BUTTON1_CLICKED", 0x4)
+              | _btn("BUTTON1_PRESSED", 0x2)
+              | _btn("BUTTON1_RELEASED", 0x1)
+              | _btn("BUTTON1_DOUBLE_CLICKED", 0x8)
+              | _btn("BUTTON1_TRIPLE_CLICKED", 0x10))
+MOUSE_WHEEL_UP = _btn("BUTTON4_PRESSED", 0x80000)
+MOUSE_WHEEL_DOWN = _btn("BUTTON5_PRESSED", 0x8000000)
+
+
+
+# ---------------- 显示宽度工具（中文占 2 列，必须按列而非字符计算） ----------------
+
+def dwidth(text):
+    """字符串在终端上的显示宽度"""
+    w = 0
+    for ch in text:
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def clip_to(text, maxw):
+    """按显示宽度截断，末尾不加省略号（避免错位）"""
+    if maxw <= 0:
+        return ""
+    out, w = [], 0
+    for ch in text:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if w + cw > maxw:
+            break
+        out.append(ch)
+        w += cw
+    return "".join(out)
+
+
+def wrap_text(text, maxw):
+    """按显示宽度折行（中文友好）"""
+    if maxw <= 2:
+        return [text]
+    lines, cur, w = [], "", 0
+    for ch in text:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if w + cw > maxw:
+            lines.append(cur)
+            cur, w = "", 0
+        cur += ch
+        w += cw
+    lines.append(cur)
+    return lines or [""]
+
+
+def pad_to(text, width):
+    """右补空格到指定显示宽度"""
+    d = width - dwidth(text)
+    return text + (" " * d if d > 0 else "")
+
+
+
+class InputDialog:
+    """单行输入框"""
+    def __init__(self, stdscr, title, prompt, default="", hint=""):
+        self.scr = stdscr
+        self.title = title
+        self.prompt = prompt
+        self.value = default
+        self.hint = hint
+        self.cursor = len(default)
+
+    def edit(self):
+        curses.curs_set(1)
+        while True:
+            h, w = self.scr.getmaxyx()
+            bw = min(max(len(self.prompt) + 20, 56), w - 4)
+            bh = 7 + (2 if self.hint else 0)
+            y = max(0, (h - bh) // 2)
+            x = max(0, (w - bw) // 2)
+            win = curses.newwin(bh, bw, y, x)
+            win.keypad(True)
+            win.attron(curses.color_pair(C_BORDER))
+            win.box()
+            title = " " + self.title + " "
+            win.addstr(0, 2, title[:bw - 4])
+            win.addstr(2, 2, self.prompt[:bw - 4])
+            if self.hint:
+                for i, ln in enumerate(self.hint.split("\n")[:2]):
+                    win.addstr(3 + i, 2, ln[:bw - 4], curses.color_pair(C_DIM))
+                fy = 3 + min(2, len(self.hint.split("\n")))
+            else:
+                fy = 3
+            win.addstr(fy, 2, "> ")
+            field_w = bw - 6
+            disp = self.value[-field_w:]
+            win.addstr(fy, 4, disp.ljust(field_w))
+            win.addstr(fy + 2, 2, "Enter 确认   Esc 取消".ljust(bw - 4),
+                       curses.color_pair(C_DIM))
+            win.attroff(curses.color_pair(C_BORDER))
+            cy = fy
+            cx = 4 + min(len(self.value), field_w - 1)
+            win.move(cy, cx)
+            win.refresh()
+
+            ch = win.getch()
+            if ch in (27,):
+                curses.curs_set(0)
+                return None
+            elif ch in (10, 13, curses.KEY_ENTER):
+                curses.curs_set(0)
+                return self.value.strip()
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.value = self.value[:-1]
+            elif ch == curses.KEY_DC:
+                self.value = ""
+            elif 32 <= ch < 127:
+                self.value += chr(ch)
+
+
+class Menu:
+    """可点击/键盘操作的菜单项"""
+    def __init__(self, key, label, desc, fn):
+        self.key = key
+        self.label = label
+        self.desc = desc
+        self.fn = fn
+
+
+class App:
+    def __init__(self, stdscr):
+        self.scr = stdscr
+        self.state = State()
+        self.issues = []
+        self.selected = 0
+        self.status_msg = "正在诊断…"
+        self.busy = False
+        self.running = True
+        self.detail_view = None      # 当前展示的详情文本
+        self.detail_title = ""
+        self.scroll = 0
+        self.mouse_enabled = False
+        self.click_regions = []      # (y, x1, x2, callback)
+        self.last_event_seq = (0, 0)
+
+    # -------------------------- 配色 --------------------------
+    def init_colors(self):
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(C_HEADER, curses.COLOR_WHITE, curses.COLOR_BLUE)
+            curses.init_pair(C_BORDER, curses.COLOR_CYAN, -1)
+            curses.init_pair(C_OK, curses.COLOR_GREEN, -1)
+            curses.init_pair(C_WARN, curses.COLOR_YELLOW, -1)
+            curses.init_pair(C_ERR, curses.COLOR_RED, -1)
+            curses.init_pair(C_INFO, curses.COLOR_CYAN, -1)
+            curses.init_pair(C_DIM, curses.COLOR_WHITE, -1)
+            curses.init_pair(C_SEL, curses.COLOR_BLACK, curses.COLOR_CYAN)
+            curses.init_pair(C_TITLE, curses.COLOR_BLUE, -1)
+        except Exception:
+            pass
+
+    # -------------------------- 刷新 --------------------------
+    def refresh_state(self):
+        self.busy = True
+        self.status_msg = "正在诊断，请稍候…"
+        self.draw()
+        st = collect_state()
+        self.state = st
+        self.issues = diagnose(st)
+        self.last_event_seq = event_seq()
+        self.busy = False
+        self.status_msg = "诊断完成  按 R 刷新"
+        if self.selected >= len(self.issues):
+            self.selected = 0
+
+    def refresh_async(self):
+        if self.busy:
+            return
+        t = threading.Thread(target=self.refresh_state, daemon=True)
+        t.start()
+
+    # -------------------------- 绘制 --------------------------
+    def addstr(self, y, x, text, attr=0):
+        """按显示列宽绘制（中文占 2 列），超宽自动裁剪"""
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return
+        avail = w - x - 1
+        if avail <= 0:
+            return
+        text = clip_to(text, avail)
+        if not text:
+            return
+        try:
+            self.scr.addstr(y, x, text, attr)
+        except curses.error:
+            pass
+
+    def hline(self, y, ch="─", attr=None):
+        h, w = self.scr.getmaxyx()
+        if attr is None:
+            attr = curses.color_pair(C_BORDER)
+        self.addstr(y, 0, ch * (w - 1), attr)
+
+    def draw(self):
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        self.click_regions = []
+
+        # ---- 标题栏（整行反色背景，中英文混排按显示列宽定位）----
+        st = self.state
+        if st.daemon_running:
+            mode = "开机自启" if st.daemon_mode == "launchd" else "手动"
+            ds = "● 守护运行中 (%s)" % mode
+            ds_attr = curses.color_pair(C_OK)
+        else:
+            ds = "○ 守护已停止"
+            ds_attr = curses.color_pair(C_DIM)
+        title = " ADB 无线调试管理器 "
+        help_txt = "Q 退出  R 刷新  ? 帮助  "
+        hw = dwidth(help_txt)
+        try:
+            self.scr.addstr(0, 0, " " * (w - 1), curses.color_pair(C_HEADER))
+        except curses.error:
+            pass
+        self.addstr(0, 0, title, curses.color_pair(C_HEADER) | curses.A_BOLD)
+        x = dwidth(title) + 2
+        self.addstr(0, x, ds, ds_attr | curses.A_BOLD)
+        if x + dwidth(ds) + hw + 3 < w:
+            self.addstr(0, w - hw - 1, help_txt, curses.color_pair(C_HEADER))
+
+        y = 1
+        if h < 20 or w < 60:
+            self.addstr(y, 1, "窗口太小，请放大终端 (至少 60x20)", curses.color_pair(C_ERR))
+            self.scr.refresh()
+            return
+
+        # ---- 连接状态区 ----
+        self.addstr(y, 1, "连接状态", curses.color_pair(C_TITLE) | curses.A_BOLD)
+        y += 1
+        devs = st.wifi_devices
+        if devs:
+            for i, d in enumerate(devs[:3]):
+                mark = "✓" if i == 0 else " "
+                self.addstr(y, 2, "%s %s" % (mark, d), curses.color_pair(C_OK) | curses.A_BOLD)
+                y += 1
+        else:
+            self.addstr(y, 2, "✗ 没有无线设备连接", curses.color_pair(C_ERR))
+            y += 1
+
+        usb = [d for d, s in st.all_devices if ":" not in d]
+        if usb:
+            self.addstr(y, 2, "USB: %s" % ", ".join(usb), curses.color_pair(C_INFO))
+        else:
+            self.addstr(y, 2, "USB: 未连接", curses.color_pair(C_DIM))
+        y += 1
+
+        # 发现方式
+        mdns = "mDNS: 可用" if st.mdns_works else "mDNS: 被屏蔽 ✗"
+        mdns_attr = curses.color_pair(C_OK) if st.mdns_works else curses.color_pair(C_ERR)
+        self.addstr(y, 2, mdns, mdns_attr)
+        how = []
+        if st.usb_found:
+            how.append("USB 读取")
+        if st.mdns_found:
+            how.append("mDNS")
+        if st.known_found:
+            how.append("记忆端点")
+        self.addstr(y, 2 + dwidth(mdns) + 3,
+                    "发现方式: " + ("、".join(how) if how else "无"),
+                    curses.color_pair(C_INFO))
+        y += 1
+        # 本机网络信息（便于确认与手机是否同一网段）
+        mac_ip = st.raw.get("MAC_IP", "")
+        dev_ip = st.raw.get("DEV_WIFI_IP", "")
+        if mac_ip:
+            net_txt = "本机: %s" % mac_ip
+            note = ""
+            if dev_ip and mac_ip.split(".")[:3] != dev_ip.split(".")[:3]:
+                note = "  ⚠ 与手机网段不同"
+            self.addstr(y, 2, net_txt + note,
+                        curses.color_pair(C_WARN) if note else curses.color_pair(C_DIM))
+            y += 1
+
+        # mDNS 被屏蔽时给出醒目横幅
+        if not st.mdns_works:
+            banner = (" ⚠ 此网络屏蔽了 mDNS 广播，无法自动发现新的无线调试设备。"
+                      "按 Enter 查看解决方案 ")
+            attr = curses.color_pair(C_WARN) | curses.A_REVERSE | curses.A_BOLD
+            self.addstr(y, 1, pad_to(banner, w - 3), attr)
+            self.click_regions.append((y, 1, w - 2, lambda: self.jump_to_issue("mDNS")))
+            y += 1
+
+        self.hline(y)
+        y += 1
+
+        # ---- 诊断与解决方案 ----
+        hdr = "诊断与解决方案"
+        self.addstr(y, 1, hdr, curses.color_pair(C_TITLE) | curses.A_BOLD)
+        tip = "↑↓ 选择   Enter 查看方案"
+        self.addstr(y, 3 + dwidth(hdr), tip, curses.color_pair(C_DIM))
+        if self.busy:
+            self.addstr(y, 3 + dwidth(hdr) + dwidth(tip) + 3, "⟳ 诊断中…",
+                        curses.color_pair(C_WARN))
+        y += 1
+
+        remaining = h - y - 3
+        shown = 0
+        for idx, iss in enumerate(self.issues):
+            if shown >= remaining:
+                break
+            sel = (idx == self.selected)
+            color = {"ok": C_OK, "warn": C_WARN, "error": C_ERR, "info": C_INFO}[iss.level]
+            icon = {"ok": "✓", "warn": "!", "error": "✗", "info": "i"}[iss.level]
+            prefix = "▶ " if sel else "  "
+            line = "%s[%s] %s" % (prefix, icon, iss.title)
+            attr = curses.color_pair(color) | curses.A_BOLD | curses.A_REVERSE
+            # 选中行整行反白，方便鼠标识别可点击区域
+            self.addstr(y, 1, pad_to(line, w - 3), attr)
+            self.click_regions.append((y, 1, w - 2, lambda i=idx: self.select_and_act(i)))
+            y += 1
+            shown += 1
+
+            if sel:
+                indent = 4
+                avail = w - indent - 2
+                for dl in iss.detail.split("\n"):
+                    for wl in wrap_text(dl, avail):
+                        if shown >= remaining:
+                            break
+                        self.addstr(y, indent, wl, curses.color_pair(C_DIM))
+                        y += 1
+                        shown += 1
+                    if shown >= remaining:
+                        break
+                if iss.actions and shown < remaining:
+                    # 按可用宽度收纳方案摘要，放不下的用 "等 N 项" 省略，
+                    # 避免超宽被硬截断成半句话
+                    avail = w - indent - 2
+                    parts, used = [], 4
+                    for a in iss.actions:
+                        piece = ("   " if parts else "") + a[0]
+                        if used + dwidth(piece) > avail - 8:
+                            break
+                        parts.append(piece)
+                        used += dwidth(piece)
+                    more = len(iss.actions) - len(parts)
+                    acts = "▸ " + "".join(parts)
+                    if more > 0:
+                        acts += "  等 %d 项" % len(iss.actions)
+                    self.addstr(y, indent - 2, acts, curses.color_pair(C_INFO))
+                    y += 1
+                    shown += 1
+        if not self.issues:
+            self.addstr(y, 2, "（无诊断结果，按 R 重新诊断）", curses.color_pair(C_DIM))
+            y += 1
+
+        # ---- 底部操作栏 ----
+        yb = h - 2
+        self.hline(yb)
+        menu = self.build_menu()
+        x = 2
+        for i, m in enumerate(menu):
+            label = " %s " % m.label
+            lw = dwidth(label)
+            if x + lw >= w - 2:
+                break
+            attr = curses.color_pair(C_INFO) | curses.A_REVERSE
+            self.addstr(yb + 1, x, label, attr)
+            self.click_regions.append((yb + 1, x, x + lw, m.fn))
+            x += lw + 1
+
+        self.scr.refresh()
+
+    def build_menu(self):
+        st = self.state
+        menu = []
+        menu.append(Menu("a", "守护 " + ("停止" if st.daemon_running else "启动"),
+                         "", self.toggle_daemon))
+        if st.daemon_running:
+            menu.append(Menu("S", "重新连接", "", self.force_reconnect))
+        menu.append(Menu("c", "手动连接", "", self.do_connect_dialog))
+        menu.append(Menu("p", "配对设备", "", self.do_pair_dialog))
+        menu.append(Menu("d", "设备列表", "", self.show_devices))
+        menu.append(Menu("l", "日志", "", self.show_log))
+        menu.append(Menu("?", "帮助", "", self.show_help))
+        menu.append(Menu("q", "退出", "", self.quit))
+        return menu
+
+    # -------------------------- 交互 --------------------------
+    def jump_to_issue(self, keyword):
+        """按标题关键字跳转到对应诊断项并展开方案"""
+        for i, iss in enumerate(self.issues):
+            if keyword in iss.title or keyword in iss.detail:
+                if iss.actions:
+                    self.select_and_act(i)
+                else:
+                    self.selected = i
+                    self.draw()
+                return
+        self.flash("没有找到相关诊断项")
+
+    def select_and_act(self, idx):
+        """点击某条诊断：选中并执行"""
+        if idx >= len(self.issues):
+            return
+        self.selected = idx
+        self.draw()
+        self.show_actions_dialog(self.issues[idx])
+
+    def do_selected(self):
+        if not self.issues:
+            return
+        iss = self.issues[self.selected]
+        acts = [a for a in iss.actions if a[1] is not None]
+        if iss.actions:
+            self.show_actions_dialog(iss)
+
+    def show_actions_dialog(self, iss):
+        """显示解决方案选择框"""
+        acts = iss.actions
+        if not acts:
+            return
+        sel = 0
+        while True:
+            h, w = self.scr.getmaxyx()
+            bw = min(78, w - 4)
+            bh = min(len(acts) + 6, h - 4)
+            y0 = (h - bh) // 2
+            x0 = (w - bw) // 2
+            win = curses.newwin(bh, bw, y0, x0)
+            win.keypad(True)
+            win.box()
+            win.addstr(0, 2, " 解决方案 " [:bw - 4], curses.color_pair(C_INFO) | curses.A_BOLD)
+            for i, (label, _) in enumerate(acts[:bh - 5]):
+                attr = curses.color_pair(C_SEL) if i == sel else 0
+                pre = "▶ " if i == sel else "  "
+                win.addstr(2 + i, 2, (pre + label)[:bw - 4], attr)
+            win.addstr(bh - 2, 2, "↑↓ 选择  Enter 执行  Esc 返回"[:bw - 4],
+                       curses.color_pair(C_DIM))
+            win.refresh()
+            ch = win.getch()
+            if ch == 27:
+                return
+            elif ch in (curses.KEY_UP, ord('k')):
+                sel = (sel - 1) % len(acts)
+            elif ch in (curses.KEY_DOWN, ord('j')):
+                sel = (sel + 1) % len(acts)
+            elif ch in (10, 13, curses.KEY_ENTER):
+                label, action_id = acts[sel]
+                self.run_action(label, action_id)
+                return
+
+    def run_action(self, label, action_id):
+        """执行动作。action_id 为字符串动作标识或可调用对象"""
+        try:
+            if callable(action_id):
+                msg = action_id()
+            elif isinstance(action_id, str):
+                msg = self.dispatch_action(action_id)
+            else:
+                msg = None
+        except Exception as e:  # noqa
+            msg = "执行出错: %s" % e
+        if msg:
+            self.show_text("执行结果", str(msg))
+
+    def dispatch_action(self, action_id):
+        """动作分发：全部走显式 ID，不依赖按文案猜"""
+        if action_id == "usb_help":
+            return ("【方式 A】插 USB 自动读取端口（最可靠）\n\n"
+                    "1. 用数据线把手机连到这台 Mac\n"
+                    "2. 手机弹窗「是否允许 USB 调试」→ 点「允许」\n"
+                    "3. 回到本界面按 R 重新诊断\n\n"
+                    "原理：无线调试端口每次随机分配，通过 USB 读取手机的\n"
+                    "实际监听端口，完全不受网络屏蔽影响。\n"
+                    "读取成功后本工具会自动连接，并记住该端口用于断线重连。")
+        if action_id == "manual_connect":
+            if not self.state.has_usb:
+                # 无 USB 时，提示手机上看哪里找端口
+                hint = "手机：设置 → 开发者选项 → 无线调试 → 页面顶部显示 IP:端口"
+            else:
+                hint = "手机页面会显示，或按 R 让工具自动读取"
+            ep = self.ask("手动连接", "输入 IP:端口", hint=hint)
+            if not ep:
+                return None
+            if ":" not in ep:
+                return "格式不对，应为 IP:端口，例如 192.168.1.5:37001"
+            return adb_connect(ep) + "\n\n提示：连接成功后端口会被记住，掉线可自动重连。"
+        if action_id == "phone_dev_settings":
+            return open_android_dev_settings()
+        if action_id == "phone_wireless":
+            return open_android_wireless_debug()
+        if action_id == "reconnect_now":
+            self.refresh_async()
+            return "已触发重新诊断，稍候片刻查看结果。"
+        if action_id == "start_daemon":
+            code, out = script("start", timeout=60)
+            self.refresh_async()
+            return out.strip() or "已启动守护"
+        if action_id == "show_log":
+            return "".join(read_log_tail(200)) or "（暂无日志）"
+        if action_id == "help":
+            return self.help_text()
+        if action_id == "help_devopts":
+            return ("【开启开发者选项】\n\n"
+                    "方法一（推荐，自动）：\n"
+                    "  插上 USB → 点「在手机上自动打开开发者选项页」\n"
+                    "方法二（手动）：\n"
+                    "  设置 → 关于手机 → 连点「版本号」7 次\n\n"
+                    "开启后返回：设置 → 系统 → 开发者选项")
+        if action_id == "help_wireless":
+            return ("【开启无线调试】\n\n"
+                    "设置 → 开发者选项 → 无线调试 → 打开\n\n"
+                    "首次连接需要配对：\n"
+                    "  1. 点「使用配对码配对设备」\n"
+                    "  2. 本工具按 P 输入配对端口和 6 位码\n"
+                    "  3. 配对成功后再按 C 输入「无线调试端口」连接\n"
+                    "\n注意：配对端口 ≠ 无线调试端口，别填错。")
+        return "未实现的动作: " + action_id
+
+    def ask(self, title, prompt, default="", hint=""):
+        d = InputDialog(self.scr, title, prompt, default, hint)
+        self.scr.refresh()
+        return d.edit()
+
+    def toggle_daemon(self):
+        if self.busy:
+            return
+        self.busy = True
+        self.status_msg = "正在切换守护状态…"
+        self.draw()
+        act = "stop" if self.state.daemon_running else "start"
+        code, out = script(act, timeout=60)
+        self.busy = False
+        self.refresh_async()
+        self.flash(out.strip().split("\n")[-1][:60] if out.strip() else "完成")
+
+    def force_reconnect(self):
+        if self.busy:
+            return
+        self.busy = True
+        self.draw()
+        eps = self.state.wifi_devices
+        for ep in eps:
+            adb("disconnect", ep)
+        time.sleep(1)
+        msgs = []
+        for ep in eps:
+            msgs.append(adb_connect(ep))
+        self.busy = False
+        self.refresh_async()
+        self.flash("已重新连接" if eps else "当前无连接")
+
+    def do_connect_dialog(self):
+        hint = "见手机：开发者选项 → 无线调试 → 显示的就是 IP:端口"
+        ep = self.ask("手动连接", "输入 IP:端口", hint=hint)
+        if ep:
+            out = adb_connect(ep)
+            self.show_text("连接结果", out + "\n\n若提示 unauthorized，请在手机上确认授权。")
+
+    def do_pair_dialog(self):
+        code_, out = script("diag", timeout=40)
+        info = parse_kv(out)
+        port = self.ask("配对步骤 1/2",
+                        "手机「无线调试 → 使用配对码配对设备」显示的【配对端口】",
+                        hint="6 位配对码也会用在下一步；端口通常是 37000-40000")
+        if not port:
+            return
+        if ":" in port:
+            host, _, p = port.rpartition(":")
+        else:
+            host = info.get("DEV_WIFI_IP") or info.get("MAC_IP", "")
+            p = port
+        pair_code = self.ask("配对步骤 2/2", "输入手机上显示的 6 位配对码", hint="例如 123456")
+        if not pair_code:
+            return
+        self.busy = True
+        self.draw()
+        res = adb_pair("%s:%s" % (host, p), pair_code)
+        self.busy = False
+        self.refresh_async()
+        self.show_text("配对结果", res + "\n\n配对成功后请按 C 输入【无线调试端口】进行连接"
+                       "（注意这不是配对端口）。")
+
+    def show_devices(self):
+        code, out = adb("devices", "-l")
+        self.show_text("adb devices -l", out)
+
+    def show_log(self):
+        lines = read_log_tail(300)
+        self.show_text("守护日志（最近 300 行）", "".join(lines) or "（暂无日志）")
+
+    def show_help(self):
+        self.show_text("使用帮助", self.help_text())
+
+    def help_text(self):
+        return """ADB 无线调试管理器 —— 使用说明
+══════════════════════════════════════════════════════
+
+【这是什么】
+  让这台 Mac 通过 Wi-Fi 调试 Android 手机，掉线自动重连。
+  不需要记住任何命令，界面上点选即可完成所有操作。
+
+【第一步：手机端准备】
+  1. 设置 → 关于手机 → 连点「版本号」7 次
+  2. 设置 → 开发者选项 → 无线调试 → 打开
+  3. 记下页面上显示的「IP:端口」
+
+【第二步：连接】
+  本工具提供三种自动发现方式，任一可用即可：
+
+  ① mDNS 广播   —— 标准方式。手机打开无线调试后自动广播。
+                    ⚠ 很多公司 Wi-Fi 会屏蔽（本机所在网络已确认屏蔽）
+  ② USB 读取    —— 插上 USB 线，工具直接读取手机真实端口。
+                    ★ 最可靠，企业网络下推荐
+  ③ 记忆端点    —— 记录连通过的地址，掉线后自动重试。
+
+【⚠ 关于「网络无法自动发现」】
+  如果你的公司 Wi-Fi 屏蔽了组播（很常见），表现为：
+      mDNS: 被屏蔽 ✗   且长时间发现不到设备
+  这不是配置错误，而是网络策略限制。解决方案：
+
+  A. 【推荐】插上了 USB 线 → 工具自动读取端口，无需任何手动输入
+  B. 换到手机热点 或 家里 Wi-Fi 测试（通常不屏蔽）
+  C. 在手机无线调试页面，把 IP:端口 用「手动连接」输入一次，
+     工具会记下来，之后端口不变就能自动重连
+  D. 找网管关闭 Wi-Fi 的「客户端隔离 / 组播隔离」（企业环境通常较难）
+
+【常用按键】
+  ↑ ↓      在诊断项之间移动
+  Enter    执行当前诊断项给出的解决方案
+  A        启动 / 停止后台守护（开机自启）
+  S        立即重新连接
+  C        手动输入 IP:端口 连接
+  P        配对设备（Android 11+ 首次连接需要）
+  D        查看设备列表
+  L        查看守护日志
+  R        重新诊断
+  Q        退出界面（守护进程继续在后台工作）
+
+【常见问题】
+  · 显示 unauthorized
+      手机弹窗「允许 USB 调试」需点允许；否则删除 ~/.android/adbkey*
+      后重启 adb 再连。
+  · 手机重启后连不上
+      无线调试端口会变化。插 USB 让工具自动读取，或用 C 手动输入新端口。
+  · 界面乱码
+      确保终端支持 UTF-8；或改用 ./adbwifi --cli 纯文本模式。
+"""
+
+    def show_text(self, title, text):
+        self.detail_view = text
+        self.detail_title = title
+        self.scroll = 0
+        scroll_viewer(self.scr, title, text)
+
+    def flash(self, msg):
+        self.status_msg = msg
+        self.draw()
+
+    def quit(self):
+        self.running = False
+
+
+def scroll_viewer(stdscr, title, text, width=None):
+    """可滚动文本框（键盘 + 滚轮）"""
+    maxh, maxw = stdscr.getmaxyx()
+    wrapw = max(20, maxw - 3)
+    lines = []
+    for ln in text.split("\n"):
+        if not ln:
+            lines.append("")
+        else:
+            lines.extend(wrap_text(ln, wrapw))
+
+    top = 0
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addstr(0, 0, (" " + title + " ")[:w - 1],
+                      curses.color_pair(C_HEADER) | curses.A_BOLD)
+        body_h = h - 3
+        for i in range(body_h):
+            idx = top + i
+            if idx >= len(lines):
+                break
+            try:
+                stdscr.addstr(1 + i, 1, lines[idx][:w - 2])
+            except curses.error:
+                pass
+        stdscr.addstr(h - 2, 0, "─" * (w - 1), curses.color_pair(C_BORDER))
+        hint = " ↑↓/PgUp/PgDn 滚动   q/Esc/Enter 返回 "
+        stdscr.addstr(h - 1, 0, hint[:w - 1], curses.color_pair(C_DIM))
+        # 右侧滚动位置指示（不覆盖标题）
+        if len(lines) > body_h:
+            total = max(len(lines) - body_h, 1)
+            frac = top / total
+            row = 1 + int(frac * (body_h - 1))
+            try:
+                stdscr.addstr(row, w - 2, "▓", curses.color_pair(C_INFO))
+            except curses.error:
+                pass
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch in (ord('q'), 27, 10, 13, curses.KEY_ENTER):
+            return
+        elif ch in (curses.KEY_UP, ord('k')):
+            top = max(0, top - 1)
+        elif ch in (curses.KEY_DOWN, ord('j')):
+            top = min(max(0, len(lines) - body_h), top + 1)
+        elif ch == curses.KEY_PPAGE:
+            top = max(0, top - body_h)
+        elif ch == curses.KEY_NPAGE:
+            top = min(max(0, len(lines) - body_h), top + body_h)
+        elif ch == curses.KEY_HOME:
+            top = 0
+        elif ch == curses.KEY_END:
+            top = max(0, len(lines) - body_h)
+        elif ch == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+                if bstate & MOUSE_WHEEL_UP:
+                    top = max(0, top - 3)
+                elif bstate & MOUSE_WHEEL_DOWN:
+                    top = min(max(0, len(lines) - body_h), top + 3)
+            except curses.error:
+                pass
+
+
+# ============================== 主循环 ==============================
+
+def main_loop(stdscr):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    try:
+        # 注意：不启用 REPORT_MOUSE_POSITION。
+        # 在某些 ncurses 上「滚轮向下」与 REPORT_MOUSE_POSITION 使用同一位(0x8000000)，
+        # 若同时监听鼠标移动，会导致移动被误判成滚轮滚动。
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        curses.mouseinterval(0)
+        print("\033[?1000h", end="", flush=True)
+    except Exception:
+        pass
+
+    app = App(stdscr)
+    app.init_colors()
+
+    # 首次诊断放到后台，界面立刻可用
+    t = threading.Thread(target=app.refresh_state, daemon=True)
+    t.start()
+
+    last_draw = 0
+    last_event_check = 0
+    while app.running:
+        now = time.time()
+
+        # 实时感知：设备接入/断开/插拔等事件发生后立即重新诊断
+        # 只 stat 事件日志文件（几乎零成本），不轮询 adb
+        if not app.busy and now - last_event_check > 0.4:
+            last_event_check = now
+            if event_seq() != app.last_event_seq:
+                last_draw = 0          # 强制重绘
+                app.refresh_async()
+
+        if now - last_draw > 0.5:
+            app.draw()
+            last_draw = now
+
+        stdscr.nodelay(True)
+        try:
+            ch = stdscr.getch()
+        except curses.error:
+            ch = -1
+        if ch == -1:
+            time.sleep(0.05)
+            continue
+
+        # ---- 鼠标 ----
+        if ch == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+            except curses.error:
+                continue
+            if bstate & MOUSE_WHEEL_UP:
+                app.selected = max(0, app.selected - 1)
+            elif bstate & MOUSE_WHEEL_DOWN:
+                if app.issues:
+                    app.selected = min(len(app.issues) - 1, app.selected + 1)
+            elif bstate & MOUSE_LEFT:
+                hit = None
+                for (ry, rx1, rx2, cb) in app.click_regions:
+                    if ry == my and rx1 <= mx < rx2:
+                        hit = cb
+                        break
+                if hit:
+                    hit()
+                else:
+                    # 点空白处：仅移动选中项，不弹窗（避免误触）
+                    if app.issues:
+                        app.selected = min(app.selected, len(app.issues) - 1)
+            last_draw = 0
+            continue
+
+        # ---- 键盘 ----
+        if ch in (ord('q'), ord('Q')):
+            if ch == ord('q'):
+                app.quit()
+            else:
+                app.show_help()
+        elif ch in (curses.KEY_UP, ord('k')):
+            app.selected = max(0, app.selected - 1)
+        elif ch in (curses.KEY_DOWN, ord('j')):
+            if app.issues:
+                app.selected = min(len(app.issues) - 1, app.selected + 1)
+        elif ch in (10, 13, curses.KEY_ENTER):
+            app.do_selected()
+        elif ch in (ord('r'), ord('R')):
+            app.refresh_async()
+        elif ch in (ord('a'), ord('A')):
+            app.toggle_daemon()
+        elif ch in (ord('s'), ord('S')):
+            app.force_reconnect()
+        elif ch in (ord('c'), ord('C')):
+            app.do_connect_dialog()
+        elif ch in (ord('p'), ord('P')):
+            app.do_pair_dialog()
+        elif ch in (ord('d'), ord('D')):
+            app.show_devices()
+        elif ch in (ord('l'), ord('L')):
+            app.show_log()
+        elif ch == ord('?'):
+            app.show_help()
+        last_draw = 0
+
+
+def cli_fallback():
+    """TERM=dumb 或不支持 curses 时的纯文本模式"""
+    print("ADB 无线调试管理器（纯文本模式）\n")
+    st = collect_state()
+    issues = diagnose(st)
+    print("守护进程:", "运行中" if st.daemon_running else "已停止")
+    print("无线设备:", ", ".join(st.wifi_devices) or "无")
+    print("mDNS:", "可用" if st.mdns_works else "被屏蔽")
+    print()
+    for iss in issues:
+        icon = {"ok": "✓", "warn": "!", "error": "✗", "info": "i"}[iss.level]
+        print("[%s] %s" % (icon, iss.title))
+        for dl in iss.detail.split("\n"):
+            print("    " + dl)
+        if iss.actions:
+            print("    可选操作:")
+            for lb, _ in iss.actions:
+                print("      - " + lb)
+        print()
+    print("提示：请在支持 curses 的终端中运行 ./adbwifi 以获得完整交互界面。")
+
+
+def main():
+    if not os.path.exists(SCRIPT):
+        print("找不到守护脚本: %s" % SCRIPT, file=sys.stderr)
+        return 2
+    if "--cli" in sys.argv or not sys.stdout.isatty():
+        cli_fallback()
+        return 0
+
+    def on_term(sig, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, on_term)
+
+    try:
+        curses.wrapper(main_loop)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            print("\033[?1000l", end="", flush=True)
+        except Exception:
+            pass
+    print("已退出（守护进程仍在后台运行；如需停止请运行 ./adbwifi 后按 A）")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

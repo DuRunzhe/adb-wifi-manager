@@ -1,0 +1,7 @@
+#!/bin/bash
+# adbwifi —— TUI 入口（零参数，打开即用）
+#
+# 用法:
+#   ./adbwifi          打开交互界面
+#   ./adbwifi --cli    纯文本诊断（不支持 curses 的终端用）
+exec /usr/bin/python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bin/adbwifi-tui.py" "$@"
