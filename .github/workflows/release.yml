@@ -1,0 +1,253 @@
+name: Release
+
+# 推送 v* 标签即触发打包：编译通用二进制菜单栏 App，
+# 生成 App 包与完整安装包，并创建 GitHub Release。
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 构建并发布
+    runs-on: macos-15-intel
+    steps:
+      - name: 拉取代码（含完整 tag 历史）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 环境信息
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: 检测签名配置
+        id: signing
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$CERT_P12" ] && [ -n "$TEAM_ID" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "✓ 已配置 Developer ID 签名与公证"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "⚠ 未配置签名 secrets，使用 ad-hoc 签名（仅本机/自用）"
+          fi
+
+      - name: 导入 Developer ID 证书
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          PASS="$(openssl rand -base64 24)"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PASS=$PASS" >> "$GITHUB_ENV"
+
+          security create-keychain -p "$PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$PASS" "$KEYCHAIN"
+
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$PASS" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | tr -d '"')
+
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
+          if [ -z "$IDENTITY" ]; then
+            echo "✗ 未在导入的证书中找到 Developer ID Application 身份"
+            security find-identity -v -p codesigning "$KEYCHAIN" || true
+            exit 1
+          fi
+          echo "CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "✓ 签名身份: $IDENTITY"
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: 校验版本号规则
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          VERSION="${TAG#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+          # 规则见 AGENTS.md：单数补丁号为稳定版，偶数补丁号为 Alpha 基座
+          if [[ "$TAG" == *-* ]]; then
+            BASE="${VERSION%%-*}"
+            PRE="${VERSION#*-}"
+            if ! [[ "$PRE" =~ ^alpha\.[0-9]+$ ]]; then
+              echo "✗ Alpha 版本后缀必须为 alpha.N，收到: $TAG"
+              exit 1
+            fi
+            IS_ALPHA=1
+          else
+            BASE="$VERSION"
+            IS_ALPHA=0
+          fi
+
+          if ! [[ "$BASE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "✗ 版本号格式应为 v<major>.<minor>.<patch>，收到: $TAG"
+            exit 1
+          fi
+
+          PATCH="${BASE##*.}"
+          if [ "$IS_ALPHA" -eq 1 ]; then
+            if (( PATCH % 2 == 1 )); then
+              echo "✗ Alpha 版本必须使用偶数 PATCH 基座（如 v0.0.2-alpha.1），收到: $TAG"
+              exit 1
+            fi
+            echo "✓ Alpha 版本: ${VERSION}（PATCH ${PATCH} 为偶数基座）"
+          else
+            if (( PATCH % 2 == 0 )); then
+              echo "✗ 稳定版必须使用单数 PATCH（如 v0.0.1），收到: $TAG"
+              exit 1
+            fi
+            echo "✓ 稳定版本: ${VERSION}（PATCH ${PATCH} 为单数）"
+          fi
+
+      - name: 构建通用二进制 App（arm64 + x86_64）
+        run: |
+          echo "构建版本: $VERSION"
+          ADBWIFI_VERSION="$VERSION" ADBWIFI_UNIVERSAL=1 ./menubar/build.sh
+
+      - name: 校验产物
+        run: |
+          set -euo pipefail
+          BIN="build/AdbWifiBar.app/Contents/MacOS/AdbWifiBar"
+          test -x "$BIN"
+          ARCHS="$(lipo -archs "$BIN")"
+          echo "架构: $ARCHS"
+          case "$ARCHS" in
+            *arm64*x86_64*|*x86_64*arm64*) ;;
+            *) echo "✗ 不是通用二进制: $ARCHS"; exit 1 ;;
+          esac
+          APP_FULL="$(/usr/libexec/PlistBuddy -c 'Print :ADBWifiFullVersion' \
+            build/AdbWifiBar.app/Contents/Info.plist)"
+          APP_SHORT="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+            build/AdbWifiBar.app/Contents/Info.plist)"
+          if [ "$APP_FULL" != "$VERSION" ] || [ "$APP_SHORT" != "${VERSION%%-*}" ]; then
+            echo "✗ 版本不一致: full=$APP_FULL short=$APP_SHORT tag=$VERSION"
+            exit 1
+          fi
+          echo "✓ App 版本: $APP_FULL (short $APP_SHORT)"
+          # Gatekeeper 评估需要在公证 + staple 之后（见「公证并装订」步骤），
+          # 这里只输出签名信息供排查
+          codesign -dv build/AdbWifiBar.app 2>&1 | head -5 || true
+
+      - name: 公证并装订
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          APP="build/AdbWifiBar.app"
+          KEY="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$KEY"
+          chmod 600 "$KEY"
+          ZIP="$RUNNER_TEMP/notarize.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+
+          echo "提交 Apple 公证（通常 1~5 分钟）..."
+          xcrun notarytool submit "$ZIP" \
+            --key "$KEY" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait
+
+          echo "装订公证票据 ..."
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          spctl -a -t exec -vv "$APP"
+          rm -f "$KEY" "$ZIP"
+
+      - name: 打包
+        run: |
+          set -euo pipefail
+
+          # 1) 仅菜单栏 App（拖入「应用程序」即可用）
+          APP_ZIP="AdbWifiBar-${VERSION}-universal.zip"
+          ditto -c -k --sequesterRsrc --keepParent build/AdbWifiBar.app "$APP_ZIP"
+
+          # 2) 完整安装包（源码 + 预编译 App + install.sh，双击脚本一键安装）
+          STAGE="$RUNNER_TEMP/adb-wifi-manager-$VERSION"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          rsync -a \
+            --exclude '.git' \
+            --exclude 'build' \
+            --exclude 'prebuilt' \
+            --exclude '*.zip' \
+            --exclude 'SHA256SUMS.txt' \
+            ./ "$STAGE/"
+          mkdir -p "$STAGE/prebuilt"
+          ditto build/AdbWifiBar.app "$STAGE/prebuilt/AdbWifiBar.app"
+          PKG_ZIP="adb-wifi-manager-${VERSION}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$STAGE" "$PKG_ZIP"
+
+          shasum -a 256 "$APP_ZIP" "$PKG_ZIP" > SHA256SUMS.txt
+          ls -lh "$APP_ZIP" "$PKG_ZIP" SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.ref_name }}
+          path: |
+            *.zip
+            SHA256SUMS.txt
+
+      - name: 创建 / 更新 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          FILES=(AdbWifiBar-*.zip adb-wifi-manager-*.zip SHA256SUMS.txt)
+          # 标签带后缀（如 v0.0.2-alpha.1）时发布为预发布版，
+          # 正式版检查不会拿到它，只能在「Alpha 预览版」通道里看到
+          EXTRA=()
+          case "$TAG" in
+            *-*) EXTRA+=(--prerelease) ;;
+          esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，更新资产"
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+            # 删除 tag 再重建时 GitHub 会把原 Release 转为 draft，
+            # 这里显式取消 draft，保证重发后仍然是已发布状态
+            gh release edit "$TAG" --draft=false
+            if [ ${#EXTRA[@]} -gt 0 ]; then
+              gh release edit "$TAG" --prerelease
+            fi
+          else
+            echo "创建 Release $TAG"
+            # macOS runner 自带 bash 3.2：空数组直接展开会在 set -u 下报
+            # "unbound variable"，用 ${arr[@]+...} 兼容写法只在非空时展开
+            gh release create "$TAG" "${FILES[@]}" \
+              --title "$TAG" \
+              --generate-notes \
+              ${EXTRA[@]+"${EXTRA[@]}"}
+          fi
+          gh release view "$TAG"
+
+      - name: 清理签名钥匙串
+        if: always() && steps.signing.outputs.enabled == 'true'
+        run: |
+          security delete-keychain "${KEYCHAIN:-$RUNNER_TEMP/signing.keychain-db}" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/AuthKey_"*.p8 2>/dev/null || true

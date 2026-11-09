@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      最小权限集：本 App 只通过 Process 调用 /bin/bash 执行 adb-wifi.sh 和 adb，
+      hardened runtime 下允许 fork/exec，无需额外 entitlement。
+      不使用 App Sandbox（需要访问用户目录下的脚本、launchd 状态与 Android SDK）。
+    -->
+</dict>
+</plist>
