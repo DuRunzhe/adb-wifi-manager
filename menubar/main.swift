@@ -169,6 +169,23 @@ func splitCSV(_ v: String?) -> [String] {
     return v.split(separator: ",").map(String.init).filter { !$0.isEmpty }
 }
 
+/// 菜单栏 App 自身的更新日志（与守护日志分开），排查自动安装失败时看这里：
+/// ~/Library/Application Support/adb-wifi-manager/logs/menubar-update.log
+func updateLog(_ s: String) {
+    let dir = NSHomeDirectory() + "/Library/Application Support/adb-wifi-manager/logs"
+    let path = dir + "/menubar-update.log"
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let stamp = ISO8601DateFormatter().string(from: Date())
+    let line = "\(stamp) \(s)\n"
+    if let h = FileHandle(forWritingAtPath: path) {
+        h.seekToEndOfFile()
+        h.write(line.data(using: .utf8) ?? Data())
+        h.closeFile()
+    } else {
+        try? line.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+}
+
 /// 解析脚本的 KEY=VALUE 输出（`diag` 的原生格式，以及 `ADBWIFI_FORMAT=kv` 的结果协议）。
 /// 只认第一行等号，忽略不含等号的行（如误入的日志/提示），值两端去空白。
 func parseKV(_ text: String) -> [String: String] {
@@ -883,7 +900,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Alpha 入口自身显示检查状态（与正式版按钮一致，不占用状态行）
     enum AlphaState {
-        case idle, checking, updateAvailable, upToDate, notFound, failed
+        case idle, checking, updateAvailable, installing, installFailed, upToDate, notFound, failed
     }
     var alphaState: AlphaState = .idle
     var latestAlphaTag = ""
@@ -1085,22 +1102,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 正式版更新（主入口）：有可用更新时直接安装，否则检查后自动安装
     @objc func checkStableUpdates() {
-        guard stableState != .checking, stableState != .installing else { return }
+        guard stableState != .checking, stableState != .installing,
+              alphaState != .installing else { return }
         if let p = pendingStable, isNewer(p.tag, than: APP_VERSION) {
-            installUpdate(p)
+            installUpdate(p, channel: .stable)
             return
         }
         runUpdateCheck(.stable, autoInstall: true)
     }
 
-    /// Alpha 预发布：状态与文字合二为一，有点击更新时再次点击链接打开下载页
+    /// Alpha 预发布：与正式版同一套自动安装链路，发现可更新时再次点击即安装
     @objc func checkAlphaUpdates() {
-        if alphaState == .updateAvailable, let p = pendingAlpha {
-            openURL(p.url.isEmpty ? RELEASES_URL : p.url)
+        guard alphaState != .checking, alphaState != .installing,
+              stableState != .checking, stableState != .installing else { return }
+        if alphaState == .updateAvailable || alphaState == .installFailed,
+           let p = pendingAlpha {
+            installUpdate(p, channel: .alpha)
             return
         }
-        guard alphaState != .checking,
-              stableState != .checking, stableState != .installing else { return }
         runUpdateCheck(.alpha)
     }
 
@@ -1136,6 +1155,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         }
                     } else {
                         self.latestAlphaTag = info.tag
+                        self.alphaError = ""
                         if self.isNewer(info.tag, than: APP_VERSION) {
                             self.pendingAlpha = info
                             self.alphaState = .updateAvailable
@@ -1221,9 +1241,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             text = L.t("about.alpha.checking")
             enabled = false
             tip = L.t("about.alpha.checking")
+        case .installing:
+            text = pendingAlpha.map { L.t("about.alpha.installingTag", $0.tag) }
+                ?? L.t("about.alpha.installing")
+            enabled = false
+            tip = text
         case .updateAvailable:
             text = pendingAlpha.map { L.t("about.alpha.download", $0.tag) } ?? L.t("about.alpha.idle")
-            tip = L.t("about.alpha.tip.download")
+            // 安装失败后会回到本态，用 tooltip 带上失败原因
+            tip = alphaError.isEmpty ? L.t("about.alpha.tip.download") : alphaError
+        case .installFailed:
+            // 安装失败必须可见（不只藏在 tooltip 里），点击直接重试安装
+            text = L.t("about.alpha.installFailed")
+            tip = alphaError.isEmpty ? L.t("about.alpha.installFailed") : alphaError
         case .upToDate:
             text = L.t("about.alpha.upToDate")
             tip = latestAlphaTag.isEmpty ? L.t("about.alpha.upToDate")
@@ -1245,9 +1275,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         checkAlphaButton?.toolTip = tip
     }
 
-    /// 下载正式版 App → 校验签名/公证 → 退出当前进程后替换并启动新版本。
+    /// 下载新版本 App → 校验签名/公证 → 退出当前进程后替换并启动新版本。
+    /// 正式版与 Alpha 走**同一条自动安装链路**，只是状态展示位置不同：
+    /// 正式版体现在「检查正式版更新」按钮上，Alpha 体现在其文字链上。
     /// 只替换菜单栏 App；守护脚本仍由 install.sh / get.sh 维护。
-    func installUpdate(_ info: (tag: String, url: String, notes: String)) {
+    func installUpdate(_ info: (tag: String, url: String, notes: String),
+                       channel: UpdateChannel = .stable) {
         guard !installingUpdate, isNewer(info.tag, than: APP_VERSION) else { return }
         let version = info.tag.hasPrefix("v") ? String(info.tag.dropFirst()) : info.tag
         let asset = "AdbWifiBar-\(version)-universal.zip"
@@ -1256,47 +1289,89 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let tmp = NSTemporaryDirectory() + "AdbWifiBarUpdate-\(UUID().uuidString)"
 
         installingUpdate = true
-        stableState = .installing
-        setStableButtonTitle()
+        updateLog("开始更新 channel=\(channel == .stable ? "stable" : "alpha") tag=\(info.tag) url=\(zipURL)")
         checkAlphaButton?.isEnabled = false
-        updateLabel?.stringValue = L.t("about.status.downloading", info.tag)
+        checkUpdateButton?.isEnabled = false
+        if channel == .stable {
+            stableState = .installing
+            setStableButtonTitle()
+            updateLabel?.stringValue = L.t("about.status.downloading", info.tag)
+        } else {
+            alphaState = .installing
+            refreshAlphaLink()
+        }
 
         DispatchQueue.global(qos: .userInitiated).async {
             let zip = tmp + "/update.zip"
             let unpack = tmp + "/unpack"
             var failure: String?
 
-            self.shell("/usr/bin/curl", ["-fL", "--retry", "3", "--retry-delay", "2",
-                                        "--max-time", "300", "-o", zip, zipURL])
-            let attrs = try? FileManager.default.attributesOfItem(atPath: zip)
-            let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
-            if size == 0 { failure = L.t("update.err.download") }
+            // 临时目录必须显式创建：curl -o 不会自动建父目录，否则报
+            // “Failure writing output to destination”并立即失败
+            do {
+                try FileManager.default.createDirectory(atPath: tmp,
+                                                        withIntermediateDirectories: true)
+            } catch {
+                failure = L.t("update.err.tempDir", error.localizedDescription)
+            }
 
             if failure == nil {
-                self.shell("/usr/bin/ditto", ["-x", "-k", zip, unpack])
+                let dl = self.shellCode("/usr/bin/curl", [
+                    "-fL", "--retry", "3", "--retry-delay", "2",
+                    "--max-time", "300", "-o", zip, zipURL])
+                let attrs = try? FileManager.default.attributesOfItem(atPath: zip)
+                let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+                if size == 0 {
+                    // 把 curl 的原因（HTTP 状态/网络错误）带出来，不只是“下载失败”
+                    let detail = dl.out.trimmingCharacters(in: .whitespacesAndNewlines)
+                    failure = detail.isEmpty
+                        ? L.t("update.err.download")
+                        : L.t("update.err.downloadDetail", String(detail.suffix(300)))
+                }
+            }
+
+            if failure == nil {
+                let un = self.shellCode("/usr/bin/ditto", ["-x", "-k", zip, unpack])
+                if un.code != 0 {
+                    let detail = un.out.trimmingCharacters(in: .whitespacesAndNewlines)
+                    failure = detail.isEmpty ? L.t("update.err.package")
+                                            : L.t("update.err.packageDetail", String(detail.suffix(300)))
+                }
             }
             let newApp = unpack + "/AdbWifiBar.app"
             if failure == nil && !FileManager.default.fileExists(atPath: newApp) {
                 failure = L.t("update.err.package")
             }
+            if failure == nil { updateLog("校验通过：\(newApp)") }
 
-            // 校验 Apple 签名与公证票据，避免安装被篡改的包
+            // 校验 Apple 签名与公证票据，避免安装被篡改的包。
+            // 注意：spctl 成功时**不输出任何内容**（仅 exit 0），所以必须用退出码判定，
+            // 不能用输出里是否包含 "accepted"；-vv 只为失败时能拿到原因。
             if failure == nil {
-                let verify = self.shell("/usr/sbin/spctl", ["-a", "-t", "exec", newApp])
-                if !verify.contains("accepted") {
-                    let detail = verify.trimmingCharacters(in: .whitespacesAndNewlines)
+                let verify = self.shellCode("/usr/sbin/spctl",
+                                            ["-a", "-t", "exec", "-vv", newApp])
+                if verify.code != 0 {
+                    let detail = verify.out.trimmingCharacters(in: .whitespacesAndNewlines)
                     failure = L.t("update.err.signature",
                                   detail.isEmpty ? L.t("update.err.unknown") : detail)
                 }
             }
 
             if let f = failure {
+                updateLog("更新失败：\(f)")
                 DispatchQueue.main.async {
                     self.installingUpdate = false
-                    self.stableState = .updateAvailable
                     self.checkAlphaButton?.isEnabled = true
-                    self.setStableButtonTitle()
-                    self.updateLabel?.stringValue = L.t("about.status.updateFailed", f)
+                    self.checkUpdateButton?.isEnabled = true
+                    if channel == .stable {
+                        self.stableState = .updateAvailable
+                        self.setStableButtonTitle()
+                        self.updateLabel?.stringValue = L.t("about.status.updateFailed", f)
+                    } else {
+                        self.alphaState = .installFailed
+                        self.alphaError = f
+                        self.refreshAlphaLink()
+                    }
                 }
                 return
             }
@@ -1326,20 +1401,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 p.arguments = [script, destApp, newApp,
                                "\(ProcessInfo.processInfo.processIdentifier)", tmp]
                 try p.run()
+                updateLog("已启动替换脚本，等当前进程退出后安装 \(info.tag)")
             } catch {
+                updateLog("无法启动替换脚本：\(error.localizedDescription)")
                 DispatchQueue.main.async {
                     self.installingUpdate = false
-                    self.stableState = .updateAvailable
                     self.checkAlphaButton?.isEnabled = true
-                    self.setStableButtonTitle()
-                    self.updateLabel?.stringValue =
-                        L.t("about.status.updateLauncherFailed", error.localizedDescription)
+                    self.checkUpdateButton?.isEnabled = true
+                    if channel == .stable {
+                        self.stableState = .updateAvailable
+                        self.setStableButtonTitle()
+                        self.updateLabel?.stringValue =
+                            L.t("about.status.updateLauncherFailed", error.localizedDescription)
+                    } else {
+                        self.alphaState = .installFailed
+                        self.alphaError = error.localizedDescription
+                        self.refreshAlphaLink()
+                    }
                 }
                 return
             }
 
             DispatchQueue.main.async {
-                self.updateLabel?.stringValue = L.t("about.status.installing")
+                if channel == .stable {
+                    self.updateLabel?.stringValue = L.t("about.status.installing")
+                } else {
+                    self.refreshAlphaLink()
+                }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                     NSApp.terminate(nil)
                 }
