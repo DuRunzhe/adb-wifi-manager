@@ -42,12 +42,21 @@
   - `recover`：`RESULT=already|recovered|failed`、`ENDPOINT`、`VIA=existing|known|scan|usb`、`ERROR=no_usb|tcpip_failed`
   - `open`：`RESULT=opened|partial|need_usb|no_device|failed`、`PAGE`、`TITLE`、`WIFI_TOGGLE=on|off|unknown`
 - `diag` 始终输出 `DIAG_CODE` 枚举（不受开关影响）；`DIAG_TITLE` / `DIAG_HINT` 保留给终端与 TUI
+- `netinfo` 输出多设备链路指标 `NET_DEV_COUNT` + 每台一组 `NET_DEV_<n>_*`
+  （SERIAL / TRANSPORT / MODEL / SSID / BSSID / FREQ / CHANNEL / LINK / RSSI /
+  RTT_MIN / RTT_AVG / RTT_MAX / BATTERY / CHARGING）
+  与全局 `NET_MAC_RATE` / `NET_MAC_CHANNEL` / `NET_MAC_RSSI` / `NET_MAC_BATTERY` / `NET_MAC_POWER`、
+  `NET_RATE_AVG_MBPS` / `NET_RATE_MAX_MBPS`、`NET_AT`（采集时间戳）；
+  采集慢（1–3s），两级缓存：设备侧 60 秒（`state/netinfo.cache`）、Mac 侧 300 秒
+  （`state/netinfo_mac.cache`）；`diag` 只读缓存，并由 mkdir 原子锁保证单采集实例
 - 界面文案统一在 `menubar/i18n.swift` 维护，`zhHans` / `zhHant` / `en` 三表必须同时补齐
+- 速率类数值协议层用 Mbps（原始值），显示层统一换算为 MB/s（字节基准）
 
 ### 修改协议时的检查清单
 
 - [ ] 新增诊断分支同时设置 `code` 与中文 `title` / `hint`
 - [ ] 新增 `DIAG_CODE` 在 `i18n.swift` 三表补 `diag.<CODE>.title` / `diag.<CODE>.hint`
+- [ ] 新增 `NET_DEV_<n>_*` 字段时，同步 `main.swift` 的 `DevLink`、TUI 的 `dev_links` 与中英文 README 协议表
 - [ ] 新增/改名 kv 字段或值域时，同步 `main.swift` 消费逻辑与中英文 README 的协议表
 - [ ] `bash -n bin/adb-wifi.sh` 与 `swiftc -typecheck menubar/main.swift menubar/i18n.swift` 通过
 - [ ] App 侧对所有新 code 保留回退：`L.has(key)` 为 false 时用脚本下发的中文

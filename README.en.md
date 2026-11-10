@@ -128,8 +128,8 @@ to the system when everything is stable.
 |---|---|---|
 | **Responsiveness** | Disconnect → reconnected within 2 s | ✅ **0.9–1.5 s** measured |
 | **Idle overhead** | Negligible load when connected | ✅ USB probing skipped; **0.87** concurrent adb processes on average |
-| **Diagnostic latency** | `diag` response (called on every menu open) | ✅ **0.2–0.4 s** (worst case was 16 s before optimization) |
-| **Scan efficiency** | Full /24 subnet scan | ✅ **0.9 s** (was 7.3 s) |
+| **Diagnostic latency** | `diag` response (called on every menu open) | ✅ **0.25–0.4 s** |
+| **Scan efficiency** | Full /24 subnet scan | ✅ **0.9 s** |
 | **Memory footprint** | Resident memory | ✅ bash process, a few MB |
 | **Dependency footprint** | No runtime deps beyond adb | ✅ Pure bash + system tools |
 
@@ -157,17 +157,8 @@ Events are written to `state/events.log` and consumed by all three readers from 
 **same data source** — so the TUI and the menu bar can never disagree (no more
 "terminal says connected, menu bar says disconnected").
 
-The trade-off is a lightweight event check during waits. After optimization only a
-single `sleep` subprocess remains:
-
-```bash
-# Before: fork sleep + stat every 0.25 s (80 subprocesses per 10 s of waiting)
-sleep 0.25
-now=$(stat -f%m "$evf")
-
-# After: builtin time check, builtin -nt comparison (only sleep remains)
-sleep 0.3
-if [ "$evf" -nt "$mark" ]; then ...
+While waiting it only compares durations with the builtin `SECONDS` and file timestamps
+with the builtin `-nt`, so a single `sleep` subprocess remains and no extra forks occur.
 ```
 
 #### 2. Five concurrent discovery paths
@@ -184,8 +175,8 @@ No single discovery method is reliable in real networks, so five are prepared:
 
 #### 3. Bypassing the permission wall with `adb tcpip`
 
-This is the key insight of the whole design. Since the wireless debugging switch
-cannot be enabled, **take a different path that does not need that permission**:
+Core mechanism: instead of the wireless debugging switch, use a path that needs no
+special permission:
 
 ```bash
 # Requires WRITE_SECURE_SETTINGS — not possible
@@ -205,41 +196,30 @@ Plug in USB → adb tcpip 5555 → read phone's Wi-Fi IP → adb connect IP:5555
                                           Unplug USB — connection survives
 ```
 
-#### 4. Fixing the "endpoint memory expires too early" defect
+#### 4. Endpoint expiry rules
 
-Early versions frequently failed to reconnect after a drop. The root cause was a
-seemingly reasonable cleanup rule:
-
-```bash
-# Flawed: delete as soon as the port is unreachable
-if nc -z "$ip" "$port"; then echo "$ep"; else stale+=("$ep"); fi
-```
-
-Brief dropouts, screen-off, or a subnet change would all trigger deletion — erasing
-the "way home". Now:
+Endpoints remembered from a successful connection are never dropped on a single failed
+probe. Each endpoint accumulates failures and is purged only after 360 consecutive
+failures (~1 hour at `CHECK_INTERVAL=10s`):
 
 ```bash
-# Only count failures; purge after 360 consecutive failures (~1 hour)
+# Only count failures; purge once the threshold is reached
 echo "$ep $((fails + 1))" >> known_fails.txt
 ```
 
 Combined with subnet scanning, even a changed IP is rediscovered and the memory is
 updated automatically.
 
-#### 5. The five key performance optimizations
+#### 5. Key performance techniques
 
-| Item | Before | After | Technique |
-|---|---|---|---|
-| Subnet scan | 254 `nc` processes, 7.3 s | **1 process, 0.9 s** | Single-process non-blocking concurrent connects (perl) |
-| `diag` | up to 16 s | **0.2–0.4 s** | Merged duplicate mDNS queries into one collection |
-| USB probing | 3–4 `adb shell` calls per round | **Skipped** when connected | Early short-circuit |
-| Event wait | fork `sleep`+`stat` each round | Only `sleep` | Builtin `SECONDS` / `-nt` |
-| Menu bar polling | Fixed 2 s | 5 s (configurable) | Event-driven; no need for high frequency |
-
-**The `diag` optimization delivers the biggest win**: the original implementation ran
-`adb mdns services` twice (`discover_mdns` once plus a count query), each taking up to
-8 s. Since the menu bar calls `diag` every time the menu opens, every menu click wasted
-over ten seconds — now merged into a single collection.
+| Technique | Approach | Effect |
+|---|---|---|
+| Subnet scan | Single-process non-blocking concurrent connects (perl) | **0.9 s** for a /24 |
+| `diag` | One mDNS collection serves both endpoints and counting | **0.25–0.4 s** |
+| USB probing | Early short-circuit when a connection already exists | 0 `adb shell` calls while idle |
+| Event wait | Builtin `SECONDS` + builtin `-nt` comparison | A single `sleep` subprocess |
+| Menu bar refresh | Event-driven, 5 s fallback poll (configurable) | No high-frequency polling |
+| Link metrics | Dedicated `netinfo` command, two-level cache, atomic lock | Zero extra cost in `diag` |
 
 #### 6. Multi-ROM compatible settings navigation
 
@@ -293,7 +273,18 @@ mouse click or keyboard**:
 
 ```
  ADB Wireless Debug Manager   ● daemon running (auto-start)   Q quit  R refresh  ? help
-```
+ Connection
+✓ 192.168.1.50:38075
+USB: not connected
+mDNS: blocked ✗   Discovery: endpoint memory
+Host: 192.168.1.100
+Network link
+  192.168.1.50:38075 · Redmi K30 5G   battery 38% (charging)
+      latency 18ms (good <20) · signal -47 dBm (great >-60)
+      link 24 MB/s · actual avg 0.44 / peak 1.8 / ceiling 14 MB/s
+      AP Office-5G · channel 149 · 5745 MHz
+Mac  link 22 MB/s (-55 dBm) · channel 40 · battery 100% (charged)
+ ⚠ This network blocks mDNS broadcast; new wireless devices cannot be auto-discovered.
 
 ### Key Bindings
 
@@ -422,10 +413,6 @@ Generated automatically at build time:
 To change the icon, edit the symbol in `gen-icon.swift` (app icon) and the `updateIcon`
 candidates in `main.swift` (menu bar), then rebuild.
 
-> An early version tried loading the same PNG for the menu bar, but PNG scaling made the
-> glyph visibly smaller (measured 42×28 → 30×20 px), so the menu bar reverted to system
-> symbol rendering.
-
 Since `LSUIElement` is `true` (menu-bar-only, no Dock icon), the app icon mainly
 appears in Finder, Launchpad, `⌘Tab`, and system dialogs.
 
@@ -446,20 +433,68 @@ data source** as the TUI, so both always agree:
   TCP mode: enabled (port 5555)
   Discovery: endpoint memory
   Host: 192.168.1.100
-  Phone: Pixel 7
+  ↓ 1.4 MB/s   ↑ 0 KB/s
 ──
-  Stop daemon
-  Restore wireless connection (no USB needed)     ⌘R
-  Open "Wireless debugging" on phone…             ⌘W
+  Network Link ▸          # expands into per-device RTT / signal / link / ceiling / AP / battery
   Open adb devices
-  View log…
-  About ADB WiFi
-  Quit menu bar (daemon keeps running)
+  Open "Wireless debugging" on phone…             ⌘W
+  View log…                                        ⌘L
+  Open Terminal TUI…                               ⌘U
+  Settings ▸   About ADB WiFi   Quit menu bar
 ```
 
 Diagnosis is produced centrally by `DIAG_LEVEL / DIAG_CODE / DIAG_TITLE / DIAG_HINT / DIAG_ACTION`
 in the script, so the menu bar and TUI never diverge. `DIAG_CODE` is a machine-readable
 enum that the menu bar maps to localized strings (see the next section).
+
+UI language: the menu bar app supports **Simplified Chinese / Traditional Chinese / English**
+(Settings → Language), defaulting to the system language (`zh-Hant`/`zh-TW` → Traditional,
+`zh` → Simplified, otherwise English), and the choice is persisted. Diagnosis, error
+messages, help dialogs and the About window are all covered by i18n;
+**terminal and TUI output stay Chinese** (the script's `text` mode) — the TUI itself is
+not localized.
+
+### Link Quality Metrics
+
+When wireless adb is slow, the transfer rate alone does not tell you where the time goes.
+The menu bar's **Network Link** submenu and the TUI's **Network link** block show the same
+set of metrics (same fields, order and units, same data source):
+
+| Metric | Meaning | Normal range | Source |
+|---|---|---|---|
+| Latency (RTT) | Mac → phone round trip | <20ms good / 20–50 high / >50 very high | `ping` |
+| Signal | Phone-side RSSI | >-60 great / -60~-70 good / <-70 weak | `dumpsys wifi` |
+| Link rate | Negotiated Wi-Fi rate | — | `dumpsys wifi` (Link speed) |
+| Actual avg / peak | Throughput while transferring | compare against ceiling | sliding window over `netstat` byte counters |
+| Ceiling | Theoretical TCP ceiling = link rate × 60% | — | derived |
+| AP / channel / frequency | SSID, channel and frequency the phone is on | — | `dumpsys wifi` |
+| Battery | Phone / Mac battery and charging state | below 15% throttles | `dumpsys battery` / `pmset` |
+
+All rates use **byte units (MB/s)**, matching the `↓/↑` transfer rate in the main menu.
+
+How to read it:
+
+- **RTT is the number-one killer of wireless adb**: adb file transfer is block-and-ACK,
+  and high RTT caps throughput directly
+- **Peak far below the ceiling** → the bottleneck is RTT or AP forwarding, not bandwidth
+- **Phone and Mac on different channels** → two APs under the same SSID; traffic is
+  forwarded through the controller and RTT grows noticeably (the AP line's tooltip shows
+  the BSSID and the Mac's channel for a direct comparison)
+
+Collection cost and caching: these commands are slow (`dumpsys wifi` ~0.3s,
+`system_profiler` ~1s, `ping` ~1s) while the menu calls `diag` on every open, so the
+metrics are gathered by a separate `adb-wifi.sh netinfo` command and **cached**:
+
+| Cache | TTL | Contents | Notes |
+|---|---|---|---|
+| `state/netinfo.cache` | 60 s | Device-side RTT / signal / link / battery, rate stats | changes often |
+| `state/netinfo_mac.cache` | 300 s | Mac-side channel / rate / signal | `system_profiler` costs ~1 s CPU but rarely changes |
+
+`diag` only reads the cache and takes 0.25–0.38 s. Collection runs in the background and an
+atomic `mkdir` lock guarantees a single collector at a time. One collection takes about 2 s
+when the Mac-side cache is warm and about 3.4 s when it needs refreshing. With multiple
+devices each one gets its own entry (`NET_DEV_<n>_*`); USB devices are labelled "USB connection · no network
+round-trip" and skip the latency item.
 
 ### Script Output Protocol (the app ⇄ script contract)
 
@@ -485,6 +520,21 @@ VIA=known
 | | `TITLE` | Page actually reached: `wireless` / `dev` |
 | | `WIFI_TOGGLE` | `on` / `off` / `unknown` |
 | `diag` | `DIAG_CODE` | See below (always emitted, regardless of `ADBWIFI_FORMAT`) |
+| `netinfo` | `NET_DEV_COUNT` | Device count; one `NET_DEV_<n>_*` group per device |
+| | `NET_DEV_<n>_SERIAL` / `_TRANSPORT` | `IP:PORT` or USB serial; `wifi` / `usb` |
+| | `NET_DEV_<n>_MODEL` | Phone model |
+| | `NET_DEV_<n>_SSID/_BSSID/_FREQ/_CHANNEL` | Phone-side Wi-Fi info |
+| | `NET_DEV_<n>_LINK` / `_RSSI` | Negotiated rate (Mbps) / signal (dBm) |
+| | `NET_DEV_<n>_RTT_MIN/_AVG/_MAX` | Round-trip time (`wifi` devices only) |
+| | `NET_DEV_<n>_BATTERY` / `_CHARGING` | Battery level / charging flag |
+| | `NET_MAC_RATE` / `NET_MAC_CHANNEL` / `NET_MAC_RSSI` | Mac-side Wi-Fi link (global) |
+| | `NET_MAC_BATTERY` / `NET_MAC_POWER` | Mac battery (omitted when absent) and power state |
+| | `NET_RATE_AVG_MBPS` / `NET_RATE_MAX_MBPS` | Average / peak throughput while transferring |
+
+`netinfo` takes 2–4 s, so it is **never called from `diag`**. Its output is cached in
+`state/netinfo.cache` (60 s TTL) and `diag` appends the cached lines at the end.
+`NET_AT` is the sample timestamp (epoch seconds), used to judge cache freshness.
+The UI layer converts Mbps to MB/s (byte units).
 
 `diag` still emits the Chinese `DIAG_TITLE` / `DIAG_HINT` for the terminal and TUI.
 The app looks up `DIAG_CODE` in its i18n tables first, and falls back to the script text
@@ -745,14 +795,8 @@ Existing connection → endpoint memory → subnet scan (finds a changed IP)
 
 Measured: same IP after a drop → **under 1 s**; changed IP → rediscovered by scan in **~5 s**.
 
-### The critical defect that was fixed
+### Endpoint expiry and cleanup
 
-In earlier implementations, `discover_known` **deleted an endpoint immediately** as
-soon as a probe failed. Brief dropouts, screen-off, and subnet changes all triggered
-deletion — erasing the "way home", after which only re-plugging USB helped. This was
-the real reason "automatic recovery" didn't work.
-
-Now:
 - Unreachable endpoints are **preserved**, with a failure counter
 - Only after `MAX_KNOWN_FAILS` consecutive failures (default 360 ≈ 1 hour) are they purged
 - When memory is empty or fully stale, the local subnet is scanned automatically
@@ -766,7 +810,7 @@ Subnet scanning is powerful but must not be abused, so it has two guards:
 - **Precondition**: only triggered when all five discovery paths come up empty;
   never while a connection is healthy
 
-For full performance data and optimization details, see
+For full performance data, see
 [Performance Goals & Technical Design](#performance-goals--technical-design).
 
 ### When USB is still required
@@ -789,30 +833,22 @@ Displays bidirectional adb transfer rates in real time — no extra tools needed
 | TUI | "Transfer: ↓ … ↑ …" in the status area, plus totals |
 | CLI | `./bin/adb-wifi.sh rate 2` |
 
-### Data source and trade-offs
+### Data source
 
-adb **has no built-in rate command**, so the rate must be sampled and computed locally.
+The rate is read from the adb connection byte counters in macOS `netstat -anv -p tcp`:
+under 10 ms per call, entirely local, and no `adb shell` is involved, so it never interferes
+with an in-flight pull/push (the device-side `/proc/net/dev` would need `adb shell` and
+blocks during transfers).
 
-| Approach | Accuracy | Cost | Verdict |
-|---|---|---|---|
-| Read `netstat -anv` connection byte counters | High, available locally on the Mac | <10 ms per call, non-intrusive | ✅ **adopted** |
-| Read device `/proc/net/dev` | High, but includes all phone app traffic | Needs `adb shell`, which **blocks during pull/push** | ❌ rejected |
-| `nettop` | Medium, aggregated per process | Parsing overhead, coarse | ❌ rejected |
+### Byte column meaning
 
-The key reason: the device-side approach runs `adb shell`, which was measured to deadlock
-during a large `adb pull`, whereas netstat reads locally and never interferes with transfers.
+| Byte column | Direction |
+|---|---|
+| Column 7 | Downlink (phone → Mac) |
+| Column 8 | Uplink (Mac → phone) |
 
-### Field mapping (measured, not assumed)
-
-The byte columns in macOS `netstat -anv -p tcp` are easy to get wrong. Verified with real transfers:
-
-| Operation | Field 7 | Field 8 | Conclusion |
-|---|---|---|---|
-| `adb pull` (phone → Mac) | **+4.38 MB** | +72 bytes | Field 7 = **downlink** |
-| `adb push` (Mac → phone) | +626 bytes | **+2.79 MB** | Field 8 = **uplink** |
-
-So `↓` uses field 7 and `↑` uses field 8. Note also that `$N` column access in macOS awk is
-unreliable — anchor on `ESTABLISHED` with a whole-line regex and use `split` instead.
+Parsing anchors on `ESTABLISHED` with a whole-line regex and then uses `split`, rather than
+relying on awk `$N` column access.
 
 ### Sampling strategy
 
@@ -841,7 +877,7 @@ This project provides one-tap access.
 | TUI | "Open wireless debugging page on phone automatically" in the diagnosis |
 | Auto-triggered | When "wireless debugging switch is off" is detected, "▸ Resolve" jumps there |
 
-### Compatibility approach
+### Compatibility handling
 
 Settings layouts differ widely, so the script tries methods in order of reliability:
 
@@ -851,27 +887,22 @@ Settings layouts differ widely, so the script tries methods in order of reliabil
 | ② | `com.android.settings/.Settings$WirelessDebuggingActivity` | Standalone page on some ROMs |
 | ③ | `android.settings.APPLICATION_DEVELOPMENT_SETTINGS` | Fallback: open Developer options and let the user tap |
 
-**Key point**: verifying whether ① actually landed on the wireless debugging page relies
-on `uiautomator dump` reading the UI text. On some ROMs (e.g. MIUI)
-`WirelessDebuggingActivity` is an empty shell that is silently redirected to the
-Settings home screen — merely checking whether `am start` errored is not enough.
+Whether ① really landed on the wireless debugging page is verified by reading the UI text
+with `uiautomator dump`: on some ROMs (e.g. MIUI) `WirelessDebuggingActivity` is an empty
+shell that is silently redirected to the Settings home screen, so checking whether
+`am start` errored is not enough.
 
-The verified command:
+Implementation constraints:
+
+- UI text is dumped to `/sdcard/` and read from there (`/dev/tty` is unusable on some ROMs)
+- The device-side `grep` avoids `'A\|B'` BRE alternation and uses separate fixed-string matches
+- Page keywords are matched in Chinese first, then `wireless debugging` to cover English systems
 
 ```bash
 adb shell am start -n com.android.settings/.SubSettings \
   --es ':settings:show_fragment' \
   'com.android.settings.development.WirelessDebuggingFragment'
 ```
-
-### Pitfalls encountered (all handled)
-
-- `uiautomator dump /dev/tty` throws `FileNotFoundException` on MIUI, outputting only a stack trace
-  → dump to `/sdcard/` and grep instead
-- The device-side `grep` is unreliable with `'A\|B'` BRE alternation
-  → use separate fixed-string matches
-- Chinese keywords sometimes fail to match under certain shell escaping
-  → try Chinese first, then fall back to `wireless debugging` (covers English systems)
 
 Either USB or wireless works; USB is preferred when available so the active wireless
 connection is not disturbed.
