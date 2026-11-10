@@ -65,6 +65,11 @@ final class L {
         return String(format: format, arguments: args)
     }
 
+    /// key 是否已收录。
+    /// 用于「脚本下发了新 DIAG_CODE、但 App 版本尚未收录」的降级判断，
+    /// 避免直接把 key 当文案显示出去。
+    static func has(_ key: String) -> Bool { shared.table[key] != nil }
+
     // MARK: - 文案表
 
     private static let tables: [AppLanguage: [String: String]] = [
@@ -198,6 +203,101 @@ final class L {
         "phone.wireless": "无线调试",
         "phone.dev": "开发者选项",
         "log.title": "adb-wifi 日志",
+
+        // ---- 错误与提示 ----
+        "err.scriptFailed": "无法执行脚本：%@",
+        "err.timeout": "执行超时",
+        "err.noStatus": "无法读取设备状态",
+        "err.noWifiIP": "已切换 TCP 模式，但未取到手机 Wi-Fi IP",
+        "err.noRelease": "仓库暂未发布任何版本，可打开版本发布页手动查看。",
+        "err.badURL": "无效的地址",
+        "err.noResponse": "未收到服务器响应",
+        "err.http": "GitHub 返回 HTTP %d",
+
+        // ---- 帮助弹窗 ----
+        "help.usb.title": "如何用 USB 自动读取端口",
+        "help.usb.body": """
+        插上 USB 线即可自动恢复连接。
+
+        步骤：
+        1. 用数据线把手机连到这台 Mac
+        2. 手机弹窗「允许 USB 调试」→ 点允许
+        3. 菜单会自动刷新并读取手机的真实端口
+
+        原理：无线调试端口每次随机分配，通过 USB 读取不受网络
+        屏蔽影响，是最可靠的方式。
+        """,
+        "help.manual.title": "手动连接（命令已复制到剪贴板）",
+        "help.manual.cmd": "adb connect <手机IP>:<端口>",
+        "help.manual.body": """
+        请先在手机上查看地址：
+          设置 → 开发者选项 → 无线调试 → 页面顶部显示 IP:端口
+
+        然后在终端里执行（菜单栏无法输入，复制下面命令改好再执行）：
+          %@
+
+        或者打开终端 TUI 完成（推荐，可点选）：
+          cd ~/mycode/adb-wifi-manager && ./adbwifi
+
+        提示：连接过一次后地址会被记住，之后掉线能自动重连。
+        """,
+        "help.tui.title": "需要进一步处理",
+        "help.tui.body": """
+        请打开终端 TUI 查看完整解决方案（支持点选操作）：
+          cd ~/mycode/adb-wifi-manager && ./adbwifi
+        """,
+        "usb.none.body": "请先用 USB 线连接手机并允许 USB 调试，\n再点击此菜单项。",
+
+        // ---- 手机设置页跳转（协议 RESULT / PAGE / WIFI_TOGGLE）----
+        "phone.open.body": "已在手机上打开「%@」页面。",
+        "phone.open.toggleOff": "当前「无线调试」开关未开启，请在手机上点开。",
+        "phone.open.toggleUnknown": "该 ROM 可能不暴露无线调试开关状态，请在手机上确认。",
+        "phone.open.partialTitle": "已打开开发者选项",
+        "phone.open.partial": "该 ROM 未能直接定位到「无线调试」页，请在列表中手动点击「无线调试」。",
+        "phone.open.failedTitle": "打开设置失败",
+        "phone.open.noDevice": "未检测到已连接的设备。请先用 USB 线或无线连接手机，再试一次。",
+        "phone.open.failedBody": "无法在手机上打开设置页。\n请确认手机已解锁并允许 USB 调试，或改用终端 TUI 排查。",
+
+        // ---- 恢复无线连接（协议 RESULT / ENDPOINT / VIA / ERROR）----
+        "recover.result.already": "当前已有可用连接：%@",
+        "recover.result.alreadyNoEp": "当前已有可用连接",
+        "recover.result.recovered": "已恢复无线连接：%@",
+        "recover.result.recoveredNoEp": "已恢复无线连接",
+        "recover.failed.tcpip": "切换到 TCP 模式后仍未连接成功。\n\n可能原因与处理：\n  1) 手机重启过 → tcpip 模式已失效，需插一次 USB\n  2) 手机未连 Wi-Fi，或与 Mac 不在同一网段\n  3) 手机改回 USB 模式了 → 插 USB 后会自动切换",
+        "recover.failed.body": "未能恢复无线连接。\n\n可能原因与处理：\n  1) 手机重启过 → tcpip 模式已失效，需插一次 USB（守护会自动恢复）\n  2) 手机未连 Wi-Fi，或与 Mac 不在同一网段\n  3) 手机改回 USB 模式了 → 插 USB 后会自动切换",
+
+        // ---- 更新失败原因 ----
+        "update.err.download": "下载失败，请检查网络后重试",
+        "update.err.package": "安装包内容异常",
+        "update.err.signature": "签名校验失败：%@",
+        "update.err.unknown": "未知原因",
+        "about.alpha.errNoVersion": "未获取到版本号",
+
+        "log.empty": "（暂无日志）",
+
+        // ---- 诊断结论（key 由脚本的 DIAG_CODE 拼接：diag.<CODE>.title / .hint）----
+        "diag.DAEMON_DOWN_NO_DEVICE.title": "守护未运行且无设备连接",
+        "diag.DAEMON_DOWN_NO_DEVICE.hint": "点击「启动守护」开始自动连接",
+        "diag.CONNECTED_MDNS.title": "连接正常",
+        "diag.CONNECTED_MDNS.hint": "mDNS 自动发现可用",
+        "diag.CONNECTED_VIA_TCPIP_USB.title": "设备已连接（USB 自动转 TCP）",
+        "diag.CONNECTED_VIA_TCPIP_USB.hint": "TCP 端口 %@ 已开启，可安全拔掉 USB",
+        "diag.CONNECTED_VIA_TCPIP_WIRELESS.title": "设备已连接（无线 %@ 端口）",
+        "diag.CONNECTED_VIA_TCPIP_WIRELESS.hint": "USB 已拔出，无线连接独立保持正常",
+        "diag.CONNECTED_VIA_KNOWN.title": "设备已连接（mDNS 被屏蔽）",
+        "diag.CONNECTED_VIA_KNOWN.hint": "靠记忆端点维持，端口变化后需重连",
+        "diag.DEV_OPTIONS_OFF.title": "手机「开发者选项」未开启",
+        "diag.DEV_OPTIONS_OFF.hint": "插着 USB，可在手机上自动打开设置页",
+        "diag.USB_AUTO_TCPIP_PENDING.title": "USB 已连接，正在自动建立无线连接",
+        "diag.USB_AUTO_TCPIP_PENDING.hint": "守护将自动切换 TCP 模式（端口 %@），无需手动开无线调试",
+        "diag.ADB_WIFI_OFF.title": "手机「无线调试」开关未打开",
+        "diag.ADB_WIFI_OFF.hint": "插着 USB，可在手机上自动打开设置页",
+        "diag.USB_CONNECTED_NO_WIRELESS.title": "USB 已连接，尚未建立无线连接",
+        "diag.USB_CONNECTED_NO_WIRELESS.hint": "正在读取端口，稍候自动连接",
+        "diag.NO_DEVICE_MDNS_OK.title": "未发现设备（mDNS 正常）",
+        "diag.NO_DEVICE_MDNS_OK.hint": "请确认手机已开启无线调试且同一 Wi-Fi",
+        "diag.NO_DEVICE_MDNS_BLOCKED.title": "未发现设备，且此网络屏蔽 mDNS",
+        "diag.NO_DEVICE_MDNS_BLOCKED.hint": "插 USB 自动读端口 / 手动输入 IP:端口",
     ]
 
     private static let zhHant: [String: String] = [
@@ -325,6 +425,101 @@ final class L {
         "phone.wireless": "無線偵錯",
         "phone.dev": "開發人員選項",
         "log.title": "adb-wifi 日誌",
+
+        // ---- 錯誤與提示 ----
+        "err.scriptFailed": "無法執行腳本：%@",
+        "err.timeout": "執行逾時",
+        "err.noStatus": "無法讀取裝置狀態",
+        "err.noWifiIP": "已切換 TCP 模式，但未取得手機 Wi-Fi IP",
+        "err.noRelease": "儲存庫尚未發布任何版本，可開啟版本發布頁手動查看。",
+        "err.badURL": "無效的位址",
+        "err.noResponse": "未收到伺服器回應",
+        "err.http": "GitHub 傳回 HTTP %d",
+
+        // ---- 說明視窗 ----
+        "help.usb.title": "如何用 USB 自動讀取連接埠",
+        "help.usb.body": """
+        插上 USB 線即可自動恢復連線。
+
+        步驟：
+        1. 用傳輸線把手機連到這台 Mac
+        2. 手機彈窗「允許 USB 偵錯」→ 點允許
+        3. 選單會自動重新整理並讀取手機的真實連接埠
+
+        原理：無線偵錯連接埠每次隨機分配，透過 USB 讀取不受網路
+        封鎖影響，是最可靠的方式。
+        """,
+        "help.manual.title": "手動連線（指令已複製到剪貼簿）",
+        "help.manual.cmd": "adb connect <手機IP>:<連接埠>",
+        "help.manual.body": """
+        請先在手機上查看位址：
+          設定 → 開發人員選項 → 無線偵錯 → 頁面頂端顯示 IP:連接埠
+
+        然後在終端機裡執行（選單列無法輸入，複製下面指令改好再執行）：
+          %@
+
+        或開啟終端機 TUI 完成（推薦，可點選）：
+          cd ~/mycode/adb-wifi-manager && ./adbwifi
+
+        提示：連線過一次後位址會被記住，之後斷線能自動重連。
+        """,
+        "help.tui.title": "需要進一步處理",
+        "help.tui.body": """
+        請開啟終端機 TUI 查看完整解決方案（支援點選操作）：
+          cd ~/mycode/adb-wifi-manager && ./adbwifi
+        """,
+        "usb.none.body": "請先用 USB 線連接手機並允許 USB 偵錯，\n再點擊此選單項目。",
+
+        // ---- 手機設定頁跳轉（協議 RESULT / PAGE / WIFI_TOGGLE）----
+        "phone.open.body": "已在手機上開啟「%@」頁面。",
+        "phone.open.toggleOff": "目前「無線偵錯」開關未開啟，請在手機上點開。",
+        "phone.open.toggleUnknown": "此 ROM 可能不公開無線偵錯開關狀態，請在手機上確認。",
+        "phone.open.partialTitle": "已開啟開發人員選項",
+        "phone.open.partial": "此 ROM 未能直接定位到「無線偵錯」頁，請在清單中手動點擊「無線偵錯」。",
+        "phone.open.failedTitle": "開啟設定失敗",
+        "phone.open.noDevice": "未偵測到已連線的裝置。請先用 USB 線或無線連接手機，再試一次。",
+        "phone.open.failedBody": "無法在手機上開啟設定頁。\n請確認手機已解鎖並允許 USB 偵錯，或改用終端機 TUI 排查。",
+
+        // ---- 恢復無線連線（協議 RESULT / ENDPOINT / VIA / ERROR）----
+        "recover.result.already": "目前已有可用連線：%@",
+        "recover.result.alreadyNoEp": "目前已有可用連線",
+        "recover.result.recovered": "已恢復無線連線：%@",
+        "recover.result.recoveredNoEp": "已恢復無線連線",
+        "recover.failed.tcpip": "切換到 TCP 模式後仍未連線成功。\n\n可能原因與處理：\n  1) 手機重新開機過 → tcpip 模式已失效，需插一次 USB\n  2) 手機未連 Wi-Fi，或與 Mac 不在同一網段\n  3) 手機改回 USB 模式了 → 插 USB 後會自動切換",
+        "recover.failed.body": "無法恢復無線連線。\n\n可能原因與處理：\n  1) 手機重新開機過 → tcpip 模式已失效，需插一次 USB（守護會自動恢復）\n  2) 手機未連 Wi-Fi，或與 Mac 不在同一網段\n  3) 手機改回 USB 模式了 → 插 USB 後會自動切換",
+
+        // ---- 更新失敗原因 ----
+        "update.err.download": "下載失敗，請檢查網路後重試",
+        "update.err.package": "安裝包內容異常",
+        "update.err.signature": "簽章驗證失敗：%@",
+        "update.err.unknown": "未知原因",
+        "about.alpha.errNoVersion": "未取得版本號",
+
+        "log.empty": "（暫無日誌）",
+
+        // ---- 診斷結論（key 由腳本的 DIAG_CODE 拼接：diag.<CODE>.title / .hint）----
+        "diag.DAEMON_DOWN_NO_DEVICE.title": "守護進程未執行且無裝置連線",
+        "diag.DAEMON_DOWN_NO_DEVICE.hint": "點擊「啟動守護」開始自動連線",
+        "diag.CONNECTED_MDNS.title": "連線正常",
+        "diag.CONNECTED_MDNS.hint": "mDNS 自動發現可用",
+        "diag.CONNECTED_VIA_TCPIP_USB.title": "裝置已連線（USB 自動轉 TCP）",
+        "diag.CONNECTED_VIA_TCPIP_USB.hint": "TCP 連接埠 %@ 已開啟，可安全拔掉 USB",
+        "diag.CONNECTED_VIA_TCPIP_WIRELESS.title": "裝置已連線（無線 %@ 連接埠）",
+        "diag.CONNECTED_VIA_TCPIP_WIRELESS.hint": "USB 已拔出，無線連線獨立保持正常",
+        "diag.CONNECTED_VIA_KNOWN.title": "裝置已連線（mDNS 被封鎖）",
+        "diag.CONNECTED_VIA_KNOWN.hint": "靠記憶端點維持，連接埠變化後需重連",
+        "diag.DEV_OPTIONS_OFF.title": "手機「開發人員選項」未開啟",
+        "diag.DEV_OPTIONS_OFF.hint": "插著 USB，可在手機上自動開啟設定頁",
+        "diag.USB_AUTO_TCPIP_PENDING.title": "USB 已連接，正在自動建立無線連線",
+        "diag.USB_AUTO_TCPIP_PENDING.hint": "守護將自動切換 TCP 模式（連接埠 %@），無需手動開無線偵錯",
+        "diag.ADB_WIFI_OFF.title": "手機「無線偵錯」開關未開啟",
+        "diag.ADB_WIFI_OFF.hint": "插著 USB，可在手機上自動開啟設定頁",
+        "diag.USB_CONNECTED_NO_WIRELESS.title": "USB 已連接，尚未建立無線連線",
+        "diag.USB_CONNECTED_NO_WIRELESS.hint": "正在讀取連接埠，稍候自動連線",
+        "diag.NO_DEVICE_MDNS_OK.title": "未發現裝置（mDNS 正常）",
+        "diag.NO_DEVICE_MDNS_OK.hint": "請確認手機已開啟無線偵錯且同一 Wi-Fi",
+        "diag.NO_DEVICE_MDNS_BLOCKED.title": "未發現裝置，且此網路封鎖 mDNS",
+        "diag.NO_DEVICE_MDNS_BLOCKED.hint": "插 USB 自動讀連接埠 / 手動輸入 IP:連接埠",
     ]
 
     private static let en: [String: String] = [
@@ -452,5 +647,102 @@ final class L {
         "phone.wireless": "Wireless debugging",
         "phone.dev": "Developer options",
         "log.title": "adb-wifi log",
+
+        // ---- errors / notices ----
+        "err.scriptFailed": "Cannot run script: %@",
+        "err.timeout": "Timed out",
+        "err.noStatus": "Cannot read device status",
+        "err.noWifiIP": "Switched to TCP mode but no phone Wi-Fi IP was found",
+        "err.noRelease": "No release published yet, open the releases page manually.",
+        "err.badURL": "Invalid URL",
+        "err.noResponse": "No response from server",
+        "err.http": "GitHub returned HTTP %d",
+
+        // ---- help dialogs ----
+        "help.usb.title": "Read the port over USB",
+        "help.usb.body": """
+        Plugging in a USB cable restores the connection automatically.
+
+        Steps:
+        1. Connect the phone to this Mac with a data cable
+        2. Tap "Allow USB debugging" on the phone
+        3. The menu refreshes and reads the phone's real port
+
+        Why: the wireless debugging port is random on every start.
+        Reading it over USB is immune to network filtering and
+        therefore the most reliable path.
+        """,
+        "help.manual.title": "Manual connect (command copied)",
+        "help.manual.cmd": "adb connect <IP>:<PORT>",
+        "help.manual.body": """
+        First read the address on the phone:
+          Settings → Developer options → Wireless debugging → IP:PORT at the top
+
+        Then run this in Terminal (the menu bar cannot take input,
+        paste the command below and fill in your values):
+          %@
+
+        Or use the terminal TUI instead (recommended, clickable):
+          cd ~/mycode/adb-wifi-manager && ./adbwifi
+
+        Tip: a successful endpoint is remembered and reconnected later.
+        """,
+        "help.tui.title": "Further action needed",
+        "help.tui.body": """
+        Open the terminal TUI for the full walkthrough (clickable):
+          cd ~/mycode/adb-wifi-manager && ./adbwifi
+        """,
+        "usb.none.body": "Connect the phone with a USB cable and allow USB debugging,\nthen click this menu item again.",
+
+        // ---- phone settings jump (protocol RESULT / PAGE / WIFI_TOGGLE) ----
+        "phone.open.body": "Opened \"%@\" on the phone.",
+        "phone.open.toggleOff": "The wireless debugging toggle is off. Turn it on in the phone.",
+        "phone.open.toggleUnknown": "This ROM may not expose the toggle state. Please confirm on the phone.",
+        "phone.open.partialTitle": "Developer options opened",
+        "phone.open.partial": "This ROM could not jump straight to wireless debugging. Tap \"Wireless debugging\" in the list.",
+        "phone.open.failedTitle": "Could not open settings",
+        "phone.open.noDevice": "No connected device found. Connect the phone over USB or Wi-Fi and try again.",
+        "phone.open.failedBody": "Could not open the settings page on the phone.\nMake sure the phone is unlocked and USB debugging is allowed, or use the terminal TUI.",
+
+        // ---- connection recovery (protocol RESULT / ENDPOINT / VIA / ERROR) ----
+        "recover.result.already": "Already connected: %@",
+        "recover.result.alreadyNoEp": "Already connected",
+        "recover.result.recovered": "Wireless connection restored: %@",
+        "recover.result.recoveredNoEp": "Wireless connection restored",
+        "recover.failed.tcpip": "Switched to TCP mode but still could not connect.\n\nPossible causes:\n  1) The phone rebooted → tcpip mode is gone, plug in USB once\n  2) The phone is not on Wi-Fi, or on a different subnet than this Mac\n  3) The phone fell back to USB mode → plugging in USB switches it back",
+        "recover.failed.body": "Could not restore the wireless connection.\n\nPossible causes:\n  1) The phone rebooted → tcpip mode is gone, plug in USB once (the daemon restores it)\n  2) The phone is not on Wi-Fi, or on a different subnet than this Mac\n  3) The phone fell back to USB mode → plugging in USB switches it back",
+
+        // ---- update failure reasons ----
+        "update.err.download": "Download failed. Check your network and retry.",
+        "update.err.package": "Unexpected contents in the package",
+        "update.err.signature": "Signature verification failed: %@",
+        "update.err.unknown": "unknown reason",
+        "about.alpha.errNoVersion": "No version number returned",
+
+        "log.empty": "(no log yet)",
+
+        // ---- diagnostics (key = diag.<DIAG_CODE>.title / .hint) ----
+        "diag.DAEMON_DOWN_NO_DEVICE.title": "Daemon not running and no device connected",
+        "diag.DAEMON_DOWN_NO_DEVICE.hint": "Click \"Start daemon\" to connect automatically",
+        "diag.CONNECTED_MDNS.title": "Connected",
+        "diag.CONNECTED_MDNS.hint": "mDNS auto-discovery is available",
+        "diag.CONNECTED_VIA_TCPIP_USB.title": "Connected (USB auto-switched to TCP)",
+        "diag.CONNECTED_VIA_TCPIP_USB.hint": "TCP port %@ is open, you can unplug USB safely",
+        "diag.CONNECTED_VIA_TCPIP_WIRELESS.title": "Connected (wireless, port %@)",
+        "diag.CONNECTED_VIA_TCPIP_WIRELESS.hint": "USB unplugged, the wireless link stands on its own",
+        "diag.CONNECTED_VIA_KNOWN.title": "Connected (mDNS blocked)",
+        "diag.CONNECTED_VIA_KNOWN.hint": "Kept alive by a remembered endpoint; reconnect if the port changes",
+        "diag.DEV_OPTIONS_OFF.title": "Developer options are off on the phone",
+        "diag.DEV_OPTIONS_OFF.hint": "USB is plugged in, the settings page can be opened on the phone",
+        "diag.USB_AUTO_TCPIP_PENDING.title": "USB connected, establishing wireless link",
+        "diag.USB_AUTO_TCPIP_PENDING.hint": "The daemon switches to TCP mode (port %@) automatically, no manual toggle needed",
+        "diag.ADB_WIFI_OFF.title": "Wireless debugging is off on the phone",
+        "diag.ADB_WIFI_OFF.hint": "USB is plugged in, the settings page can be opened on the phone",
+        "diag.USB_CONNECTED_NO_WIRELESS.title": "USB connected, no wireless link yet",
+        "diag.USB_CONNECTED_NO_WIRELESS.hint": "Reading the port, connecting shortly",
+        "diag.NO_DEVICE_MDNS_OK.title": "No device found (mDNS works)",
+        "diag.NO_DEVICE_MDNS_OK.hint": "Make sure wireless debugging is on and both devices share the same Wi-Fi",
+        "diag.NO_DEVICE_MDNS_BLOCKED.title": "No device found and this network blocks mDNS",
+        "diag.NO_DEVICE_MDNS_BLOCKED.hint": "Plug in USB to read the port, or enter IP:PORT manually",
     ]
 }

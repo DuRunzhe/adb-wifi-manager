@@ -16,6 +16,29 @@
 #   adb-wifi.sh restart   重启
 #   adb-wifi.sh log       实时查看日志(Ctrl-C 退出查看)
 #   adb-wifi.sh once      前台跑一轮诊断（排查用）
+#
+# -----------------------------------------------------------------------------
+# 输出协议（机器可读契约）
+#
+# 默认 text 模式输出人类可读的中文文案，给终端用户与 TUI 直接展示。
+# 菜单栏 App 需要做多语言时不能解析这些文案，因此提供 kv 模式：
+#
+#   ADBWIFI_FORMAT=kv adb-wifi.sh <子命令>
+#
+# kv 模式只输出 ASCII 的 KEY=VALUE 字段，值一律为枚举 token，不含任何自然语言；
+# 语义文案由调用方（menubar/main.swift）用各自的 i18n 表渲染。
+#
+#   recover : RESULT=already|recovered|failed  ENDPOINT=<ip:port>  VIA=existing|known|scan|usb
+#             ERROR=no_usb|tcpip_failed（仅 failed 时）
+#   open    : RESULT=opened|partial|need_usb|no_device|failed  PAGE=wireless|dev
+#             TITLE=wireless|dev  WIFI_TOGGLE=on|off|unknown
+#   diag    : 始终输出 KEY=VALUE（不受本开关影响，本身即协议）
+#             其中 DIAG_CODE 是诊断结论枚举，菜单栏按它查本地 i18n；
+#             DIAG_TITLE / DIAG_HINT 是同义的中文文案，仅供终端与 TUI。
+#             枚举取值见 cmd_diag 内各分支的 code=（共 11 种）
+#
+# 约定：这些字段是**稳定契约**，改名/改值需同步 menubar/main.swift；
+#       新增诊断分支必须同时设置 code 并在 menubar/i18n.swift 三语表补齐。
 # =============================================================================
 
 set -uo pipefail
@@ -45,6 +68,11 @@ TCPIP_RETRY_INTERVAL="${TCPIP_RETRY_INTERVAL:-60}"  # 失败后重试间隔(秒)
 # 记忆端点的清理阈值：连续探测失败多少次才丢弃。
 # 设得足够大，保证手机临时掉线/睡眠不会把"回家的路"忘掉。
 MAX_KNOWN_FAILS="${MAX_KNOWN_FAILS:-360}"  # 约 1 小时（按 CHECK_INTERVAL=10s 计）
+
+# 输出格式：text=人类可读（默认）；kv=机器可读协议字段（菜单栏 App 使用）。
+# 详见文件头「输出协议」一节。
+OUT_FORMAT="${ADBWIFI_FORMAT:-text}"
+is_kv() { [ "$OUT_FORMAT" = "kv" ]; }
 
 # 无 USB 自动恢复：手机换了网段后，扫描本网段找回
 AUTO_SCAN="${AUTO_SCAN:-1}"              # 1=允许自动扫描，0=关闭
@@ -434,7 +462,7 @@ recover_connection() {
     for ep in $eps; do
         if try_connect "$ep" >/dev/null 2>&1; then
             remember_endpoint "$ep"
-            echo "OK $ep"
+            echo "OK known $ep"
             return 0
         fi
     done
@@ -446,7 +474,7 @@ recover_connection() {
         for ep in $found; do
             if try_connect "$ep" >/dev/null 2>&1; then
                 remember_endpoint "$ep"
-                echo "OK $ep"
+                echo "OK scan $ep"
                 return 0
             fi
         done
@@ -813,7 +841,7 @@ open_settings_page() {
         out=$(tmo 15 "$ADB_BIN" -s "$serial" shell am start \
             -a android.settings.APPLICATION_DEVELOPMENT_SETTINGS 2>&1 | tr -d '\r')
         if echo "$out" | grep -q "Starting:"; then
-            echo "OK 开发者选项"
+            echo "OK dev"
             return 0
         fi
         echo "FAIL $out"
@@ -829,7 +857,7 @@ open_settings_page() {
         # 校验是否真的停在无线调试页：读界面文本，含"无线调试/Wireless debugging"且含开关项
         sleep 1.5
         if ui_page_is_wireless_debug "$serial"; then
-            echo "OK 无线调试"
+            echo "OK wireless"
             return 0
         fi
     fi
@@ -840,7 +868,7 @@ open_settings_page() {
     if echo "$out" | grep -q "Starting:"; then
         sleep 1.5
         if ui_page_is_wireless_debug "$serial"; then
-            echo "OK 无线调试"
+            echo "OK wireless"
             return 0
         fi
     fi
@@ -849,8 +877,8 @@ open_settings_page() {
     out=$(tmo 15 "$ADB_BIN" -s "$serial" shell am start \
         -a android.settings.APPLICATION_DEVELOPMENT_SETTINGS 2>&1 | tr -d '\r')
     if echo "$out" | grep -q "Starting:"; then
-        echo "PARTIAL 开发者选项"
-        echo "该 ROM 未能直接定位无线调试页，已打开开发者选项，请手动点击「无线调试」" >&2
+        echo "PARTIAL dev"
+        is_kv || echo "该 ROM 未能直接定位无线调试页，已打开开发者选项，请手动点击「无线调试」" >&2
         return 0
     fi
 
@@ -893,29 +921,70 @@ settings_serial() {
 }
 
 cmd_open() {
-    local page="${1:-wireless}" serial out qr
+    local page="${1:-wireless}" serial out
     serial="$(settings_serial)"
     if [ -z "$serial" ]; then
-        echo "✗ 未检测到已连接的设备（USB 或无线均可）"
-        echo "  请先连上手机再执行本命令"
+        if is_kv; then
+            echo "RESULT=no_device"
+            echo "PAGE=$page"
+        else
+            echo "✗ 未检测到已连接的设备（USB 或无线均可）"
+            echo "  请先连上手机再执行本命令"
+        fi
         return 1
     fi
-    echo "使用设备: $serial"
+    is_kv || echo "使用设备: $serial"
+
     out=$(open_settings_page "$serial" "$page" 2>/dev/null)
+
+    # 当前「无线调试」开关状态（kv 下作为字段，text 下作为提示行）
+    local en toggle
+    en=$(adbw -s "$serial" shell settings get global adb_wifi_enabled 2>/dev/null | tr -d '\r')
+    case "$en" in
+        1) toggle=on ;;
+        0) toggle=off ;;
+        *) toggle=unknown ;;
+    esac
+
+    # 把内部协议转成对外的 RESULT / TITLE token（值域见文件头「输出协议」）
+    local result title=""
     case "$out" in
-        OK*)      echo "✓ 已在手机上打开「${out#OK }」页面" ;;
-        PARTIAL*) echo "△ ${out#PARTIAL }"; echo "  未能直接定位到无线调试页，请在列表中手动点击「无线调试」" ;;
-        NEED_USB) echo "✗ 需要先连接手机"; return 1 ;;
+        OK\ *)      result=opened;  title="${out#OK }" ;;
+        PARTIAL\ *) result=partial; title="${out#PARTIAL }" ;;
+        NEED_USB)   result=need_usb ;;
+        *)          result=failed ;;
+    esac
+
+    if is_kv; then
+        echo "RESULT=$result"
+        echo "PAGE=$page"
+        [ -n "$title" ] && echo "TITLE=$title"
+        echo "WIFI_TOGGLE=$toggle"
+        if [ "$result" = "failed" ] || [ "$result" = "need_usb" ]; then
+            return 1
+        fi
+        return 0
+    fi
+
+    # text 模式：把 token 渲染成中文（终端用户 / TUI 直接看）
+    local label
+    case "$title" in
+        dev)      label="开发者选项" ;;
+        wireless) label="无线调试" ;;
+        *)        label="$title" ;;
+    esac
+    case "$result" in
+        opened)   echo "✓ 已在手机上打开「$label」页面" ;;
+        partial)  echo "△ $label"
+                  echo "  未能直接定位到无线调试页，请在列表中手动点击「无线调试」" ;;
+        need_usb) echo "✗ 需要先连接手机"; return 1 ;;
         *)        echo "✗ 打开失败: ${out#FAIL }"; return 1 ;;
     esac
 
-    # 顺带打印当前无线调试开关状态，方便判断还要不要手动开
-    local en
-    en=$(adbw -s "$serial" shell settings get global adb_wifi_enabled 2>/dev/null | tr -d '\r')
-    case "$en" in
-        1) echo "  当前「无线调试」开关: 已开启" ;;
-        0) echo "  当前「无线调试」开关: 未开启（请在手机上点开）" ;;
-        *) echo "  当前「无线调试」开关: 无法读取（该 ROM 可能不暴露此设置）" ;;
+    case "$toggle" in
+        on)      echo "  当前「无线调试」开关: 已开启" ;;
+        off)     echo "  当前「无线调试」开关: 未开启（请在手机上点开）" ;;
+        *)       echo "  当前「无线调试」开关: 无法读取（该 ROM 可能不暴露此设置）" ;;
     esac
     return 0
 }
@@ -925,33 +994,58 @@ cmd_open() {
 # 之后无论 USB 是否插着，都能直接 connect 恢复。
 # 恢复顺序：已有连接 → 记忆端点 → 扫描本网段
 cmd_recover() {
-    echo "正在恢复无线连接 ..."
-    local r
+    local r ep="" via="" result="" err=""
+    is_kv || echo "正在恢复无线连接 ..."
     r=$(recover_connection 2>/dev/null)
+
     case "$r" in
-        ALREADY\ *)
-            echo "✓ 当前已有可用连接: ${r#ALREADY }"
-            return 0
-            ;;
-        OK\ *)
-            echo "✓ 已恢复无线连接: ${r#OK }"
-            return 0
-            ;;
+        ALREADY\ *)   result=already;   ep="${r#ALREADY }"; via=existing ;;
+        OK\ known\ *) result=recovered; ep="${r#OK known }"; via=known ;;
+        OK\ scan\ *)  result=recovered; ep="${r#OK scan }"; via=scan ;;
+    esac
+
+    # 第一轮失败：插着 USB 时尝试切 TCP 模式再恢复
+    if [ -z "$result" ]; then
+        local usb
+        usb="$(first_usb_serial)"
+        if [ -n "$usb" ]; then
+            is_kv || echo "✗ 未能恢复无线连接"
+            is_kv || echo "  检测到 USB 已连接，将自动切换 TCP 模式重试 ..."
+            ep=$(ensure_tcpip 2>/dev/null)
+            if [ -n "$ep" ]; then
+                result=recovered
+                via=usb
+            else
+                err=tcpip_failed
+            fi
+        else
+            err=no_usb
+        fi
+    fi
+
+    if is_kv; then
+        # 输出协议：RESULT / ENDPOINT / VIA / ERROR，不含任何自然语言
+        echo "RESULT=${result:-failed}"
+        [ -n "$ep" ] && echo "ENDPOINT=$ep"
+        [ -n "$via" ] && echo "VIA=$via"
+        [ -n "$err" ] && echo "ERROR=$err"
+        [ -n "$result" ] && return 0
+        return 1
+    fi
+
+    case "$result" in
+        already)   echo "✓ 当前已有可用连接: $ep"; return 0 ;;
+        recovered)
+            if [ "$via" = "usb" ]; then
+                echo "✓ 已通过 USB 恢复: $ep"
+            else
+                echo "✓ 已恢复无线连接: $ep"
+            fi
+            return 0 ;;
     esac
 
     # 失败：区分"手机根本没在监听"与"网络不通"，给出可操作提示
-    local usb
-    usb="$(first_usb_serial)"
-    echo "✗ 未能恢复无线连接"
-    if [ -n "$usb" ]; then
-        echo "  检测到 USB 已连接，将自动切换 TCP 模式重试 ..."
-        local ep
-        ep=$(ensure_tcpip 2>/dev/null)
-        if [ -n "$ep" ]; then
-            echo "✓ 已通过 USB 恢复: $ep"
-            return 0
-        fi
-    fi
+    [ "$err" = "no_usb" ] && echo "✗ 未能恢复无线连接"
     echo
     echo "可能原因与处理："
     echo "  1) 手机重启过 → tcpip 模式已失效，需插一次 USB（守护会自动恢复）"
@@ -1153,10 +1247,14 @@ cmd_diag() {
     echo "KNOWN_LIST=$( [ -f "$KNOWN_FILE" ] && tr '\n' ',' < "$KNOWN_FILE" )"
 
     # ---- 结构化诊断结论（TUI 与菜单栏 App 共用，避免两边判断不一致）----
-    local level title hint action
+    # code 是机器可读枚举，供菜单栏 App 按自己的语言渲染；
+    # title/hint 是中文文案，给终端用户与 TUI 用。新增分支必须同时设 code。
+    local level title hint action code=""
     if [ -z "$dpid" ] && [ -z "$(wifi_devices)" ]; then
+        code="DAEMON_DOWN_NO_DEVICE"
         level="warn"; title="守护未运行且无设备连接"; hint="点击「启动守护」开始自动连接"; action="start_daemon"
     elif [ -n "$(wifi_devices)" ] && [ "${raw_mdns:-0}" -gt 0 ]; then
+        code="CONNECTED_MDNS"
         level="ok"; title="连接正常"; hint="mDNS 自动发现可用"; action=""
     elif [ -n "$(wifi_devices)" ]; then
         # 区分：是靠 tcpip 端口连上的，还是记忆端点维持的
@@ -1168,30 +1266,39 @@ cmd_diag() {
             # tcpip 模式下 USB 只是"最初把它们连起来"的手段，之后无线独立工作，
             # 因此按当前有没有插 USB 给出不同文案，避免拔线后仍显示"USB 已连接"造成误解
             if [ -n "$usb_serial" ]; then
+                code="CONNECTED_VIA_TCPIP_USB"
                 level="ok"; title="设备已连接（USB 自动转 TCP）"
                 hint="TCP 端口 $TCPIP_PORT 已开启，可安全拔掉 USB"
             else
+                code="CONNECTED_VIA_TCPIP_WIRELESS"
                 level="ok"; title="设备已连接（无线 $TCPIP_PORT 端口）"
                 hint="USB 已拔出，无线连接独立保持正常"
             fi
             action=""
         else
+            code="CONNECTED_VIA_KNOWN"
             level="ok"; title="设备已连接（mDNS 被屏蔽）"; hint="靠记忆端点维持，端口变化后需重连"; action="manual_connect"
         fi
     elif [ -n "$usb_serial" ] && [ "${_dev_opts:-}" = "0" ]; then
+        code="DEV_OPTIONS_OFF"
         level="error"; title="手机「开发者选项」未开启"; hint="插着 USB，可在手机上自动打开设置页"; action="phone_dev_settings"
     elif [ -n "$usb_serial" ] && [ "$AUTO_TCPIP" = "1" ]; then
         # 插着 USB 且开启自动 tcpip：守护会自动切换，无需用户去设置里手动开
+        code="USB_AUTO_TCPIP_PENDING"
         level="warn"; title="USB 已连接，正在自动建立无线连接"
         hint="守护将自动切换 TCP 模式(端口 $TCPIP_PORT)，无需手动开无线调试"
         action="reconnect_now"
     elif [ -n "$usb_serial" ] && [ "${_adb_wifi:-}" = "0" ]; then
+        code="ADB_WIFI_OFF"
         level="error"; title="手机「无线调试」开关未打开"; hint="插着 USB，可在手机上自动打开设置页"; action="phone_wireless"
     elif [ -n "$usb_serial" ]; then
+        code="USB_CONNECTED_NO_WIRELESS"
         level="warn"; title="USB 已连接，尚未建立无线连接"; hint="正在读取端口，稍候自动连接"; action="reconnect_now"
     elif [ "${raw_mdns:-0}" -gt 0 ]; then
+        code="NO_DEVICE_MDNS_OK"
         level="warn"; title="未发现设备（mDNS 正常）"; hint="请确认手机已开启无线调试且同一 Wi-Fi"; action="phone_dev_settings"
     else
+        code="NO_DEVICE_MDNS_BLOCKED"
         level="error"; title="未发现设备，且此网络屏蔽 mDNS"; hint="插 USB 自动读端口 / 手动输入 IP:端口"; action="usb_help"
     fi
     # 事件序号：设备事件每发生一次 +1，UI 可据此判断"是否有变化"
@@ -1214,6 +1321,7 @@ cmd_diag() {
 
     echo "EVENT_SEQ=$(wc -l < "$STATE_DIR/events.log" 2>/dev/null | tr -d ' ' || echo 0)"
     echo "DIAG_LEVEL=$level"
+    echo "DIAG_CODE=$code"
     echo "DIAG_TITLE=$title"
     echo "DIAG_HINT=$hint"
     echo "DIAG_ACTION=$action"

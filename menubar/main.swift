@@ -92,16 +92,22 @@ func resolveScriptPath() -> String {
 
 let SCRIPT = resolveScriptPath()
 
+/// 让脚本输出机器可读的协议字段（见 bin/adb-wifi.sh 文件头「输出协议」）。
+/// 协议值为 ASCII 枚举，界面文案一律由本地 i18n 渲染，两边彻底分开。
+let KV_ENV = ["ADBWIFI_FORMAT": "kv"]
+
 // MARK: - 执行脚本
 
 @discardableResult
-func runScript(_ args: [String], timeout: TimeInterval = 20) -> (code: Int32, out: String) {
+func runScript(_ args: [String], timeout: TimeInterval = 20,
+               env extraEnv: [String: String] = [:]) -> (code: Int32, out: String) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/bash")
     p.arguments = [SCRIPT] + args
     var env = ProcessInfo.processInfo.environment
     env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:"
         + NSHomeDirectory() + "/Library/Android/sdk/platform-tools"
+    for (k, v) in extraEnv { env[k] = v }
     p.environment = env
     let pipe = Pipe()
     p.standardOutput = pipe
@@ -109,7 +115,7 @@ func runScript(_ args: [String], timeout: TimeInterval = 20) -> (code: Int32, ou
     do {
         try p.run()
     } catch {
-        return (-1, "无法执行脚本: \(error.localizedDescription)")
+        return (-1, L.t("err.scriptFailed", error.localizedDescription))
     }
     // 超时保护，避免界面卡死
     let deadline = Date().addingTimeInterval(timeout)
@@ -118,7 +124,7 @@ func runScript(_ args: [String], timeout: TimeInterval = 20) -> (code: Int32, ou
     }
     if p.isRunning {
         p.terminate()
-        return (-1, "执行超时")
+        return (-1, L.t("err.timeout"))
     }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
@@ -150,6 +156,7 @@ struct Status {
     var rateTotalUp = ""
     // 结构化诊断结论（由脚本层统一给出，与 TUI 完全同源）
     var diagLevel = ""
+    var diagCode = ""
     var diagTitle = ""
     var diagHint = ""
     var diagAction = ""
@@ -162,21 +169,28 @@ func splitCSV(_ v: String?) -> [String] {
     return v.split(separator: ",").map(String.init).filter { !$0.isEmpty }
 }
 
-/// 解析 KEY=VALUE 形式的 diag 输出
-func loadStatus() -> Status {
-    let r = runScript(["diag"], timeout: 20)
-    var s = Status()
-    s.raw = r.out
+/// 解析脚本的 KEY=VALUE 输出（`diag` 的原生格式，以及 `ADBWIFI_FORMAT=kv` 的结果协议）。
+/// 只认第一行等号，忽略不含等号的行（如误入的日志/提示），值两端去空白。
+func parseKV(_ text: String) -> [String: String] {
     var kv: [String: String] = [:]
-    for line in r.out.split(separator: "\n") {
+    for line in text.split(separator: "\n") {
         guard let eq = line.firstIndex(of: "=") else { continue }
         let k = String(line[line.startIndex..<eq]).trimmingCharacters(in: .whitespaces)
         let v = String(line[line.index(after: eq)...])
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if !k.isEmpty { kv[k] = v }
     }
+    return kv
+}
+
+/// 解析 KEY=VALUE 形式的 diag 输出
+func loadStatus() -> Status {
+    let r = runScript(["diag"], timeout: 20)
+    var s = Status()
+    s.raw = r.out
+    let kv = parseKV(r.out)
     if kv.isEmpty {
-        s.loadError = r.out.isEmpty ? "无法读取设备状态" : String(r.out.prefix(120))
+        s.loadError = r.out.isEmpty ? L.t("err.noStatus") : String(r.out.prefix(120))
         return s
     }
     s.pid = kv["DAEMON_PID"] ?? ""
@@ -197,6 +211,7 @@ func loadStatus() -> Status {
     s.rateTotalDown = kv["RATE_TOTAL_DOWN_MB"] ?? ""
     s.rateTotalUp = kv["RATE_TOTAL_UP_MB"] ?? ""
     s.diagLevel = kv["DIAG_LEVEL"] ?? ""
+    s.diagCode = kv["DIAG_CODE"] ?? ""
     s.diagTitle = kv["DIAG_TITLE"] ?? ""
     s.diagHint = kv["DIAG_HINT"] ?? ""
     s.diagAction = kv["DIAG_ACTION"] ?? ""
@@ -377,19 +392,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        // ---- 诊断结论（与 TUI 同源，由脚本层 DIAG_* 字段给出）----
-        if !s.diagTitle.isEmpty {
+        // ---- 诊断结论（与 TUI 同源，但文案由本地 i18n 渲染）----
+        let diag = localizedDiag(s)
+        if !diag.title.isEmpty {
             menu.addItem(.separator())
             let icon = s.diagLevel == "ok" ? "✓" : (s.diagLevel == "warn" ? "!" : "✗")
-            menu.addItem(disabledItem("  [\(icon)] \(s.diagTitle)"))
-            if !s.diagHint.isEmpty {
-                menu.addItem(disabledItem("        \(s.diagHint)"))
+            menu.addItem(disabledItem("  [\(icon)] \(diag.title)"))
+            if !diag.hint.isEmpty {
+                menu.addItem(disabledItem("        \(diag.hint)"))
             }
             if !s.diagAction.isEmpty {
                 let fix = NSMenuItem(title: L.t("diag.actionPrefix") + actionLabel(s.diagAction),
                                      action: #selector(runDiagAction(_:)), keyEquivalent: "")
                 fix.target = self
-                fix.toolTip = s.diagHint
+                fix.toolTip = diag.hint
                 menu.addItem(fix)
             }
         }
@@ -540,6 +556,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if reopen { showAbout() }
     }
 
+    /// 诊断结论本地化。
+    /// 脚本只给 `DIAG_CODE` 枚举（见 adb-wifi.sh 的 cmd_diag），文案在本 App 渲染；
+    /// 旧脚本没有 DIAG_CODE、或 App 尚未收录新 code 时，回退到脚本下发的中文。
+    func localizedDiag(_ s: Status) -> (title: String, hint: String) {
+        let titleKey = "diag." + s.diagCode + ".title"
+        let hintKey = "diag." + s.diagCode + ".hint"
+        guard !s.diagCode.isEmpty, L.has(titleKey), L.has(hintKey) else {
+            return (s.diagTitle, s.diagHint)
+        }
+        // 部分文案需要 tcpip 端口（%@）
+        let port = s.tcpipPort.isEmpty ? "5555" : s.tcpipPort
+        return (L.t(titleKey, port), L.t(hintKey, port))
+    }
+
     /// 把动作 ID 翻译成用户能看懂的文字
     func actionLabel(_ action: String) -> String {
         switch action {
@@ -572,57 +602,52 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             refresh()
             flash(title: L.t("flash.reconnect"), text: L.t("flash.refreshed"))
         case "usb_help":
-            let msg = """
-            插上 USB 线即可自动恢复连接。
-
-            步骤：
-            1. 用数据线把手机连到这台 Mac
-            2. 手机弹窗「允许 USB 调试」→ 点允许
-            3. 菜单会自动刷新并读取手机的真实端口
-
-            原理：无线调试端口每次随机分配，通过 USB 读取不受网络
-            屏蔽影响，是最可靠的方式。
-            """
-            showTextWindow(title: "如何用 USB 自动读取端口", content: msg)
+            showTextWindow(title: L.t("help.usb.title"), content: L.t("help.usb.body"))
         case "manual_connect":
-            let cmd = "adb connect <手机IP>:<端口>"
-            let msg = """
-            请先在手机上查看地址：
-              设置 → 开发者选项 → 无线调试 → 页面顶部显示 IP:端口
-
-            然后在终端里执行（菜单栏无法输入，复制下面命令改好再执行）：
-              \(cmd)
-
-            或者打开终端 TUI 完成（推荐，可点选）：
-              cd ~/mycode/adb-wifi-manager && ./adbwifi
-
-            提示：连接过一次后地址会被记住，之后掉线能自动重连。
-            """
+            let cmd = L.t("help.manual.cmd")
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(cmd, forType: .string)
-            showTextWindow(title: "手动连接（命令已复制到剪贴板）", content: msg)
+            showTextWindow(title: L.t("help.manual.title"),
+                           content: L.t("help.manual.body", cmd))
         case "phone_dev_settings", "phone_wireless":
             // 跳转策略统一收敛在 adb-wifi.sh 的 open 子命令里（多 ROM 自适应），
             // 菜单栏、TUI、命令行三处行为一致，避免各自实现导致体验不一。
             let page = action == "phone_wireless" ? "wireless" : "dev"
-            let r = runScript(["open", page], timeout: 60)
-            let out = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
-            if out.contains("✓") {
-                flash(title: L.t("flash.opened"), text: page == "wireless" ? L.t("phone.wireless") : L.t("phone.dev"))
-                showTextWindow(title: "已在手机上打开", content: out)
-            } else if out.contains("△") {
-                showTextWindow(title: "已打开开发者选项", content: out
-                    + "\n\n该 ROM 未能直接定位到「无线调试」页，请在列表中手动点击。")
-            } else {
-                showTextWindow(title: "打开设置失败",
-                               content: out.isEmpty ? "未获取到输出，请确认手机已连接。" : out)
-            }
+            let r = runScript(["open", page], timeout: 60, env: KV_ENV)
+            handleOpenResult(r.out, page: page, withFlash: false)
         default:
-            let msg = """
-            请打开终端 TUI 查看完整解决方案（支持点选操作）：
-              cd ~/mycode/adb-wifi-manager && ./adbwifi
-            """
-            showTextWindow(title: "需要进一步处理", content: msg)
+            showTextWindow(title: L.t("help.tui.title"), content: L.t("help.tui.body"))
+        }
+    }
+
+    /// 统一渲染 `open` 子命令的结果。
+    /// 脚本以 kv 模式返回 RESULT/PAGE/TITLE/WIFI_TOGGLE（见 adb-wifi.sh 文件头
+    /// 「输出协议」），界面文案完全由本地 i18n 渲染，不再解析脚本里的中文。
+    func handleOpenResult(_ out: String, page: String, withFlash: Bool) {
+        let kv = parseKV(out)
+        let result = kv["RESULT"] ?? "failed"
+        let toggle = kv["WIFI_TOGGLE"] ?? "unknown"
+        let label = page == "wireless" ? L.t("phone.wireless") : L.t("phone.dev")
+
+        switch result {
+        case "opened":
+            if withFlash { flash(title: L.t("flash.opened"), text: L.t("flash.checkPhone")) }
+            var body = L.t("phone.open.body", label)
+            if toggle == "off" { body += "\n\n" + L.t("phone.open.toggleOff") }
+            else if toggle == "unknown" { body += "\n\n" + L.t("phone.open.toggleUnknown") }
+            showTextWindow(title: L.t("phone.openTitle", label), content: body)
+        case "partial":
+            // 只能带到开发者选项页，无线调试要用户自己点
+            if withFlash { flash(title: L.t("flash.opened"), text: L.t("flash.manualWireless")) }
+            var body = L.t("phone.open.partial")
+            if toggle == "off" { body += "\n\n" + L.t("phone.open.toggleOff") }
+            showTextWindow(title: L.t("phone.open.partialTitle"), content: body)
+        case "need_usb", "no_device":
+            if withFlash { flash(title: L.t("flash.openFailed"), text: L.t("flash.connectFirst")) }
+            showTextWindow(title: L.t("phone.open.failedTitle"), content: L.t("phone.open.noDevice"))
+        default:
+            if withFlash { flash(title: L.t("flash.openFailed"), text: L.t("flash.connectFirst")) }
+            showTextWindow(title: L.t("phone.open.failedTitle"), content: L.t("phone.open.failedBody"))
         }
     }
 
@@ -654,22 +679,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !busy else { return }
         busy = true
         DispatchQueue.global().async {
-            let r = runScript(["recover"], timeout: 90)
-            let out = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
-            let ok = out.contains("✓")
+            let r = runScript(["recover"], timeout: 90, env: KV_ENV)
+            let kv = parseKV(r.out)
             DispatchQueue.main.async {
                 self.busy = false
-                if ok {
-                    // 成功：只闪一下，不弹窗打扰。取输出里带 ✓ 的那一行
-                    let line = out.components(separatedBy: "\n")
-                        .first(where: { $0.contains("✓") }) ?? "已恢复无线连接"
-                    let text = line.replacingOccurrences(of: "✓ ", with: "")
-                        .replacingOccurrences(of: "已恢复无线连接: ", with: "")
-                        .replacingOccurrences(of: "当前已有可用连接: ", with: "")
-                    self.flash(title: L.t("flash.recovered"), text: text)
-                } else {
-                    // 失败：弹窗给出可操作的排查提示
-                    self.showTextWindow(title: L.t("recover.failed.title"), content: out)
+                let ep = kv["ENDPOINT"] ?? ""
+                switch kv["RESULT"] ?? "" {
+                case "already":
+                    self.flash(title: L.t("flash.recovered"),
+                               text: ep.isEmpty ? L.t("recover.result.alreadyNoEp")
+                                                : L.t("recover.result.already", ep))
+                case "recovered":
+                    self.flash(title: L.t("flash.recovered"),
+                               text: ep.isEmpty ? L.t("recover.result.recoveredNoEp")
+                                                : L.t("recover.result.recovered", ep))
+                default:
+                    // 失败：原因由脚本枚举（ERROR=no_usb|tcpip_failed），文案本地渲染
+                    let body = kv["ERROR"] == "tcpip_failed"
+                        ? L.t("recover.failed.tcpip")
+                        : L.t("recover.failed.body")
+                    self.showTextWindow(title: L.t("recover.failed.title"), content: body)
                 }
                 self.refresh()
             }
@@ -683,16 +712,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let serial = status.allDevices.first(where: { !$0.0.contains(":") })?.0,
               !serial.isEmpty else {
             showTextWindow(title: L.t("usb.none.title"),
-                           content: "请先用 USB 线连接手机并允许 USB 调试，\n再点击此菜单项。")
+                           content: L.t("usb.none.body"))
             return
         }
         let port = status.tcpipPort.isEmpty ? "5555" : status.tcpipPort
         busy = true
         DispatchQueue.global().async {
-            let out = self.shell("/usr/bin/env", ["adb", "-s", serial, "tcpip", port])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            var msg = out
-            var ok = out.contains("restarting in TCP mode")
+            // 用退出码判定 adb tcpip 是否成功，不匹配 adb 的英文提示
+            let tcpip = self.shellCode("/usr/bin/env",
+                                       ["adb", "-s", serial, "tcpip", port])
+            var msg = tcpip.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            var ok = tcpip.code == 0
             if ok {
                 // 等 adbd 重启后取手机 IP 并连接
                 var ip = self.shell("/usr/bin/env", ["adb", "-s", serial, "shell",
@@ -710,7 +740,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     msg = c
                     ok = c.contains("connected")
                 } else {
-                    msg = "已切换 TCP 模式，但未取到手机 Wi-Fi IP"
+                    msg = L.t("err.noWifiIP")
                     ok = false
                 }
             }
@@ -734,22 +764,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func jumpToPhoneSettings(page: String) {
-        let label = page == "wireless" ? L.t("phone.wireless") : L.t("phone.dev")
         busy = true
         DispatchQueue.global().async {
-            let r = runScript(["open", page], timeout: 60)
-            let out = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            let r = runScript(["open", page], timeout: 60, env: KV_ENV)
             DispatchQueue.main.async {
                 self.busy = false
-                if out.contains("✓") {
-                    self.flash(title: L.t("flash.opened"), text: L.t("flash.checkPhone"))
-                } else if out.contains("△") {
-                    self.flash(title: L.t("flash.opened"), text: L.t("flash.manualWireless"))
-                } else {
-                    self.flash(title: L.t("flash.openFailed"), text: out.isEmpty ? L.t("flash.connectFirst") : out)
-                }
-                self.showTextWindow(title: L.t("phone.openTitle", label),
-                                    content: out.isEmpty ? "未获取到输出。" : out)
+                self.handleOpenResult(r.out, page: page, withFlash: true)
                 self.refresh()
             }
         }
@@ -757,6 +777,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @discardableResult
     func shell(_ path: String, _ args: [String]) -> String {
+        shellCode(path, args).out
+    }
+
+    /// 与 shell 相同，但同时返回退出码（用于不依赖英文输出文案的判定）
+    func shellCode(_ path: String, _ args: [String]) -> (code: Int32, out: String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = args
@@ -767,10 +792,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
-        do { try p.run() } catch { return "" }
+        do { try p.run() } catch { return (-1, "") }
         let d = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        return String(data: d, encoding: .utf8) ?? ""
+        return (p.terminationStatus, String(data: d, encoding: .utf8) ?? "")
     }
 
     @objc func openDevices() {
@@ -784,7 +809,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func showLog() {
         let p = logPath()
-        let content = (try? String(contentsOfFile: p, encoding: .utf8)) ?? "（暂无日志）"
+        let content = (try? String(contentsOfFile: p, encoding: .utf8)) ?? L.t("log.empty")
         showTextWindow(title: L.t("log.title"), content: String(content.suffix(50_000)))
     }
 
@@ -1129,7 +1154,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         self.updateLabel?.stringValue = L.t("about.status.noVersion")
                     } else {
                         self.alphaState = .failed
-                        self.alphaError = "未获取到版本号"
+                        self.alphaError = L.t("about.alpha.errNoVersion")
                         self.refreshAlphaLink()
                     }
 
@@ -1188,7 +1213,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func refreshAlphaLink() {
         let text: String
         var enabled = true
-        var tip = "检查 Alpha 预发布版本"
+        var tip = L.t("about.alpha.tip")
         switch alphaState {
         case .idle:
             text = L.t("about.alpha.idle")
@@ -1245,14 +1270,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                         "--max-time", "300", "-o", zip, zipURL])
             let attrs = try? FileManager.default.attributesOfItem(atPath: zip)
             let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
-            if size == 0 { failure = "下载失败，请检查网络后重试" }
+            if size == 0 { failure = L.t("update.err.download") }
 
             if failure == nil {
                 self.shell("/usr/bin/ditto", ["-x", "-k", zip, unpack])
             }
             let newApp = unpack + "/AdbWifiBar.app"
             if failure == nil && !FileManager.default.fileExists(atPath: newApp) {
-                failure = "安装包内容异常"
+                failure = L.t("update.err.package")
             }
 
             // 校验 Apple 签名与公证票据，避免安装被篡改的包
@@ -1260,7 +1285,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let verify = self.shell("/usr/sbin/spctl", ["-a", "-t", "exec", newApp])
                 if !verify.contains("accepted") {
                     let detail = verify.trimmingCharacters(in: .whitespacesAndNewlines)
-                    failure = "签名校验失败：\(detail.isEmpty ? "未知原因" : detail)"
+                    failure = L.t("update.err.signature",
+                                  detail.isEmpty ? L.t("update.err.unknown") : detail)
                 }
             }
 
@@ -1402,13 +1428,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     static func notFoundError() -> NSError {
         NSError(domain: "AdbWifiBar", code: 404, userInfo: [
-            NSLocalizedDescriptionKey: "仓库暂未发布任何版本，可打开版本发布页手动查看。"])
+            NSLocalizedDescriptionKey: L.t("err.noRelease")])
     }
 
     func fetchJSON(_ urlStr: String, _ completion: @escaping (Result<Any, Error>) -> Void) {
         guard let url = URL(string: urlStr) else {
             completion(.failure(NSError(domain: "AdbWifiBar", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "无效的地址"])))
+                userInfo: [NSLocalizedDescriptionKey: L.t("err.badURL")])))
             return
         }
         var req = URLRequest(url: url, timeoutInterval: 15)
@@ -1418,12 +1444,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let err = err { completion(.failure(err)); return }
             guard let http = resp as? HTTPURLResponse else {
                 completion(.failure(NSError(domain: "AdbWifiBar", code: -2,
-                    userInfo: [NSLocalizedDescriptionKey: "未收到服务器响应"])))
+                    userInfo: [NSLocalizedDescriptionKey: L.t("err.noResponse")])))
                 return
             }
             guard (200..<300).contains(http.statusCode), let data = data else {
                 completion(.failure(NSError(domain: "AdbWifiBar", code: http.statusCode,
-                    userInfo: [NSLocalizedDescriptionKey: "GitHub 返回 HTTP \(http.statusCode)"])))
+                    userInfo: [NSLocalizedDescriptionKey: L.t("err.http", http.statusCode)])))
                 return
             }
             do {
