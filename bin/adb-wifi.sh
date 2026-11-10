@@ -615,6 +615,9 @@ main_loop() {
     start_device_tracker
 
     while true; do
+        # 0) 链路质量缓存（RTT/链路速率/信号/电量），过期则由后台异步刷新
+        netinfo_maybe_refresh
+
         # 1) Wi-Fi 网段变化 → 重启 adb，清空失效端点
         prefix=$(lan_prefix)
         if [ -n "$prefix" ] && [ -n "$last_prefix" ] && [ "$prefix" != "$last_prefix" ]; then
@@ -1067,6 +1070,40 @@ cmd_recover() {
 # 速率需要两次采样求差，因此用一个状态文件保存上次的值与时间。
 
 RATE_FILE="$STATE_DIR/rate_state"     # 格式: 时间戳 发送字节 接收字节
+RATE_HIST_FILE="$STATE_DIR/rate_history"  # 格式: 时间戳 下行KB/s 上行KB/s（滑动窗口）
+RATE_HIST_KEEP="${RATE_HIST_KEEP:-600}"   # 历史保留时长（秒），用于算平均/峰值
+
+# 把本次瞬时速率记入历史，供“传输时的平均/峰值”统计使用。
+# 只保留最近 RATE_HIST_KEEP 秒，文件行数恒定，不会无限增长。
+rate_hist_append() {
+    local down="$1" up="$2" now
+    now=$(date +%s)
+    printf '%s %s %s\n' "$now" "${down:-0}" "${up:-0}" >> "$RATE_HIST_FILE" 2>/dev/null || return 0
+    awk -v cut=$((now - RATE_HIST_KEEP)) '$1 >= cut' "$RATE_HIST_FILE" \
+        > "$RATE_HIST_FILE.tmp" 2>/dev/null \
+        && mv -f "$RATE_HIST_FILE.tmp" "$RATE_HIST_FILE" 2>/dev/null
+    return 0
+}
+
+# 计算“有传输时”的平均与峰值速率（Mbps）。
+# 跳过 0 采样，避免空闲时段把均值拉低；单位换成 Mbps 方便与链路速率对比。
+net_rate_stats() {
+    [ -f "$RATE_HIST_FILE" ] || { echo "0 0"; return 0; }
+    local now from
+    now=$(date +%s)
+    from=$((now - RATE_HIST_KEEP))
+    awk -v from="$from" '
+        $1 >= from {
+            v = ($2 + 0) + ($3 + 0)
+            if (v <= 0) next
+            n++; sum += v
+            if (v > max) max = v
+        }
+        END {
+            if (n > 0) printf "%.1f %.1f\n", sum / n * 8 / 1024, max * 8 / 1024
+            else       print "0 0"
+        }' "$RATE_HIST_FILE"
+}
 
 # 取当前 adb 连接的累计字节数，输出 "下行 上行"（Mac 视角：手机→Mac 为下行）
 # 同一设备可能有多个 TCP 连接（控制连接 + 数据连接），全部累加。
@@ -1127,10 +1164,15 @@ sample_rate() {
         awk -v d="$down" -v u="$up" 'BEGIN{printf "0 0 %.2f %.2f\n", d/1048576, u/1048576}'
         return 0
     fi
-    awk -v dd="$d_down" -v du="$d_up" -v ms="$dt_ms" -v d="$down" -v u="$up" 'BEGIN {
+    local out
+    out=$(awk -v dd="$d_down" -v du="$d_up" -v ms="$dt_ms" -v d="$down" -v u="$up" 'BEGIN {
         sec = ms / 1000.0
         printf "%.1f %.1f %.2f %.2f\n", dd/sec/1024, du/sec/1024, d/1048576, u/1048576
-    }'
+    }')
+    # 记录瞬时速率，供 netinfo 算“传输中的平均/峰值”
+    rate_hist_append "$(printf '%s' "$out" | awk '{print $1}')" \
+                     "$(printf '%s' "$out" | awk '{print $2}')"
+    printf '%s\n' "$out"
 }
 
 # 把 KB/s 格式化成易读形式
@@ -1140,6 +1182,197 @@ fmt_rate() {
         else if (v < 1024)  printf "%.0f KB/s", v
         else                printf "%.2f MB/s", v/1024
     }'
+}
+
+# ------------------------------------------------- 链路质量指标
+# 解释“为什么无线会慢”的几项关键数据：RTT、链路速率、AP、频率、信号强度、电量。
+#
+# 哪些项慢（实测）：dumpsys wifi ~0.3s、system_profiler ~1s、ping ~1.5s。
+# 而 diag 每 2 秒被菜单栏调一次，绝不能在 diag 里实时采。
+# 因此统一走缓存：后台刷新（守护循环 / App 主动触发），diag 只读文件。
+NETINFO_CACHE="$STATE_DIR/netinfo.cache"
+NETINFO_TTL="${NETINFO_TTL:-60}"
+
+# 频率 → 信道号（仅覆盖常见 2.4G / 5G）
+net_freq_to_channel() {
+    local f="${1:-0}"
+    case "$f" in
+        ''|*[!0-9]*) echo "" ;;
+        *) if [ "$f" -ge 2400 ] && [ "$f" -le 2500 ]; then
+               echo $(( (f - 2407) / 5 ))
+           elif [ "$f" -ge 4900 ]; then
+               echo $(( (f - 5000) / 5 ))
+           else
+               echo ""
+           fi ;;
+    esac
+}
+
+# Mac 电量（仅笔记本有电池；台式机 / 无电池时直接跳过）
+net_mac_battery() {
+    local raw pct mode
+    raw=$(pmset -g batt 2>/dev/null)
+    case "$raw" in
+        *InternalBattery*) ;;
+        *) return 0 ;;
+    esac
+    pct=$(printf '%s' "$raw" | grep -o '[0-9][0-9]*%' | head -1 | tr -d '%')
+    # 注意：discharging 包含 charging 子串，必须先判断
+    case "$raw" in
+        *discharging*) mode=discharging ;;
+        *charging*)    mode=charging ;;
+        *charged*)     mode=charged ;;
+        *)             mode=ac ;;
+    esac
+    echo "NET_MAC_BATTERY=$pct"
+    echo "NET_MAC_POWER=$mode"
+}
+
+# 采集单台设备的链路与电量指标（一次 shell 调用拿齐，避免高 RTT 下多次往返）
+net_dev_collect() {
+    local serial="$1" idx="$2" raw wifi_line model batt
+    local ssid bssid freq link rssi ch dev_ip rtt_line rtt_min rtt_avg rtt_max
+    local transport=usb level status charging=0
+
+    case "$serial" in *:*) transport=wifi ;; esac
+
+    raw=$(adbw -s "$serial" shell "
+        dumpsys wifi | grep -m1 'SSID:'
+        echo '@@MODEL@@'
+        getprop ro.product.model
+        echo '@@BATT@@'
+        dumpsys battery | grep -E 'level:|status:'
+    " 2>/dev/null | tr -d '\r')
+
+    wifi_line=$(printf '%s\n' "$raw" | awk '/@@MODEL@@/{exit} {print}' | head -1)
+    model=$(printf '%s\n' "$raw" | awk '/@@MODEL@@/{f=1;next} /@@BATT@@/{exit} f' | head -1)
+    batt=$(printf '%s\n' "$raw" | awk '/@@BATT@@/{f=1;next} f')
+
+    ssid=$(printf '%s' "$wifi_line" | sed -n 's/.*SSID: "\([^"]*\)".*/\1/p')
+    bssid=$(printf '%s' "$wifi_line" | sed -n 's/.*BSSID: \([0-9a-f:]*\).*/\1/p')
+    freq=$(printf '%s' "$wifi_line" | sed -n 's/.*Frequency: \([0-9]*\)MHz.*/\1/p')
+    link=$(printf '%s' "$wifi_line" | sed -n 's/.*Link speed: \([0-9]*\)Mbps.*/\1/p')
+    rssi=$(printf '%s' "$wifi_line" | sed -n 's/.*RSSI: \(-\{0,1\}[0-9]*\).*/\1/p')
+    ch=$(net_freq_to_channel "$freq")
+
+    level=$(printf '%s' "$batt" | sed -n 's/.*level: \([0-9]*\).*/\1/p' | head -1)
+    status=$(printf '%s' "$batt" | sed -n 's/.*status: \([0-9]*\).*/\1/p' | head -1)
+    case "$status" in 2|5) charging=1 ;; esac
+
+    # RTT 只对无线设备有意义（USB 走本地总线，不存在网络往返）
+    if [ "$transport" = "wifi" ]; then
+        dev_ip="${serial%%:*}"
+        rtt_line=$(ping -c 3 -i 0.2 -q "$dev_ip" 2>/dev/null | tail -1)
+        rtt_min=$(printf '%s' "$rtt_line" | sed -n 's/.*= \([0-9.]*\)\/.*/\1/p')
+        rtt_avg=$(printf '%s' "$rtt_line" | sed -n 's/.*= [0-9.]*\/\([0-9.]*\)\/.*/\1/p')
+        rtt_max=$(printf '%s' "$rtt_line" | sed -n 's/.*\/\([0-9.]*\)\/[0-9.]* ms/\1/p')
+    fi
+
+    echo "NET_DEV_${idx}_SERIAL=$serial"
+    echo "NET_DEV_${idx}_TRANSPORT=$transport"
+    echo "NET_DEV_${idx}_MODEL=$model"
+    echo "NET_DEV_${idx}_SSID=$ssid"
+    echo "NET_DEV_${idx}_BSSID=$bssid"
+    echo "NET_DEV_${idx}_FREQ=$freq"
+    echo "NET_DEV_${idx}_CHANNEL=$ch"
+    echo "NET_DEV_${idx}_LINK=$link"
+    echo "NET_DEV_${idx}_RSSI=$rssi"
+    echo "NET_DEV_${idx}_RTT_MIN=$rtt_min"
+    echo "NET_DEV_${idx}_RTT_AVG=$rtt_avg"
+    echo "NET_DEV_${idx}_RTT_MAX=$rtt_max"
+    echo "NET_DEV_${idx}_BATTERY=$level"
+    echo "NET_DEV_${idx}_CHARGING=$charging"
+}
+
+# Mac 侧 Wi-Fi 链路单独缓存。
+# system_profiler 一次约 1s CPU（比 dumpsys / ping 都贵），但 Mac 的信道、协商速率
+# 极少变化，没必要跟着设备侧 60 秒刷。改 300 秒一次，平时直接读缓存。
+NETINFO_MAC_CACHE="$STATE_DIR/netinfo_mac.cache"
+NETINFO_MAC_TTL="${NETINFO_MAC_TTL:-300}"
+
+net_mac_link_collect() {
+    local age=999999 mtime sp mac_ch mac_rate mac_rssi
+    if [ -f "$NETINFO_MAC_CACHE" ]; then
+        mtime=$(stat -f %m "$NETINFO_MAC_CACHE" 2>/dev/null || echo 0)
+        age=$(( $(date +%s) - mtime ))
+    fi
+    if [ "$age" -ge "$NETINFO_MAC_TTL" ]; then
+        sp=$(system_profiler SPAirPortDataType 2>/dev/null \
+            | sed -n '/Current Network Information/,/Other Local Wi-Fi Networks/p')
+        mac_ch=$(printf '%s' "$sp" | sed -n 's/.*Channel: \([0-9]*\).*/\1/p' | head -1)
+        mac_rate=$(printf '%s' "$sp" | sed -n 's/.*Transmit Rate: \([0-9]*\).*/\1/p' | head -1)
+        mac_rssi=$(printf '%s' "$sp" | sed -n 's/.*Signal \/ Noise: \(-\{0,1\}[0-9]*\).*/\1/p' | head -1)
+        if [ -n "$mac_rate" ] || [ -n "$mac_ch" ]; then
+            {
+                echo "NET_MAC_CHANNEL=$mac_ch"
+                echo "NET_MAC_RATE=$mac_rate"
+                echo "NET_MAC_RSSI=$mac_rssi"
+            } > "$NETINFO_MAC_CACHE.tmp.$$" 2>/dev/null \
+                && mv -f "$NETINFO_MAC_CACHE.tmp.$$" "$NETINFO_MAC_CACHE" 2>/dev/null
+        fi
+    fi
+    [ -f "$NETINFO_MAC_CACHE" ] && cat "$NETINFO_MAC_CACHE"
+    return 0
+}
+
+# 采集一次完整链路指标（慢，只在缓存过期时调用）
+# 多设备：每台一份 NET_DEV_<n>_*；Mac 侧（信道/速率/信号/电量）全局一份。
+net_info_collect() {
+    local idx=0 serial
+
+    for serial in $(all_serial); do
+        idx=$((idx + 1))
+        net_dev_collect "$serial" "$idx"
+    done
+    echo "NET_DEV_COUNT=$idx"
+
+    # ---- Mac 侧 Wi-Fi 链路（独立 300 秒缓存，平时不跑 system_profiler）----
+    net_mac_link_collect
+
+    net_mac_battery
+
+    # 速率对比：传输时的平均值 / 峰值（全设备共用 adb 通道）
+    local stats
+    stats=$(net_rate_stats)
+    echo "NET_RATE_AVG_MBPS=$(printf '%s' "$stats" | awk '{print $1}')"
+    echo "NET_RATE_MAX_MBPS=$(printf '%s' "$stats" | awk '{print $2}')"
+    echo "NET_AT=$(date +%s)"
+}
+
+# 缓存过期就再起一个后台采集，不阻塞调用方（diag / 菜单 / 守护循环）。
+#
+# 必须加锁：采集要 2~4 秒，期间缓存仍是旧的（或不存在），
+# 而 diag 每 2 秒就被调一次 —— 不加锁会派生 N 个并发采集
+# （实测 6 次调用起了 6 个 system_profiler + dumpsys + ping）。
+# 用 mkdir 做原子锁，不能用「先判断再创建」的文件锁。
+NETINFO_LOCK="$STATE_DIR/netinfo.lock"
+
+netinfo_maybe_refresh() {
+    local age=999999 mtime
+    if [ -f "$NETINFO_CACHE" ]; then
+        mtime=$(stat -f %m "$NETINFO_CACHE" 2>/dev/null || echo 0)
+        age=$(( $(date +%s) - mtime ))
+    fi
+    [ "$age" -lt "$NETINFO_TTL" ] && return 0
+
+    # 抢锁：mkdir 是原子的，成功者才去采集
+    if ! mkdir "$NETINFO_LOCK" 2>/dev/null; then
+        # 陈旧锁（进程被 kill -9 / 异常退出残留）：超过 2×TTL 强制接管
+        local lmt lage
+        lmt=$(stat -f %m "$NETINFO_LOCK" 2>/dev/null || echo 0)
+        lage=$(( $(date +%s) - lmt ))
+        [ "$lage" -lt $(( NETINFO_TTL * 2 )) ] && return 0
+        rm -rf "$NETINFO_LOCK" 2>/dev/null
+        mkdir "$NETINFO_LOCK" 2>/dev/null || return 0
+    fi
+
+    (
+        trap 'rm -rf "$NETINFO_LOCK" 2>/dev/null' EXIT INT TERM
+        net_info_collect > "$NETINFO_CACHE.tmp.$$" 2>/dev/null \
+            && mv "$NETINFO_CACHE.tmp.$$" "$NETINFO_CACHE" \
+            || rm -f "$NETINFO_CACHE.tmp.$$"
+    ) >/dev/null 2>&1 &
+    return 0
 }
 
 # 采样时长必须 >=1s，netstat 计数按秒级有意义，太短会剧烈抖动
@@ -1320,6 +1553,11 @@ cmd_diag() {
     echo "RATE_UP_HUMAN=$(fmt_rate "${_ul:-0}")"
 
     echo "EVENT_SEQ=$(wc -l < "$STATE_DIR/events.log" 2>/dev/null | tr -d ' ' || echo 0)"
+
+    # ---- 链路质量指标（读缓存，不实时采样；缓存过期则后台刷新）----
+    netinfo_maybe_refresh
+    [ -f "$NETINFO_CACHE" ] && cat "$NETINFO_CACHE"
+
     echo "DIAG_LEVEL=$level"
     echo "DIAG_CODE=$code"
     echo "DIAG_TITLE=$title"
@@ -1347,6 +1585,7 @@ case "${1:-}" in
     log)     tail -f "$LOG_FILE" ;;
     once)    cmd_once ;;
     diag)    cmd_diag ;;
+    netinfo) net_info_collect ;;
     open)    cmd_open "${2:-wireless}" ;;
     recover) cmd_recover ;;
     rate)    cmd_rate "${2:-1}" ;;

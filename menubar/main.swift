@@ -133,6 +133,16 @@ func runScript(_ args: [String], timeout: TimeInterval = 20,
 
 // MARK: - 状态
 
+/// 单台设备的链路质量指标（由 `netinfo` 采集，见 bin/adb-wifi.sh）
+struct DevLink {
+    var serial = "", transport = "", model = ""
+    var ssid = "", bssid = "", freq = "", channel = ""
+    var linkMbps = "", rssi = ""
+    var rttMin = "", rttAvg = "", rttMax = ""
+    var battery = "", charging = ""
+    var isWifi: Bool { transport == "wifi" }
+}
+
 struct Status {
     var running = false
     var pid = ""
@@ -151,9 +161,21 @@ struct Status {
     var autoTcpip = false
     // 传输速率（Mac 视角：手机→Mac 为下行）
     var rateDownHuman = ""
+    var rateDownKB = ""
     var rateUpHuman = ""
     var rateTotalDown = ""
     var rateTotalUp = ""
+
+    // ---- 链路质量（多设备：每台一份；Mac 侧全局一份）----
+    var devLinks: [DevLink] = []
+    var macChannel = ""
+    var macRate = ""
+    var macRSSI = ""
+    var macBattery = ""
+    var macPower = ""
+    // 传输时的平均值 / 峰值（Mbps，与链路速率对比用）
+    var rateAvgMbps = ""
+    var rateMaxMbps = ""
     // 结构化诊断结论（由脚本层统一给出，与 TUI 完全同源）
     var diagLevel = ""
     var diagCode = ""
@@ -184,6 +206,15 @@ func updateLog(_ s: String) {
     } else {
         try? line.write(toFile: path, atomically: true, encoding: .utf8)
     }
+}
+
+/// 把链路速率（Mbps）换算成字节基准（MB/s）并按大小选精度。
+/// 用户对「MB/s」更直观，也更方便与菜单里已有的 ↓↑ 传输速率直接对比。
+func linkRateText(_ mbps: Double) -> String {
+    let mbs = mbps / 8
+    if mbs >= 10 { return String(format: "%.0f", mbs) }
+    if mbs >= 1  { return String(format: "%.1f", mbs) }
+    return String(format: "%.2f", mbs)
 }
 
 /// 解析脚本的 KEY=VALUE 输出（`diag` 的原生格式，以及 `ADBWIFI_FORMAT=kv` 的结果协议）。
@@ -224,9 +255,40 @@ func loadStatus() -> Status {
     s.tcpipListen = (kv["TCPIP_LISTEN"] ?? "0") == "1"
     s.autoTcpip = (kv["AUTO_TCPIP"] ?? "0") == "1"
     s.rateDownHuman = kv["RATE_DOWN_HUMAN"] ?? ""
+    s.rateDownKB = kv["RATE_DOWN_KB"] ?? ""
     s.rateUpHuman = kv["RATE_UP_HUMAN"] ?? ""
     s.rateTotalDown = kv["RATE_TOTAL_DOWN_MB"] ?? ""
     s.rateTotalUp = kv["RATE_TOTAL_UP_MB"] ?? ""
+
+    s.macChannel = kv["NET_MAC_CHANNEL"] ?? ""
+    s.macRate = kv["NET_MAC_RATE"] ?? ""
+    s.macRSSI = kv["NET_MAC_RSSI"] ?? ""
+    s.macBattery = kv["NET_MAC_BATTERY"] ?? ""
+    s.macPower = kv["NET_MAC_POWER"] ?? ""
+    s.rateAvgMbps = kv["NET_RATE_AVG_MBPS"] ?? ""
+    s.rateMaxMbps = kv["NET_RATE_MAX_MBPS"] ?? ""
+
+    let devCount = Int(kv["NET_DEV_COUNT"] ?? "0") ?? 0
+    if devCount > 0 {
+        for i in 1...devCount {
+            var d = DevLink()
+            d.serial = kv["NET_DEV_\(i)_SERIAL"] ?? ""
+            d.transport = kv["NET_DEV_\(i)_TRANSPORT"] ?? ""
+            d.model = kv["NET_DEV_\(i)_MODEL"] ?? ""
+            d.ssid = kv["NET_DEV_\(i)_SSID"] ?? ""
+            d.bssid = kv["NET_DEV_\(i)_BSSID"] ?? ""
+            d.freq = kv["NET_DEV_\(i)_FREQ"] ?? ""
+            d.channel = kv["NET_DEV_\(i)_CHANNEL"] ?? ""
+            d.linkMbps = kv["NET_DEV_\(i)_LINK"] ?? ""
+            d.rssi = kv["NET_DEV_\(i)_RSSI"] ?? ""
+            d.rttMin = kv["NET_DEV_\(i)_RTT_MIN"] ?? ""
+            d.rttAvg = kv["NET_DEV_\(i)_RTT_AVG"] ?? ""
+            d.rttMax = kv["NET_DEV_\(i)_RTT_MAX"] ?? ""
+            d.battery = kv["NET_DEV_\(i)_BATTERY"] ?? ""
+            d.charging = kv["NET_DEV_\(i)_CHARGING"] ?? ""
+            if !d.serial.isEmpty { s.devLinks.append(d) }
+        }
+    }
     s.diagLevel = kv["DIAG_LEVEL"] ?? ""
     s.diagCode = kv["DIAG_CODE"] ?? ""
     s.diagTitle = kv["DIAG_TITLE"] ?? ""
@@ -375,6 +437,116 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return it
     }
 
+    /// 链路质量指标：每台设备一份（RTT / 信号 / 链路速率 / AP / 频率 / 电量），
+    /// Max 侧（信道 / 速率 / 信号 / 电量）全局一份。
+    /// 收到子菜单里，避免多设备时把主菜单撑爆。
+    /// 每一项都带“正常区间”提示，tooltip 解释其与传输速度的关系。
+    func addLinkQualityItems(to menu: NSMenu, s: Status) {
+        guard !s.devLinks.isEmpty || !s.macRate.isEmpty else { return }
+
+        menu.addItem(.separator())
+        let header = NSMenuItem(title: L.t("net.menu"), action: nil, keyEquivalent: "")
+        header.image = NSImage(systemSymbolName: "wifi", accessibilityDescription: nil)
+        let sub = NSMenu()
+
+        // 全局实测吞吐（adb server 侧统计，多设备共用）
+        if !s.rateDownHuman.isEmpty {
+            sub.addItem(disabledItem(
+                L.t("net.actual.line", s.rateDownHuman, s.rateUpHuman),
+                tooltip: L.t("net.actual.tip")))
+            sub.addItem(.separator())
+        }
+
+        for (idx, d) in s.devLinks.enumerated() {
+            if idx > 0 { sub.addItem(.separator()) }
+
+            // 设备标题：地址 · 机型（USB 设备加标注）
+            let name = d.model.isEmpty ? d.serial : "\(d.serial) · \(d.model)"
+            sub.addItem(disabledItem(L.t("net.dev.header", name),
+                                     tooltip: d.isWifi ? nil : L.t("net.dev.usb")))
+
+            if d.isWifi {
+                if let rtt = Double(d.rttAvg) {
+                    let grade = rtt < 20 ? L.t("net.rtt.good")
+                        : (rtt < 50 ? L.t("net.rtt.fair") : L.t("net.rtt.poor"))
+                    var tip = L.t("net.rtt.tip")
+                    if !d.rttMin.isEmpty && !d.rttMax.isEmpty {
+                        tip += "\n" + L.t("net.rtt.range", d.rttMin, d.rttMax)
+                    }
+                    sub.addItem(disabledItem(
+                        "    " + L.t("net.rtt.line", String(format: "%.0f", rtt), grade),
+                        tooltip: tip))
+                }
+                if let rssi = Double(d.rssi) {
+                    let grade = rssi > -60 ? L.t("net.signal.strong")
+                        : (rssi > -70 ? L.t("net.signal.ok") : L.t("net.signal.weak"))
+                    var tip = L.t("net.signal.tip")
+                    if !s.macRSSI.isEmpty { tip += "\n" + L.t("net.signal.mac", s.macRSSI) }
+                    sub.addItem(disabledItem(
+                        "    " + L.t("net.signal.line", d.rssi, grade),
+                        tooltip: tip))
+                }
+                if let link = Double(d.linkMbps) {
+                    sub.addItem(disabledItem(
+                        "    " + L.t("net.link.simple", linkRateText(link)),
+                        tooltip: L.t("net.link.tip")))
+                    // 平均 / 峰值 / 理论极限 三者对比（统一字节基准，一眼看出差多少）
+                    let avg = (s.rateAvgMbps.isEmpty || s.rateAvgMbps == "0.0")
+                        ? "-" : linkRateText(Double(s.rateAvgMbps) ?? 0)
+                    let peak = (s.rateMaxMbps.isEmpty || s.rateMaxMbps == "0.0")
+                        ? "-" : linkRateText(Double(s.rateMaxMbps) ?? 0)
+                    sub.addItem(disabledItem(
+                        "    " + L.t("net.compare.line", avg, peak,
+                                    linkRateText(link * 0.6)),
+                        tooltip: L.t("net.compare.tip")))
+                }
+                if !d.ssid.isEmpty {
+                    let ch = d.channel.isEmpty ? "-" : d.channel
+                    let freq = d.freq.isEmpty ? "-" : d.freq
+                    sub.addItem(disabledItem(
+                        "    " + L.t("net.ap.line", d.ssid, ch, freq),
+                        tooltip: L.t("net.ap.tip",
+                                     d.bssid.isEmpty ? "-" : d.bssid,
+                                     s.macChannel.isEmpty ? "-" : s.macChannel)))
+                }
+            } else {
+                sub.addItem(disabledItem("    " + L.t("net.dev.usb")))
+            }
+
+            if !d.battery.isEmpty {
+                let text = d.charging == "1"
+                    ? L.t("net.battery.line", d.battery, L.t("net.battery.charging"))
+                    : L.t("net.battery.lineNoCharge", d.battery)
+                sub.addItem(disabledItem("    " + text, tooltip: L.t("net.battery.tip")))
+            }
+        }
+
+        // ---- Mac 侧（全局）----
+        if !s.macRate.isEmpty || !s.macBattery.isEmpty {
+            sub.addItem(.separator())
+            if !s.macRate.isEmpty {
+                sub.addItem(disabledItem(
+                    L.t("net.mac.link", linkRateText(Double(s.macRate) ?? 0),
+                        s.macRSSI.isEmpty ? "-" : s.macRSSI,
+                        s.macChannel.isEmpty ? "-" : s.macChannel),
+                    tooltip: L.t("net.mac.link.tip")))
+            }
+            if !s.macBattery.isEmpty {
+                let mode: String
+                switch s.macPower {
+                case "charging":    mode = L.t("net.macbattery.charging")
+                case "charged":     mode = L.t("net.macbattery.charged")
+                case "ac":          mode = L.t("net.macbattery.ac")
+                default:            mode = L.t("net.macbattery.discharging")
+                }
+                sub.addItem(disabledItem(L.t("net.macbattery.line", s.macBattery, mode)))
+            }
+        }
+
+        header.submenu = sub
+        menu.addItem(header)
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         // 每次展开菜单都实时重新采集，保证与 TUI 展示一致
         _ = menu
@@ -470,6 +642,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
+        // ---- 链路质量（解释“为什么无线会慢”，数据来自 netinfo 缓存）----
+        addLinkQualityItems(to: menu, s: s)
+
         menu.addItem(.separator())
 
         let toggle = NSMenuItem(
@@ -522,6 +697,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let log = NSMenuItem(title: L.t("menu.viewLog"), action: #selector(showLog), keyEquivalent: "l")
         log.target = self
         menu.addItem(log)
+
+        // 一键打开终端 TUI：图形界面里看不完的诊断/修复操作在那里
+        let tui = NSMenuItem(title: L.t("menu.openTUI"),
+                             action: #selector(openTUI), keyEquivalent: "u")
+        tui.target = self
+        tui.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: nil)
+        tui.toolTip = L.t("menu.openTUI.tip")
+        menu.addItem(tui)
 
         menu.addItem(.separator())
 
@@ -818,6 +1001,49 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openDevices() {
         let out = shell("/usr/bin/env", ["adb", "devices", "-l"])
         showTextWindow(title: "adb devices -l", content: out)
+    }
+
+    // MARK: - 打开终端 TUI
+
+    /// 一键在终端里打开 TUI（交互式诊断/修复界面）。
+    ///
+    /// 做法：写一个 `.command` 文件再交给系统打开。
+    /// 为什么不直接写 AppleScript / osascript：
+    ///   1. 控制 Terminal/iTerm 需要「自动化」TCC 授权，正式签名版还要额外 entitlement；
+    ///   2. 各终端（iTerm2）的 AppleScript 方言不一致，容易在别人机器上失败。
+    /// `open` 一个 .command 会交给用户当前的默认终端执行，零权限、跨终端都可用。
+    @objc func openTUI() {
+        let binDir = (SCRIPT as NSString).deletingLastPathComponent
+        let rootDir = (binDir as NSString).deletingLastPathComponent
+        let entry = rootDir + "/adbwifi"
+        guard FileManager.default.fileExists(atPath: entry) else {
+            showTextWindow(title: L.t("tui.missing.title"),
+                           content: L.t("tui.missing.body", entry))
+            return
+        }
+
+        let dir = NSHomeDirectory() + "/Library/Application Support/adb-wifi-manager"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = dir + "/open-tui.command"
+        let body = """
+        #!/bin/bash
+        # 由菜单栏「打开终端 TUI」自动生成，每次覆盖
+        cd \(shellQuote(rootDir)) && ./adbwifi
+        """
+        do {
+            try body.write(toFile: path, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+        } catch {
+            showTextWindow(title: L.t("tui.missing.title"),
+                           content: L.t("tui.missing.body", path))
+            return
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    }
+
+    /// 单引号包裹（路径含空格时也安全）
+    func shellQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     func logPath() -> String {

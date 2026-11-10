@@ -125,6 +125,51 @@ class State:
         return (d, u)
 
     @property
+    def dev_links(self):
+        """每台设备的链路质量指标（netinfo 采集，缓存 60 秒）"""
+        try:
+            n = int(self.raw.get("NET_DEV_COUNT", "0") or 0)
+        except ValueError:
+            return []
+        out = []
+        for i in range(1, n + 1):
+            p = "NET_DEV_%d_" % i
+            d = {
+                "serial": self.raw.get(p + "SERIAL", ""),
+                "transport": self.raw.get(p + "TRANSPORT", ""),
+                "model": self.raw.get(p + "MODEL", ""),
+                "ssid": self.raw.get(p + "SSID", ""),
+                "bssid": self.raw.get(p + "BSSID", ""),
+                "freq": self.raw.get(p + "FREQ", ""),
+                "channel": self.raw.get(p + "CHANNEL", ""),
+                "link": self.raw.get(p + "LINK", ""),
+                "rssi": self.raw.get(p + "RSSI", ""),
+                "rtt": self.raw.get(p + "RTT_AVG", ""),
+                "battery": self.raw.get(p + "BATTERY", ""),
+                "charging": self.raw.get(p + "CHARGING", ""),
+            }
+            if d["serial"]:
+                out.append(d)
+        return out
+
+    @property
+    def rate_stats(self):
+        """传输时的平均 / 峰值速率（Mbps）"""
+        return (self.raw.get("NET_RATE_AVG_MBPS", ""),
+                self.raw.get("NET_RATE_MAX_MBPS", ""))
+
+    @property
+    def mac_link(self):
+        """Mac 侧 Wi-Fi 链路与电量（全局一份）"""
+        return {
+            "rate": self.raw.get("NET_MAC_RATE", ""),
+            "channel": self.raw.get("NET_MAC_CHANNEL", ""),
+            "rssi": self.raw.get("NET_MAC_RSSI", ""),
+            "battery": self.raw.get("NET_MAC_BATTERY", ""),
+            "power": self.raw.get("NET_MAC_POWER", ""),
+        }
+
+    @property
     def mdns_works(self):
         """mDNS 是否真的能发现 adb 服务"""
         return int(self.raw.get("MDNS_ADB_COUNT", "0") or 0) > 0
@@ -437,6 +482,37 @@ MOUSE_WHEEL_DOWN = _btn("BUTTON5_PRESSED", 0x8000000)
 
 # ---------------- 显示宽度工具（中文占 2 列，必须按列而非字符计算） ----------------
 
+def rtt_grade(v):
+    """延迟等级（与菜单栏文案保持一致）"""
+    if v < 20:
+        return "正常 <20"
+    if v < 50:
+        return "偏高 20–50"
+    return "过高 >50"
+
+
+def signal_grade(v):
+    """信号等级（与菜单栏文案保持一致）"""
+    if v > -60:
+        return "优秀 >-60"
+    if v > -70:
+        return "良好 -60~-70"
+    return "偏弱 <-70"
+
+
+def link_rate_text(mbps):
+    """链路速率 Mbps → 字节基准 MB/s（与 ↓↑ 传输速率口径一致）"""
+    try:
+        mbs = float(mbps) / 8.0
+    except (TypeError, ValueError):
+        return "-"
+    if mbs >= 10:
+        return "%.0f" % mbs
+    if mbs >= 1:
+        return "%.1f" % mbs
+    return "%.2f" % mbs
+
+
 def dwidth(text):
     """字符串在终端上的显示宽度"""
     w = 0
@@ -718,6 +794,82 @@ class App:
                         "累计: 收 %s MB / 发 %s MB" % (rd, ru),
                         curses.color_pair(C_DIM))
             y += 1
+
+        # ---- 链路质量 ----
+        # 字段与顺序与菜单栏「网络链路」子菜单保持一致：
+        #   设备名 → 延迟（含正常区间）→ 信号（含区间）→ 链路/实测均值/峰值/上限
+        #   → AP/信道/频率 → 电量；最后是 Mac 侧一行。
+        # 每台设备占 4 行，最多 2 台，避免挤占下方诊断区。
+        links = st.dev_links
+        if links:
+            self.addstr(y, 1, "链路质量", curses.color_pair(C_TITLE) | curses.A_BOLD)
+            y += 1
+            avg, peak = st.rate_stats
+
+            for d in links[:2]:
+                # 1) 设备名 + 电量
+                label = d["serial"] + ((" · " + d["model"]) if d["model"] else "")
+                if d["battery"]:
+                    label += "   电量 %s%%%s" % (
+                        d["battery"], "（充电中）" if d["charging"] == "1" else "")
+                self.addstr(y, 2, label, curses.color_pair(C_DIM) | curses.A_BOLD)
+                y += 1
+
+                if d["transport"] != "wifi":
+                    self.addstr(y, 4, "USB 连接（无网络往返延迟）", curses.color_pair(C_DIM))
+                    y += 1
+                    continue
+
+                # 2) 延迟 / 信号（带正常区间）
+                line2 = []
+                rtt_val = None
+                if d["rtt"]:
+                    try:
+                        rtt_val = float(d["rtt"])
+                        line2.append("延迟 %.0fms（%s）" % (rtt_val, rtt_grade(rtt_val)))
+                    except ValueError:
+                        pass
+                if d["rssi"]:
+                    try:
+                        line2.append("信号 %s dBm（%s）"
+                                     % (d["rssi"], signal_grade(float(d["rssi"]))))
+                    except ValueError:
+                        line2.append("信号 %s dBm" % d["rssi"])
+                attr2 = curses.color_pair(C_WARN if (rtt_val and rtt_val > 50) else C_DIM)
+                self.addstr(y, 4, " · ".join(line2) if line2 else "-", attr2)
+                y += 1
+
+                # 3) 链路速率 + 实测平均/峰值/上限（与菜单同一口径、同一单位）
+                if d["link"]:
+                    try:
+                        ceiling = link_rate_text(float(d["link"]) * 0.6)
+                    except ValueError:
+                        ceiling = "-"
+                    avg_txt = link_rate_text(avg) if avg and avg != "0.0" else "-"
+                    peak_txt = link_rate_text(peak) if peak and peak != "0.0" else "-"
+                    line3 = "链路 %s MB/s · 实测 平均 %s / 峰值 %s / 上限 %s MB/s" % (
+                        link_rate_text(d["link"]), avg_txt, peak_txt, ceiling)
+                    self.addstr(y, 4, line3, curses.color_pair(C_DIM))
+                    y += 1
+
+                # 4) AP / 信道 / 频率（BSSID 在菜单的 tooltip 里，TUI 不显示避免超宽）
+                if d["ssid"]:
+                    self.addstr(y, 4, "AP %s · 信道 %s · %s MHz" % (
+                        d["ssid"], d["channel"] or "-", d["freq"] or "-"),
+                        curses.color_pair(C_DIM))
+                    y += 1
+
+            # Mac 侧（全局）
+            ml = st.mac_link
+            if ml["rate"]:
+                mac = "Mac  链路 %s MB/s（%s dBm）· 信道 %s" % (
+                    link_rate_text(ml["rate"]), ml["rssi"] or "-", ml["channel"] or "-")
+                if ml["battery"]:
+                    pw = {"charging": "充电中", "charged": "已充满",
+                          "ac": "外接电源"}.get(ml["power"], "使用电池")
+                    mac += " · 电量 %s%%（%s）" % (ml["battery"], pw)
+                self.addstr(y, 2, mac, curses.color_pair(C_DIM))
+                y += 1
 
         # mDNS 被屏蔽时给出醒目横幅
         if not st.mdns_works:
