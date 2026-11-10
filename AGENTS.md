@@ -33,6 +33,25 @@
   `CFBundleVersion` 取 `git rev-list --count HEAD`
 - 菜单栏「关于 ADB WiFi」优先读 `ADBWifiFullVersion`，并用它做更新检查
 
+## 脚本输出协议（App ↔ 脚本）
+
+`bin/adb-wifi.sh` 与 `menubar/main.swift` 之间**只通过 ASCII 枚举通信，禁止解析中文文案**。
+
+- 默认（`text`）模式输出中文文案，供终端与 TUI 直接展示
+- `ADBWIFI_FORMAT=kv` 时只输出协议字段：
+  - `recover`：`RESULT=already|recovered|failed`、`ENDPOINT`、`VIA=existing|known|scan|usb`、`ERROR=no_usb|tcpip_failed`
+  - `open`：`RESULT=opened|partial|need_usb|no_device|failed`、`PAGE`、`TITLE`、`WIFI_TOGGLE=on|off|unknown`
+- `diag` 始终输出 `DIAG_CODE` 枚举（不受开关影响）；`DIAG_TITLE` / `DIAG_HINT` 保留给终端与 TUI
+- 界面文案统一在 `menubar/i18n.swift` 维护，`zhHans` / `zhHant` / `en` 三表必须同时补齐
+
+### 修改协议时的检查清单
+
+- [ ] 新增诊断分支同时设置 `code` 与中文 `title` / `hint`
+- [ ] 新增 `DIAG_CODE` 在 `i18n.swift` 三表补 `diag.<CODE>.title` / `diag.<CODE>.hint`
+- [ ] 新增/改名 kv 字段或值域时，同步 `main.swift` 消费逻辑与中英文 README 的协议表
+- [ ] `bash -n bin/adb-wifi.sh` 与 `swiftc -typecheck menubar/main.swift menubar/i18n.swift` 通过
+- [ ] App 侧对所有新 code 保留回退：`L.has(key)` 为 false 时用脚本下发的中文
+
 ## 安装入口
 
 - 一键在线安装 / 更新：`get.sh`。下载最新**稳定** Release 的完整包，校验 SHA256，

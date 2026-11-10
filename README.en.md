@@ -457,8 +457,57 @@ data source** as the TUI, so both always agree:
   Quit menu bar (daemon keeps running)
 ```
 
-Diagnosis is produced centrally by `DIAG_LEVEL / DIAG_TITLE / DIAG_HINT / DIAG_ACTION`
-in the script, so the menu bar and TUI never diverge.
+Diagnosis is produced centrally by `DIAG_LEVEL / DIAG_CODE / DIAG_TITLE / DIAG_HINT / DIAG_ACTION`
+in the script, so the menu bar and TUI never diverge. `DIAG_CODE` is a machine-readable
+enum that the menu bar maps to localized strings (see the next section).
+
+### Script Output Protocol (the app ⇄ script contract)
+
+The menu bar app **never parses natural language** from the script. By default the script
+prints Chinese text for the terminal and TUI; in `kv` mode it prints ASCII enum fields
+only, and the UI text is rendered from the app's own i18n tables:
+
+```bash
+$ ADBWIFI_FORMAT=kv ./bin/adb-wifi.sh recover
+RESULT=recovered
+ENDPOINT=192.168.1.50:38075
+VIA=known
+```
+
+| Command | Field | Values |
+|---|---|---|
+| `recover` | `RESULT` | `already` / `recovered` / `failed` |
+| | `ENDPOINT` | `IP:PORT` (on success) |
+| | `VIA` | `existing` / `known` / `scan` / `usb` |
+| | `ERROR` | `no_usb` / `tcpip_failed` (failures only) |
+| `open <page>` | `RESULT` | `opened` / `partial` / `need_usb` / `no_device` / `failed` |
+| | `PAGE` | Requested page: `wireless` / `dev` |
+| | `TITLE` | Page actually reached: `wireless` / `dev` |
+| | `WIFI_TOGGLE` | `on` / `off` / `unknown` |
+| `diag` | `DIAG_CODE` | See below (always emitted, regardless of `ADBWIFI_FORMAT`) |
+
+`diag` still emits the Chinese `DIAG_TITLE` / `DIAG_HINT` for the terminal and TUI.
+The app looks up `DIAG_CODE` in its i18n tables first, and falls back to the script text
+when the code is unknown (older script, or a code this app build does not ship yet), so
+a raw key is never shown to the user.
+
+| `DIAG_CODE` | Meaning |
+|---|---|
+| `DAEMON_DOWN_NO_DEVICE` | Daemon stopped and no device connected |
+| `CONNECTED_MDNS` | Connected, mDNS discovery works |
+| `CONNECTED_VIA_TCPIP_USB` | Connected (USB auto-switched to TCP), cable plugged |
+| `CONNECTED_VIA_TCPIP_WIRELESS` | Connected on the wireless port, USB unplugged |
+| `CONNECTED_VIA_KNOWN` | Connected via a remembered endpoint (mDNS blocked) |
+| `DEV_OPTIONS_OFF` | Developer options are off on the phone |
+| `USB_AUTO_TCPIP_PENDING` | USB connected, wireless link being established |
+| `ADB_WIFI_OFF` | Wireless debugging is off on the phone |
+| `USB_CONNECTED_NO_WIRELESS` | USB connected, no wireless link yet |
+| `NO_DEVICE_MDNS_OK` | No device found, mDNS works |
+| `NO_DEVICE_MDNS_BLOCKED` | No device found and the network blocks mDNS |
+
+Field names and value ranges are a **stable contract**: changing them requires updating
+`menubar/main.swift`. Every new diagnostic branch must set `code` and add the matching
+`diag.<CODE>.title` / `.hint` entries to all three language tables in `menubar/i18n.swift`.
 
 ### About & Version Updates
 

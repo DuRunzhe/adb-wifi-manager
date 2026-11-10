@@ -453,8 +453,54 @@ Android 11+ 的「无线调试」端口是**每次随机分配**的，因此脚�
   本机：192.168.1.100
 ```
 
-诊断结论由脚本层 `DIAG_LEVEL / DIAG_TITLE / DIAG_HINT / DIAG_ACTION` 统一给出，
+诊断结论由脚本层 `DIAG_LEVEL / DIAG_CODE / DIAG_TITLE / DIAG_HINT / DIAG_ACTION` 统一给出，
 避免菜单栏与 TUI 各自判断导致信息不一致。点击「▸ 处理」可直接执行对应修复动作。
+其中 `DIAG_CODE` 是机器可读枚举，菜单栏按它查本地 i18n 文案（见下一节）。
+
+### 脚本输出协议（App 与脚本的契约）
+
+菜单栏 App 与 `adb-wifi.sh` 之间**不解析自然语言**。脚本默认输出中文文案，供终端与 TUI
+直接展示；另提供 `kv` 模式，只输出 ASCII 枚举字段，界面文案由 App 的 i18n 表渲染：
+
+```bash
+$ ADBWIFI_FORMAT=kv ./bin/adb-wifi.sh recover
+RESULT=recovered
+ENDPOINT=192.168.1.50:38075
+VIA=known
+```
+
+| 命令 | 字段 | 取值 |
+|---|---|---|
+| `recover` | `RESULT` | `already` / `recovered` / `failed` |
+| | `ENDPOINT` | `IP:PORT`（成功时） |
+| | `VIA` | `existing` / `known` / `scan` / `usb` |
+| | `ERROR` | `no_usb` / `tcpip_failed`（仅失败时） |
+| `open <page>` | `RESULT` | `opened` / `partial` / `need_usb` / `no_device` / `failed` |
+| | `PAGE` | 请求的页面：`wireless` / `dev` |
+| | `TITLE` | 实际落到的页面：`wireless` / `dev` |
+| | `WIFI_TOGGLE` | `on` / `off` / `unknown` |
+| `diag` | `DIAG_CODE` | 见下表（始终输出，不受 `ADBWIFI_FORMAT` 影响） |
+
+`diag` 同时保留 `DIAG_TITLE` / `DIAG_HINT` 中文文案（终端与 TUI 用）。App 优先用
+`DIAG_CODE` 查本地 i18n 表，查不到时（旧脚本，或脚本新增了 App 未收录的 code）
+自动回退到脚本下发的中文，不会把 key 原样显示给用户。
+
+| `DIAG_CODE` | 含义 |
+|---|---|
+| `DAEMON_DOWN_NO_DEVICE` | 守护未运行且无设备连接 |
+| `CONNECTED_MDNS` | 已连接，mDNS 自动发现可用 |
+| `CONNECTED_VIA_TCPIP_USB` | 已连接（USB 自动转 TCP），插着线 |
+| `CONNECTED_VIA_TCPIP_WIRELESS` | 已连接（无线端口），USB 已拔 |
+| `CONNECTED_VIA_KNOWN` | 已连接，mDNS 被屏蔽，靠记忆端点维持 |
+| `DEV_OPTIONS_OFF` | 手机「开发者选项」未开启 |
+| `USB_AUTO_TCPIP_PENDING` | 插着 USB，正在自动建立无线连接 |
+| `ADB_WIFI_OFF` | 手机「无线调试」开关未打开 |
+| `USB_CONNECTED_NO_WIRELESS` | USB 已连接，尚未建立无线连接 |
+| `NO_DEVICE_MDNS_OK` | 未发现设备，但 mDNS 正常 |
+| `NO_DEVICE_MDNS_BLOCKED` | 未发现设备，且此网络屏蔽 mDNS |
+
+约定：字段名与值域是**稳定契约**，修改需同步 `menubar/main.swift`；新增诊断分支必须
+同时设置 `code`，并在 `menubar/i18n.swift` 的三种语言表里补齐对应文案。
 
 ### 关于与版本更新
 
@@ -834,8 +880,10 @@ adb-wifi-manager/
 ├── install.sh                      # 一键安装（launchd + 菜单栏 App）
 ├── launchd/*.plist                 # launchd 模板
 ├── menubar/main.swift              # 菜单栏 App 源码
+├── menubar/i18n.swift              # 界面文案表（简中 / 繁中 / 英文）
 ├── menubar/build.sh                # 编译脚本（支持 ADBWIFI_UNIVERSAL=1）
 ├── menubar/gen-icon.swift          # App 图标生成器（SF Symbol → png + icns）
+├── menubar/entitlements.plist      # 正式签名用的最小权限集
 ├── Resources/                      # 生成的 App 图标资源
 ├── prebuilt/AdbWifiBar.app         # 发布包内的预编译 App（仅打包时生成）
 └── build/AdbWifiBar.app            # 本地编译产物
