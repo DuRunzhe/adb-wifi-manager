@@ -15,6 +15,15 @@ DEST="${ADBWIFI_DIR:-$HOME/mycode/adb-wifi-manager}"
 info() { printf '%s\n' "$*"; }
 die() { printf '✗ %s\n' "$*" >&2; exit 1; }
 
+# 把 $HOME 前缀缩写为 ~，避免安装日志暴露本机用户名
+shorten_path() {
+    case "$1" in
+        "$HOME") printf '~' ;;
+        "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 [ "$(uname -s)" = "Darwin" ] || die "目前仅支持 macOS"
 command -v curl >/dev/null 2>&1 || die "未找到 curl"
 command -v rsync >/dev/null 2>&1 || die "未找到 rsync"
@@ -67,16 +76,16 @@ SRC="$TMP/unzip/adb-wifi-manager-$VERSION"
 
 # 5) 部署到目标目录（保留已有的 config.sh）
 if [ -d "$DEST" ]; then
-    info "覆盖更新已有安装: ${DEST}（config.sh 会保留）"
+    info "覆盖更新已有安装: $(shorten_path "$DEST")（config.sh 会保留）"
 fi
 mkdir -p "$DEST"
 rsync -a --exclude 'config.sh' "$SRC/" "$DEST/"
 chmod +x "$DEST/install.sh" "$DEST/bin/adb-wifi.sh" 2>/dev/null
-info "✓ 已部署到 $DEST"
+info "✓ 已部署到 $(shorten_path "$DEST")"
 
 if [ "${ADBWIFI_SKIP_INSTALL:-0}" = "1" ]; then
     info "已跳过安装步骤（ADBWIFI_SKIP_INSTALL=1）"
-    info "手动安装：cd \"$DEST\" && ./install.sh"
+    info "手动安装：cd \"$(shorten_path "$DEST")\" && ./install.sh"
     exit 0
 fi
 

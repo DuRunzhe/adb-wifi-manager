@@ -735,6 +735,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
+        // 主菜单展示当前版本，不必打开「关于」也能确认
+        var menuVersion = L.t("about.version", APP_VERSION)
+        if !APP_BUILD.isEmpty { menuVersion += L.t("about.buildSuffix", APP_BUILD) }
+        menu.addItem(disabledItem("  " + menuVersion))
+
         // 关于：版本信息与「检查更新」入口都收敛在这里，主菜单保持精简
         let about = NSMenuItem(title: L.t("menu.about"), action: #selector(showAbout), keyEquivalent: "")
         about.target = self
@@ -1114,7 +1119,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - 关于 / 版本更新
 
     var aboutWindow: NSWindow?
-    var updateLabel: NSTextField?
     var checkUpdateButton: NSButton?
     var checkAlphaButton: NSButton?
 
@@ -1134,9 +1138,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 正式版按钮状态机：检查结果直接体现在按钮文案上，不再弹窗
     enum StableState {
-        case idle, checking, updateAvailable, upToDate, failed, installing
+        case idle, checking, updateAvailable, upToDate, installFailed, failed, installing
     }
     var stableState: StableState = .idle
+    var stableError = ""
+
+    /// 主更新按钮当前代表哪个通道（Alpha 检查出更新后会接管主按钮）
+    var primaryChannel: UpdateChannel = .stable
 
     /// 更新通道：正式版走 releases/latest，Alpha 只取预发布
     enum UpdateChannel {
@@ -1156,7 +1164,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func makeAboutWindow() -> NSWindow {
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 420),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 380),
             styleMask: [.titled, .closable],
             backing: .buffered, defer: false)
         w.title = L.t("about.title")
@@ -1209,38 +1217,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         check.keyEquivalent = "\r"
         check.toolTip = L.t("about.checkTip")
         check.translatesAutoresizingMaskIntoConstraints = false
-        check.widthAnchor.constraint(equalToConstant: 220).isActive = true
+        check.widthAnchor.constraint(equalToConstant: 260).isActive = true
         checkUpdateButton = check
         stack.addArrangedSubview(check)
+        stack.setCustomSpacing(12, after: check)
 
-        let upd = NSTextField(labelWithString: " ")
-        upd.alignment = .center
-        upd.font = NSFont.systemFont(ofSize: 11)
-        upd.textColor = .secondaryLabelColor
-        upd.widthAnchor.constraint(equalToConstant: 360).isActive = true
-        updateLabel = upd
-        stack.addArrangedSubview(upd)
-
-        stack.setCustomSpacing(14, after: upd)
-
-        // Alpha 通道弱化为文字链，避免与正式版抢注意力
-        let alphaRow = NSStackView()
-        alphaRow.orientation = .horizontal
-        alphaRow.spacing = 2
-        let alphaTip = NSTextField(labelWithString: L.t("about.alpha.prefix"))
-        alphaTip.font = NSFont.systemFont(ofSize: 11)
-        alphaTip.textColor = .tertiaryLabelColor
+        // Alpha 入口自身完成「状态 + 动作」，不再额外占一行状态文字
         let alpha = NSButton(title: L.t("about.alpha.idle"), target: self, action: #selector(checkAlphaUpdates))
         alpha.bezelStyle = .inline
         alpha.isBordered = false
         alpha.toolTip = L.t("about.alpha.tip")
         checkAlphaButton = alpha
         refreshAlphaLink()
-        alphaRow.addArrangedSubview(alphaTip)
-        alphaRow.addArrangedSubview(alpha)
-        stack.addArrangedSubview(alphaRow)
+        stack.addArrangedSubview(alpha)
 
-        stack.setCustomSpacing(18, after: alphaRow)
+        stack.setCustomSpacing(18, after: alpha)
 
         let links = NSStackView()
         links.orientation = .horizontal
@@ -1326,10 +1317,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return comparePrerelease(a.pre, b.pre) > 0
     }
 
-    /// 正式版更新（主入口）：有可用更新时直接安装，否则检查后自动安装
+    /// 主更新按钮：根据当前展示的通道执行检查 / 安装
     @objc func checkStableUpdates() {
         guard stableState != .checking, stableState != .installing,
               alphaState != .installing else { return }
+
+        // 主按钮当前展示的是 Alpha 更新：点击安装 / 重试 Alpha
+        if primaryChannel == .alpha,
+           alphaState == .updateAvailable || alphaState == .installFailed,
+           let p = pendingAlpha {
+            installUpdate(p, channel: .alpha)
+            return
+        }
+
         if let p = pendingStable, isNewer(p.tag, than: APP_VERSION) {
             installUpdate(p, channel: .stable)
             return
@@ -1337,23 +1337,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         runUpdateCheck(.stable, autoInstall: true)
     }
 
-    /// Alpha 预发布：与正式版同一套自动安装链路，发现可更新时再次点击即安装
+    /// Alpha 入口只负责检查；结果展示到主按钮，安装由主按钮执行
     @objc func checkAlphaUpdates() {
         guard alphaState != .checking, alphaState != .installing,
               stableState != .checking, stableState != .installing else { return }
-        if alphaState == .updateAvailable || alphaState == .installFailed,
-           let p = pendingAlpha {
-            installUpdate(p, channel: .alpha)
-            return
-        }
         runUpdateCheck(.alpha)
     }
 
     func runUpdateCheck(_ channel: UpdateChannel, autoInstall: Bool = false) {
         if channel == .stable {
+            primaryChannel = .stable
             stableState = .checking
+            stableError = ""
             setStableButtonTitle()
-            updateLabel?.stringValue = L.t("about.status.checking")
             lastAutoCheck = Date()
         } else {
             alphaState = .checking
@@ -1371,13 +1367,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         if self.isNewer(info.tag, than: APP_VERSION) {
                             self.pendingStable = info
                             self.stableState = .updateAvailable
-                            self.updateLabel?.stringValue =
-                                L.t("about.status.updateAvailable", APP_VERSION, info.tag)
+                            self.stableError = ""
+                            self.primaryChannel = .stable
                             if autoInstall { self.installUpdate(info) }
                         } else {
                             self.pendingStable = nil
                             self.stableState = .upToDate
-                            self.updateLabel?.stringValue = L.t("about.status.upToDate", APP_VERSION)
+                            self.stableError = ""
+                            self.primaryChannel = .stable
                         }
                     } else {
                         self.latestAlphaTag = info.tag
@@ -1385,9 +1382,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         if self.isNewer(info.tag, than: APP_VERSION) {
                             self.pendingAlpha = info
                             self.alphaState = .updateAvailable
+                            // Alpha 检查出更新后接管主按钮
+                            self.primaryChannel = .alpha
                         } else {
                             self.pendingAlpha = nil
                             self.alphaState = .upToDate
+                            if self.primaryChannel == .alpha { self.primaryChannel = .stable }
                         }
                         self.refreshAlphaLink()
                     }
@@ -1397,7 +1397,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.pendingAlpha = nil
                     if channel == .stable {
                         self.stableState = .failed
-                        self.updateLabel?.stringValue = L.t("about.status.noVersion")
+                        self.stableError = L.t("about.status.noVersion")
                     } else {
                         self.alphaState = .failed
                         self.alphaError = L.t("about.alpha.errNoVersion")
@@ -1408,7 +1408,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     if channel == .stable {
                         self.pendingStable = nil
                         self.stableState = .failed
-                        self.updateLabel?.stringValue = (err as NSError).code == 404
+                        self.stableError = (err as NSError).code == 404
                             ? L.t("about.status.noStable")
                             : L.t("about.status.failed", err.localizedDescription)
                     } else {
@@ -1420,6 +1420,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             self.alphaState = .failed
                             self.alphaError = err.localizedDescription
                         }
+                        if self.primaryChannel == .alpha { self.primaryChannel = .stable }
                         self.refreshAlphaLink()
                     }
                 }
@@ -1429,30 +1430,70 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// 正式版按钮文案 = 当前状态 + 下一步动作，检查结果不再弹窗
+    /// 主更新按钮：Alpha 检查出更新时接管按钮，否则显示正式版状态
     func setStableButtonTitle() {
         let btn = checkUpdateButton
+        var tip = L.t("about.checkTip")
+
+        if primaryChannel == .alpha {
+            switch alphaState {
+            case .installing:
+                btn?.title = L.t("about.installing")
+                btn?.isEnabled = false
+                tip = pendingAlpha.map { L.t("about.tip.installing", $0.tag) } ?? L.t("about.installing")
+                btn?.toolTip = tip
+                return
+            case .installFailed:
+                btn?.title = L.t("about.alpha.installFailed")
+                btn?.isEnabled = true
+                tip = alphaError.isEmpty ? L.t("about.alpha.installFailed") : alphaError
+                btn?.toolTip = tip
+                return
+            case .updateAvailable:
+                btn?.title = pendingAlpha.map { L.t("about.alpha.download", $0.tag) } ?? L.t("about.check")
+                btn?.isEnabled = true
+                if let p = pendingAlpha {
+                    tip = L.t("about.tip.updateAvailable", APP_VERSION, p.tag)
+                }
+                btn?.toolTip = tip
+                return
+            default:
+                break
+            }
+        }
+
         switch stableState {
         case .checking:
             btn?.title = L.t("about.checking")
             btn?.isEnabled = false
+            tip = L.t("about.status.checking")
         case .installing:
             btn?.title = L.t("about.installing")
             btn?.isEnabled = false
+            tip = pendingStable.map { L.t("about.tip.installing", $0.tag) } ?? L.t("about.installing")
+        case .installFailed:
+            btn?.title = L.t("about.installFailed")
+            btn?.isEnabled = true
+            tip = stableError.isEmpty ? L.t("about.installFailed") : stableError
         case .failed:
             btn?.title = L.t("about.checkFailed")
             btn?.isEnabled = true
+            tip = stableError.isEmpty ? L.t("about.checkFailed") : stableError
         case .upToDate:
             btn?.title = L.t("about.upToDate")
             btn?.isEnabled = true
+            tip = L.t("about.tip.upToDate", APP_VERSION)
         case .updateAvailable:
             btn?.title = pendingStable.map { L.t("about.downloadInstall", $0.tag) } ?? L.t("about.check")
             btn?.isEnabled = true
+            if let p = pendingStable {
+                tip = L.t("about.tip.updateAvailable", APP_VERSION, p.tag)
+            }
         case .idle:
             btn?.title = L.t("about.check")
             btn?.isEnabled = true
         }
-        btn?.toolTip = L.t("about.checkTip")
+        btn?.toolTip = tip
     }
 
     /// Alpha 入口：文字本身就是检查状态（蓝色下划线超链接）
@@ -1473,9 +1514,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             enabled = false
             tip = text
         case .updateAvailable:
-            text = pendingAlpha.map { L.t("about.alpha.download", $0.tag) } ?? L.t("about.alpha.idle")
-            // 安装失败后会回到本态，用 tooltip 带上失败原因
-            tip = alphaError.isEmpty ? L.t("about.alpha.tip.download") : alphaError
+            text = pendingAlpha.map { L.t("about.alpha.available", $0.tag) } ?? L.t("about.alpha.idle")
+            tip = pendingAlpha.map { L.t("about.alpha.tip.available", $0.tag) } ?? L.t("about.alpha.tip")
         case .installFailed:
             // 安装失败必须可见（不只藏在 tooltip 里），点击直接重试安装
             text = L.t("about.alpha.installFailed")
@@ -1515,17 +1555,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let tmp = NSTemporaryDirectory() + "AdbWifiBarUpdate-\(UUID().uuidString)"
 
         installingUpdate = true
+        primaryChannel = channel
         updateLog("开始更新 channel=\(channel == .stable ? "stable" : "alpha") tag=\(info.tag) url=\(zipURL)")
         checkAlphaButton?.isEnabled = false
         checkUpdateButton?.isEnabled = false
         if channel == .stable {
             stableState = .installing
-            setStableButtonTitle()
-            updateLabel?.stringValue = L.t("about.status.downloading", info.tag)
         } else {
             alphaState = .installing
-            refreshAlphaLink()
         }
+        setStableButtonTitle()
+        refreshAlphaLink()
 
         DispatchQueue.global(qos: .userInitiated).async {
             let zip = tmp + "/update.zip"
@@ -1590,14 +1630,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.checkAlphaButton?.isEnabled = true
                     self.checkUpdateButton?.isEnabled = true
                     if channel == .stable {
-                        self.stableState = .updateAvailable
-                        self.setStableButtonTitle()
-                        self.updateLabel?.stringValue = L.t("about.status.updateFailed", f)
+                        self.stableState = .installFailed
+                        self.stableError = f
                     } else {
                         self.alphaState = .installFailed
                         self.alphaError = f
-                        self.refreshAlphaLink()
                     }
+                    self.primaryChannel = channel
+                    self.setStableButtonTitle()
+                    self.refreshAlphaLink()
                 }
                 return
             }
@@ -1635,25 +1676,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.checkAlphaButton?.isEnabled = true
                     self.checkUpdateButton?.isEnabled = true
                     if channel == .stable {
-                        self.stableState = .updateAvailable
-                        self.setStableButtonTitle()
-                        self.updateLabel?.stringValue =
-                            L.t("about.status.updateLauncherFailed", error.localizedDescription)
+                        self.stableState = .installFailed
+                        self.stableError = error.localizedDescription
                     } else {
                         self.alphaState = .installFailed
                         self.alphaError = error.localizedDescription
-                        self.refreshAlphaLink()
                     }
+                    self.primaryChannel = channel
+                    self.setStableButtonTitle()
+                    self.refreshAlphaLink()
                 }
                 return
             }
 
             DispatchQueue.main.async {
+                self.primaryChannel = channel
                 if channel == .stable {
-                    self.updateLabel?.stringValue = L.t("about.status.installing")
+                    self.stableState = .installing
                 } else {
-                    self.refreshAlphaLink()
+                    self.alphaState = .installing
                 }
+                self.setStableButtonTitle()
+                self.refreshAlphaLink()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                     NSApp.terminate(nil)
                 }
