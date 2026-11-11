@@ -259,11 +259,21 @@ first_usb_serial() {
 # 成功时输出端点 ip:port 到 stdout（供主循环作为候选），失败返回 1。
 # 重试节流：同一台设备在 TCPIP_RETRY_INTERVAL 秒内不重复打扰（adb tcpip 会闪断 USB）。
 ensure_tcpip() {
+    # 可选参数：指定 USB 序列号时只处理这一台（多设备场景下避免抢用别的手机）
+    ensure_tcpip_for "${1:-}"
+}
+
+# 同 ensure_tcpip，但强制作用于指定 USB 设备。
+# 节流戳按设备分开，避免多台手机互相覆盖彼此的退避状态。
+ensure_tcpip_for() {
     [ "$AUTO_TCPIP" = "1" ] || return 1
 
-    local serial ip ep now last next_expire=""
-    serial="$(first_usb_serial)"
+    local serial ip ep now last next_expire="" stamp
+    serial="$1"
+    [ -z "$serial" ] && serial="$(first_usb_serial)"
     [ -z "$serial" ] && return 1
+    case "$serial" in *:*) return 1 ;; esac   # 只有 USB 设备能切 tcpip
+    stamp="$TCPIP_STAMP.$serial"
 
     ip="$(device_wifi_ip "$serial")"
     if [ -z "$ip" ]; then
@@ -286,15 +296,15 @@ ensure_tcpip() {
 
     # 节流：避免每轮都切 tcpip 导致 USB 反复闪断
     now=$(date +%s)
-    if [ -f "$TCPIP_STAMP" ]; then
-        read -r last next_expire < "$TCPIP_STAMP" 2>/dev/null || last=0
+    if [ -f "$stamp" ]; then
+        read -r last next_expire < "$stamp" 2>/dev/null || last=0
         case "$last" in ''|*[!0-9]*) last=0 ;; esac
         if [ $((now - last)) -lt "$TCPIP_RETRY_INTERVAL" ]; then
             info "tcpip 上次尝试在 $((now - last))s 前，$TCPIP_RETRY_INTERVAL 秒内不重复切换" >&2
             return 1
         fi
     fi
-    echo "$now" > "$TCPIP_STAMP"
+    echo "$now" > "$stamp"
 
     info "USB 设备 $serial 未开无线调试，自动切换 TCP 模式(端口 $TCPIP_PORT) ..." >&2
     local out
@@ -923,9 +933,143 @@ settings_serial() {
     return 0
 }
 
+# 输出「供 App 建立设备列表」的 kv 字段（多设备入口的基础数据）。
+# 只做一次 adb devices -l，不逐台查询，避免菜单打开时卡顿。
+emit_device_list() {
+    local n=0 id
+    "$ADB_BIN" devices -l 2>/dev/null | while read -r id state rest; do
+        case "$id" in ''|List|*"*"*) continue ;; esac
+        case "$state" in
+            device|offline|unauthorized) ;;
+            *) continue ;;
+        esac
+        n=$((n + 1))
+        local model transport
+        model=$(printf '%s' "$rest" | sed -n 's/.*model:\([^ ]*\).*/\1/p' | tr '_' ' ')
+        case "$id" in
+            *:*) transport=wifi ;;
+            *)   transport=usb ;;
+        esac
+        echo "DEV_${n}_SERIAL=$id"
+        echo "DEV_${n}_STATE=$state"
+        echo "DEV_${n}_TRANSPORT=$transport"
+        [ -n "$model" ] && echo "DEV_${n}_MODEL=$model"
+        echo "DEV_COUNT=$n"
+    done
+}
+
+# 某台设备能否作为「在手机上打开设置页」的对象：排除离线/未授权
+device_usable() {
+    local s="$1" st
+    st=$("$ADB_BIN" -s "$s" get-state 2>/dev/null | tr -d '\r')
+    [ "$st" = "device" ]
+}
+
+# 把 open_settings_page 的内部 token 转成对外 RESULT（值域见文件头「输出协议」）
+open_result_token() {
+    case "$1" in
+        OK\ *)      echo "opened" ;;
+        PARTIAL\ *) echo "partial" ;;
+        NEED_USB)   echo "need_usb" ;;
+        *)          echo "failed" ;;
+    esac
+}
+
+# 把 open_settings_page 的内部 token 转成对外的 TITLE 枚举（dev / wireless）
+open_title_token() {
+    local out="$1" title=""
+    case "$out" in
+        OK\ *)      title="${out#OK }" ;;
+        PARTIAL\ *) title="${out#PARTIAL }" ;;
+    esac
+    echo "$title"
+}
+
+# 单轮参数解析：只认 `--serial <SERIAL>` 与 `--all`，其余位置参数不动。
+# 结果放进 OPEN_SERIAL / OPEN_ALL 两个全局变量（bash 3.2 无 nameref 可用）。
+parse_target_flags() {
+    OPEN_SERIAL=""
+    OPEN_ALL=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --serial|-s) OPEN_SERIAL="${2:-}"; shift 2 ;;
+            --all)       OPEN_ALL=1; shift ;;
+            *)           break ;;
+        esac
+    done
+}
+
 cmd_open() {
-    local page="${1:-wireless}" serial out
-    serial="$(settings_serial)"
+    OPEN_SERIAL=""
+    OPEN_ALL=0
+    local page="wireless"
+    # 单个循环同时吃 page 与目标 flag：跳过 --serial 的取值，避免把序列号当成 page
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --serial|-s) OPEN_SERIAL="${2:-}"; shift 2 ;;
+            --all)       OPEN_ALL=1; shift ;;
+            *)           page="$1"; shift ;;
+        esac
+    done
+
+    # ---- 批量模式：对当前所有可用设备逐台打开 ----
+    if [ "$OPEN_ALL" = "1" ]; then
+        local targets s i=0 ok=0 fail=0 total
+        targets=$(all_serial)
+        total=$(printf '%s\n' "$targets" | grep -c . )
+        if [ -z "$targets" ]; then
+            if is_kv; then echo "DONE_COUNT=0"; echo "OK_COUNT=0"; echo "FAIL_COUNT=0"
+            else echo "✗ 未检测到已连接的设备（USB 或无线均可）"; fi
+            return 1
+        fi
+        is_kv || echo "对 $total 台设备打开「$page」页面 ..."
+        for s in $targets; do
+            i=$((i + 1))
+            local out result
+            out=$(open_settings_page "$s" "$page" 2>/dev/null)
+            result=$(open_result_token "$out")
+            case "$result" in opened|partial) ok=$((ok + 1)) ;; *) fail=$((fail + 1)) ;; esac
+            if is_kv; then
+                echo "DEV_${i}_SERIAL=$s"
+                echo "DEV_${i}_RESULT=$result"
+                local t; t=$(open_title_token "$out")
+                [ -n "$t" ] && echo "DEV_${i}_TITLE=$t"
+            else
+                case "$result" in
+                    opened)  echo "  ✓ $s" ;;
+                    partial) echo "  △ $s（已到开发者选项，请手动点「无线调试」）" ;;
+                    *)       echo "  ✗ $s 打开失败" ;;
+                esac
+            fi
+        done
+        if is_kv; then
+            echo "DONE_COUNT=$i"
+            echo "OK_COUNT=$ok"
+            echo "FAIL_COUNT=$fail"
+            echo "OK=$([ "$fail" -eq 0 ] && echo 1 || echo 0)"
+        else
+            echo "完成: $ok 台成功 / $fail 台失败"
+        fi
+        [ "$fail" -eq 0 ]
+        return $?
+    fi
+
+    # ---- 单台模式：显式指定优先，否则沿用原来的自动挑选策略 ----
+    local serial="${OPEN_SERIAL:-}" out
+    if [ -z "$serial" ]; then
+        serial="$(settings_serial)"
+    else
+        if ! device_usable "$serial"; then
+            if is_kv; then
+                echo "RESULT=no_device"
+                echo "PAGE=$page"
+                echo "SERIAL=$serial"
+            else
+                echo "✗ 设备 $serial 当前不可用（不在线或未授权）"
+            fi
+            return 1
+        fi
+    fi
     if [ -z "$serial" ]; then
         if is_kv; then
             echo "RESULT=no_device"
@@ -950,17 +1094,14 @@ cmd_open() {
     esac
 
     # 把内部协议转成对外的 RESULT / TITLE token（值域见文件头「输出协议」）
-    local result title=""
-    case "$out" in
-        OK\ *)      result=opened;  title="${out#OK }" ;;
-        PARTIAL\ *) result=partial; title="${out#PARTIAL }" ;;
-        NEED_USB)   result=need_usb ;;
-        *)          result=failed ;;
-    esac
+    local result title
+    result=$(open_result_token "$out")
+    title=$(open_title_token "$out")
 
     if is_kv; then
         echo "RESULT=$result"
         echo "PAGE=$page"
+        echo "SERIAL=$serial"
         [ -n "$title" ] && echo "TITLE=$title"
         echo "WIFI_TOGGLE=$toggle"
         if [ "$result" = "failed" ] || [ "$result" = "need_usb" ]; then
@@ -996,7 +1137,93 @@ cmd_open() {
 # 不需要 USB：只要手机此前通过 USB 执行过 adb tcpip，adbd 就会常驻监听 TCP 端口，
 # 之后无论 USB 是否插着，都能直接 connect 恢复。
 # 恢复顺序：已有连接 → 记忆端点 → 扫描本网段
+# 恢复「一台指定设备」：只尝试这台设备记得的端点 / 该设备的 USB 通道，
+# 不会像批量逐设备扫描那样把整个 /24 网段扫一遍造成网络风暴。
+# 输出协议：RESULT / ENDPOINT / VIA / ERROR（与 cmd_recover 的 kv 字段一致）
+recover_one() {
+    local serial="$1" known eps ep via="" usb_only=1 out
+    # ① 该设备已在无线连接且响应正常
+    if [ "${serial#*:}" != "$serial" ] && tmo 5 "$ADB_BIN" -s "$serial" get-state >/dev/null 2>&1; then
+        echo "RESULT=already"
+        echo "ENDPOINT=$serial"
+        echo "VIA=existing"
+        return 0
+    fi
+    # ② 仅该设备记住的端点（记忆文件按端点记录，逐条校验后只认本设备的）
+    if [ -f "$KNOWN_FILE" ]; then
+        known=$(grep -F "$serial" "$KNOWN_FILE" 2>/dev/null)
+        for ep in $known; do
+            [ "$ep" = "$serial" ] || continue
+            if try_connect "$ep" >/dev/null 2>&1; then
+                echo "RESULT=recovered"; echo "ENDPOINT=$ep"; echo "VIA=known"
+                return 0
+            fi
+        done
+    fi
+    # ③ 通过该设备自身的 USB 通道切 TCP 模式（只针对这台，不抢用其他 USB 设备）
+    case "$serial" in
+        *:*) usb_only=0 ;;
+    esac
+    if [ "$usb_only" = "1" ] && [ "$AUTO_TCPIP" = "1" ]; then
+        ep=$(ensure_tcpip_for "$serial" 2>/dev/null)
+        if [ -n "$ep" ]; then
+            echo "RESULT=recovered"; echo "ENDPOINT=$ep"; echo "VIA=usb"
+            return 0
+        fi
+        echo "RESULT=failed"; echo "ERROR=tcpip_failed"
+        return 1
+    fi
+    echo "RESULT=failed"; echo "ERROR=no_usb"
+    return 1
+}
+
 cmd_recover() {
+    local only=""
+    parse_target_flags "$@"
+    only="$OPEN_SERIAL"
+
+    # ---- 批量模式：对当前所有已连接设备做一次「保活校验 / 重连」----
+    # 只校验已有端点 + 通过 USB 设备切 TCP，不做网段扫描（多设备同时扫会拖慢网络）
+    if [ "$OPEN_ALL" = "1" ]; then
+        local s i=0 ok=0 fail=0
+        is_kv || echo "正在校验并恢复所有设备的无线连接 ..."
+        for s in $(all_serial); do
+            i=$((i + 1))
+            local r; r=$(recover_one "$s")
+            local res; res=$(printf '%s\n' "$r" | sed -n 's/^RESULT=//p')
+            local ep;  ep=$(printf '%s\n' "$r"  | sed -n 's/^ENDPOINT=//p')
+            local via; via=$(printf '%s\n' "$r" | sed -n 's/^VIA=//p')
+            case "$res" in already|recovered) ok=$((ok + 1)) ;; *) fail=$((fail + 1)) ;; esac
+            if is_kv; then
+                echo "DEV_${i}_SERIAL=$s"
+                echo "DEV_${i}_RESULT=${res:-failed}"
+                [ -n "$ep" ]  && echo "DEV_${i}_ENDPOINT=$ep"
+                [ -n "$via" ] && echo "DEV_${i}_VIA=$via"
+            else
+                case "$res" in
+                    already)   echo "  ✓ $s 已在线" ;;
+                    recovered) echo "  ✓ $s 已恢复 $ep" ;;
+                    *)         echo "  ✗ $s 恢复失败" ;;
+                esac
+            fi
+        done
+        if is_kv; then
+            echo "DONE_COUNT=$i"; echo "OK_COUNT=$ok"; echo "FAIL_COUNT=$fail"
+            echo "OK=$([ "$fail" -eq 0 ] && echo 1 || echo 0)"
+        fi
+        [ "$fail" -eq 0 ]
+        return $?
+    fi
+
+    # ---- 单台模式 ----
+    if [ -n "$only" ]; then
+        is_kv || echo "正在恢复设备 $only 的无线连接 ..."
+        local r; r=$(recover_one "$only")
+        if is_kv; then printf '%s\n' "$r"; fi
+        printf '%s\n' "$r" | grep -q '^RESULT=\(already\|recovered\)$'
+        return $?
+    fi
+
     local r ep="" via="" result="" err=""
     is_kv || echo "正在恢复无线连接 ..."
     r=$(recover_connection 2>/dev/null)
@@ -1057,7 +1284,6 @@ cmd_recover() {
     echo "  3) 手机改回 USB 模式了 → 插 USB 后会自动切换"
     return 1
 }
-
 # ------------------------------------------------- 流量监控
 # 统计本机与手机 adb 端口之间的实时传输速率。
 #
@@ -1566,6 +1792,69 @@ cmd_diag() {
     echo "MDNS_OK=$([ "${raw_mdns:-0}" -gt 0 ] && echo 1 || echo 0)"
 }
 
+# ------------------------------------------------- 设备清单（多设备入口）
+# 供 App / TUI 建立「每台设备各自的入口」。只做一次 adb devices -l，
+# 并尽量补上 Wi-Fi IP，不逐台拉取重型信息（保持菜单打开速度）。
+cmd_devices() {
+    local raw line id state rest model transport ip n=0
+
+    # 关键：用 heredoc（<<<）而不是 `adb ... | while`。
+    # 管道会为 while 开子 shell，循环里的计数与 local 都在子 shell 内失效，
+    # 早先的实现因此只输出第一台设备。
+    raw=$("$ADB_BIN" devices -l 2>/dev/null | tr -d '\r')
+
+    if is_kv; then
+        while IFS= read -r -u 3 line; do
+            [ -z "$line" ] && continue
+            id=${line%%[[:space:]]*}
+            case "$id" in ''|List|*"*"*) continue ;; esac   # 跳过表头与 "* daemon ..."
+            rest="${line#"$id"}"
+            rest="${rest#"${rest%%[![:space:]]*}"}"            # 去掉前导空白
+            state=${rest%%[[:space:]]*}
+            [ "$state" = "$rest" ] && rest=""
+            rest="${rest#"$state"}"
+            case "$state" in
+                device|offline|unauthorized) ;;
+                *) continue ;;
+            esac
+            n=$((n + 1))
+            model=$(printf '%s' "$rest" | sed -n 's/.*model:\([^ ]*\).*/\1/p' | tr '_' ' ')
+            case "$id" in
+                *:*) transport=wifi ;;
+                *)   transport=usb ;;
+            esac
+            echo "DEV_${n}_SERIAL=$id"
+            echo "DEV_${n}_STATE=$state"
+            echo "DEV_${n}_TRANSPORT=$transport"
+            [ -n "$model" ] && echo "DEV_${n}_MODEL=$model"
+        done 3<<< "$raw"
+        echo "DEV_COUNT=$n"
+        return 0
+    fi
+
+    printf '%-24s %-12s %-9s %s\n' "SERIAL" "STATE" "TRANSPORT" "MODEL / IP"
+    # 注意这里必须用 -u 3 + 3<&0：循环体内会调用 adb（device_wifi_ip），
+    # 子进程会继承并消耗 heredoc 的 stdin，导致第二台设备读不到。
+    while IFS= read -r -u 3 line; do
+        [ -z "$line" ] && continue
+        id=${line%%[[:space:]]*}
+        case "$id" in ''|List|*"*"*) continue ;; esac
+        rest="${line#"$id"}"
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        state=${rest%%[[:space:]]*}
+        [ "$state" = "$rest" ] && rest=""
+        rest="${rest#"$state"}"
+        model=$(printf '%s' "$rest" | sed -n 's/.*model:\([^ ]*\).*/\1/p' | tr '_' ' ')
+        case "$id" in
+            *:*) transport=wifi ;;
+            *)   transport=usb ;;
+        esac
+        ip=$(device_wifi_ip "$id" 2>/dev/null | tr -d '\r')
+        printf '%-24s %-12s %-9s %s\n' "$id" "$state" "$transport" "${model:-?}${ip:+ ($ip)}"
+    done 3<<< "$raw"
+    return 0
+}
+
 case "${1:-}" in
     start)   cmd_start ;;
     stop)    cmd_stop ;;
@@ -1586,8 +1875,9 @@ case "${1:-}" in
     once)    cmd_once ;;
     diag)    cmd_diag ;;
     netinfo) net_info_collect ;;
-    open)    cmd_open "${2:-wireless}" ;;
-    recover) cmd_recover ;;
+    open)    shift; cmd_open "$@" ;;
+    recover) shift; cmd_recover "$@" ;;
+    devices) cmd_devices ;;
     rate)    cmd_rate "${2:-1}" ;;
     _daemon) main_loop ;;
     *)
@@ -1600,11 +1890,15 @@ adb-wifi-manager —— Android 无线调试自动连接守护
   adb-wifi.sh status          查看状态与在线设备
   adb-wifi.sh log             实时查看日志
   adb-wifi.sh once            前台执行一轮发现（排查用）
-  adb-wifi.sh open [wireless|dev]
+  adb-wifi.sh open [wireless|dev] [--serial <S>] [--all]
                               在手机上直接打开「无线调试」页面（默认）
                               或「开发者选项」页面，省去手动点菜单
-  adb-wifi.sh recover         主动恢复无线连接（无需 USB）
+                              --serial 指定某台设备；--all 对所有设备逐台打开
+  adb-wifi.sh recover [--serial <S>] [--all]
+                              主动恢复无线连接（无需 USB）
                               依次尝试：已有连接 → 记忆端点 → 扫描本网段
+                              --serial 只恢复某台（不扫描网段）；--all 逐台校验
+  adb-wifi.sh devices         列出当前设备（序列号 / 状态 / 通道 / 型号）
   adb-wifi.sh rate [间隔秒]   查看当前 adb 传输速率（默认采样 1 秒）
 USAGE
         ;;

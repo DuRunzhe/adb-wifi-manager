@@ -334,7 +334,10 @@ Mac  链路 22 MB/s（-55 dBm）· 信道 40 · 电量 100%（已充满）
 | `./bin/adb-wifi.sh once` | 前台跑一轮发现，用于排查问题 |
 | `./bin/adb-wifi.sh open` | 在手机上直接打开「无线调试」页面 |
 | `./bin/adb-wifi.sh open dev` | 在手机上打开「开发者选项」页面 |
+| `./bin/adb-wifi.sh open dev --all` | 在**所有**已连接设备上打开该页面（`--serial S` 指定单台） |
 | `./bin/adb-wifi.sh recover` | 主动恢复无线连接（**无需 USB**） |
+| `./bin/adb-wifi.sh recover --all` | 逐台校验 / 恢复所有已连接设备 |
+| `./bin/adb-wifi.sh devices` | 列出设备（序列号 / 状态 / 通道 / 型号） |
 | `./bin/adb-wifi.sh rate [秒]` | 查看当前 adb 传输速率（默认采样 1 秒） |
 
 日志位置：`~/Library/Application Support/adb-wifi-manager/logs/adb-wifi.log`
@@ -425,27 +428,45 @@ Android 11+ 的「无线调试」端口是**每次随机分配**的，因此脚�
 
 展开菜单会**实时重新采集**状态（约 0.16 秒），与 TUI 使用**同一份 `diag` 数据源**，因此两边结论一致：
 
+菜单按三块组织：**状态 + 设备** / **操作** / **更多信息**。
+
 ```
 ● 守护运行中（开机自启）
-  没有无线设备连接
+已连接 无线 2 台 + USB 1 台        # 状态区：正常时不报喜，只陈述事实
+USB 已可拔线                        #         需要你动手时才出现这行
+  ✓ Pixel 7 · 无线 ▸
+          延迟 39.6 ms（一般 20–50 ms）
+          信号 -49 dBm（优秀 >-60 dBm）
+          吞吐 上限 32 MB/s · 平均 1.3 MB/s · 最大 3.4 MB/s（一般 10–30%）
+          AP PiLink · 信道 149 · 5745 MHz
+          手机电量 68%
+      ──
+      复制设备地址 / 重连这台设备 / 无线调试 / 开发者选项
+  ✓ K30 · USB ▸
+          USB 直连（不经过 Wi-Fi）
+          手机电量 81%（充电中）
+      ──
+      重连这台设备 / 无线调试 / 开发者选项
+  全部设备（2 台） ▸ 逐台重连
 ──
-  [✗] 未发现设备，且此网络屏蔽 mDNS
-        插 USB 自动读端口 / 手动输入 IP:端口
-  ▸ 处理：插上 USB 自动读取端口
+  停止守护服务                                         ⌘R 单设备时为「重连」
+  查看日志…                                            ⌘L
+  打开终端 TUI…                                        ⌘U
+  更多信息 ▸            # 发现方式 / TCP 模式 / 本机 IP / 累计流量 / adb devices
 ──
-  mDNS：被屏蔽
-  USB：未连接
-  发现方式：无
-  本机：192.168.1.100
-  ↓ 1.4 MB/s   ↑ 0 KB/s
-──
-  网络链路 ▸              # 展开后按设备列出 RTT / 信号 / 链路 / 上限 / AP / 电量
-  打开 adb devices
-  在手机上打开「无线调试」…   ⌘W
-  查看日志…                  ⌘L
-  打开终端 TUI…              ⌘U
   设置 ▸  关于 ADB WiFi  退出菜单栏
 ```
+
+设计要点：
+
+- **状态区不报喜**：一切正常时只写「已连接 无线 2 台 + USB 1 台」，
+  不再显示「连接正常」这类同义反复；只有需要用户行动时才多一行（如「USB 已可拔线」）
+- **设备操作只有一级**：每台设备展开即见「重连 / 无线调试 / 开发者选项」，不再套二级菜单
+- **设备状态跟设备走**：延迟、信号、吞吐、AP、电量直接显示在该设备子菜单顶部，
+  不用再去别处找
+- **多设备隔离**：每台设备的「重连这台设备」只作用于它自己（不扫描网段），
+  批量操作收敛到「全部设备 → 逐台重连」
+- **诊断行只在异常时出现**：`DIAG_LEVEL` 为 `ok` 时隐藏，出问题时才展示结论与修复动作
 
 诊断结论由脚本层 `DIAG_LEVEL / DIAG_CODE / DIAG_TITLE / DIAG_HINT / DIAG_ACTION` 统一给出，
 避免菜单栏与 TUI 各自判断导致信息不一致。点击「▸ 处理」可直接执行对应修复动作。
@@ -461,17 +482,21 @@ Android 11+ 的「无线调试」端口是**每次随机分配**的，因此脚�
 无线 adb 慢的时候，仅看「传输速率」无法判断慢在哪里。菜单栏的 **网络链路** 子菜单和
 TUI 的 **链路质量** 区展示同一组归因指标（两处字段、顺序、单位完全一致，数据同源）：
 
-| 指标 | 含义 | 正常区间 | 采集方式 |
-|---|---|---|---|
-| 延迟 RTT | Mac → 手机的往返时延 | <20ms 正常 / 20–50 偏高 / >50 过高 | `ping` |
-| 信号 | 手机侧 RSSI | >-60 优秀 / -60~-70 良好 / <-70 偏弱 | `dumpsys wifi` |
-| 链路速率 | 手机 Wi-Fi 协商速率 | — | `dumpsys wifi`（Link speed） |
-| 实测 平均 / 峰值 | 有传输时的平均与峰值吞吐 | 对照上限看差距 | `netstat` 字节计数滑动窗口 |
-| 上限 | 理论 TCP 上限，取 `链路速率 × 60%` | — | 由链路速率推算 |
-| AP / 信道 / 频率 | 手机接入的 SSID、信道、频率 | — | `dumpsys wifi` |
-| 电量 | 手机 / Mac 电量与充电状态 | 低于 15% 会限速 | `dumpsys battery` / `pmset` |
+| 指标 | 单位 | 含义与算法 | 评级标准 | 采集方式 |
+|---|---|---|---|---|
+| 延迟 RTT | ms | Mac 对手机 IP 执行 `ping -c 3`，取平均往返 | <20 优秀 / 20–50 一般 / >50 较差 | `ping` |
+| 信号 | dBm | 手机侧接收信号强度 RSSI | >-50 极佳 / -50~-60 优秀 / -60~-70 良好 / -70~-80 偏弱 / <-80 很差 | `dumpsys wifi` |
+| 吞吐 · 上限 | MB/s | 协商速率 × 60%（半双工 + 协议开销，理论天花板） | — | 由链路速率推算 |
+| 吞吐 · 平均 | MB/s | 最近 10 分钟**有流量**的采样均值（低于 0.1 显示 `<0.1`） | 与最大值合看 | `netstat` 滑动窗口 |
+| 吞吐 · 最大 | MB/s | 同期峰值，决定大文件 push/pull 耗时 | 达上限 ≥30% 良好 / 10–30% 一般 / <10% 偏低 | `netstat` 滑动窗口 |
+| AP / 信道 / 频率 | — / — / MHz | 手机接入的 SSID、信道、频率 | BSSID 与 Mac 一致为佳 | `dumpsys wifi` |
+| 电量 | % | 手机 / Mac 电量与充电状态 | 低于 15% 会限速 | `dumpsys battery` / `pmset` |
 
-速率统一用**字节基准（MB/s）**，与主菜单的 `↓/↑` 传输速率同一口径。
+速率统一用**字节基准（MB/s）**，与主菜单的 `↓/↑` 传输速率同一口径；
+协商速率保留原值 **Mbps**（`433 Mbps ≈ 54 MB/s 理论上限`），避免把理论峰值误读成实际速度。
+
+**为什么吞吐评级看比例而不是绝对速度**：433 / 866 / 1200 Mbps 三种 Wi-Fi 制式对应
+32 / 64 / 90 MB/s 的上限，只有「最大值 ÷ 上限」才能跨设备横向比较。
 
 判读要点：
 
@@ -507,14 +532,31 @@ VIA=known
 
 | 命令 | 字段 | 取值 |
 |---|---|---|
-| `recover` | `RESULT` | `already` / `recovered` / `failed` |
+| `devices` | `DEV_COUNT` | 设备数；每台一组 `DEV_<n>_*` |
+| | `DEV_<n>_SERIAL` / `_TRANSPORT` | `IP:PORT` 或 USB 序列号；`wifi` / `usb` |
+| | `DEV_<n>_STATE` | `device` / `offline` / `unauthorized` |
+| | `DEV_<n>_MODEL` | 机型（空格替换为 `_` 后还原） |
+| `recover [--serial S] [--all]` | `RESULT` | `already` / `recovered` / `failed` |
 | | `ENDPOINT` | `IP:PORT`（成功时） |
 | | `VIA` | `existing` / `known` / `scan` / `usb` |
 | | `ERROR` | `no_usb` / `tcpip_failed`（仅失败时） |
-| `open <page>` | `RESULT` | `opened` / `partial` / `need_usb` / `no_device` / `failed` |
+| `open <page> [--serial S] [--all]` | `RESULT` | `opened` / `partial` / `need_usb` / `no_device` / `failed` |
 | | `PAGE` | 请求的页面：`wireless` / `dev` |
+| | `SERIAL` | 实际操作的设备（`--serial` 时原样返回） |
 | | `TITLE` | 实际落到的页面：`wireless` / `dev` |
 | | `WIFI_TOGGLE` | `on` / `off` / `unknown` |
+
+**批量模式**（`--all`）下 `recover` / `open` 改为逐设备输出，不再有顶层 `RESULT`：
+
+| 字段 | 取值 |
+|---|---|
+| `DEV_<n>_SERIAL` | 该台设备的序列号 / 端点 |
+| `DEV_<n>_RESULT` | 同单台的 `RESULT` 值域（`recover` 额外带 `DEV_<n>_ENDPOINT` / `_VIA`） |
+| `DONE_COUNT` / `OK_COUNT` / `FAIL_COUNT` | 处理总数 / 成功数 / 失败数 |
+| `OK` | `1` / `0`（全成功才为 1） |
+
+单设备模式（不带 `--all`）语义与旧版完全一致，`--serial` 只是把"自动挑一台"
+换成"指定这台"；批量 `recover` **不做整段网段扫描**，避免多设备时引发网络风暴。
 | `diag` | `DIAG_CODE` | 见下表（始终输出，不受 `ADBWIFI_FORMAT` 影响） |
 | `netinfo` | `NET_DEV_COUNT` | 设备数；每台一组 `NET_DEV_<n>_*` |
 | | `NET_DEV_<n>_SERIAL` / `_TRANSPORT` | `IP:PORT` 或 USB 序列号；`wifi` / `usb` |

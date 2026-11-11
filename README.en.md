@@ -331,7 +331,10 @@ After that the endpoint is remembered and automatic reconnection takes over.
 | `./bin/adb-wifi.sh once` | Run one discovery round in the foreground (for troubleshooting) |
 | `./bin/adb-wifi.sh open` | Open the **Wireless debugging** page on the phone |
 | `./bin/adb-wifi.sh open dev` | Open the **Developer options** page on the phone |
+| `./bin/adb-wifi.sh open dev --all` | Open that page on **every** connected device |
 | `./bin/adb-wifi.sh recover` | Actively restore the wireless connection (**no USB needed**) |
+| `./bin/adb-wifi.sh recover --all` | Check / restore every connected device in turn |
+| `./bin/adb-wifi.sh devices` | List devices (serial / state / transport / model) |
 | `./bin/adb-wifi.sh rate [secs]` | Show current adb transfer rate (default 1 s sample) |
 
 Log location: `~/Library/Application Support/adb-wifi-manager/logs/adb-wifi.log`
@@ -421,27 +424,47 @@ appears in Finder, Launchpad, `⌘Tab`, and system dialogs.
 Opening the menu **re-samples the state in real time** (~0.2 s), using the **same `diag`
 data source** as the TUI, so both always agree:
 
+The menu is organized in three blocks: **status + devices** / **actions** / **more info**.
+
 ```
 ● Daemon running (auto-start)
-  ✓ 192.168.1.50:5555
+Connected: 2 Wi-Fi + 1 USB          # status area: states facts, never celebrates
+USB cable can be unplugged           #          appears only when you should act
+  ✓ Pixel 7 · Wi-Fi ▸
+          Latency 39.6 ms (fair 20–50 ms)
+          Signal -49 dBm (good >-60 dBm)
+          Throughput ceiling 32 MB/s · avg 1.3 MB/s · peak 3.4 MB/s (fair 10–30%)
+          AP PiLink · channel 149 · 5745 MHz
+          Phone battery 68%
+      ──
+      Copy address / Reconnect this device / Wireless debugging / Developer options
+  ✓ K30 · USB ▸
+          Direct USB (not over Wi-Fi)
+          Phone battery 81% (charging)
+      ──
+      Reconnect this device / Wireless debugging / Developer options
+  All devices (2) ▸ Reconnect each device
 ──
-  [✓] Device connected (wireless port 5555)
-        USB unplugged; wireless connection holds independently
+  Stop daemon                                          ⌘R (reconnect when single device)
+  View log…                                            ⌘L
+  Open Terminal TUI…                                   ⌘U
+  More info ▸             # discovery / TCP mode / host IP / totals / adb devices
 ──
-  mDNS: blocked
-  USB: not connected
-  TCP mode: enabled (port 5555)
-  Discovery: endpoint memory
-  Host: 192.168.1.100
-  ↓ 1.4 MB/s   ↑ 0 KB/s
-──
-  Network Link ▸          # expands into per-device RTT / signal / link / ceiling / AP / battery
-  Open adb devices
-  Open "Wireless debugging" on phone…             ⌘W
-  View log…                                        ⌘L
-  Open Terminal TUI…                               ⌘U
   Settings ▸   About ADB WiFi   Quit menu bar
 ```
+
+Design rules:
+
+- **The status area never celebrates**: when everything is fine it just says
+  `Connected: 2 Wi-Fi + 1 USB` instead of a tautological "connection normal"; an extra line
+  appears only when action is warranted (e.g. "USB cable can be unplugged")
+- **One level of device actions**: expanding a device shows reconnect / wireless debugging /
+  developer options directly, with no nested submenu
+- **Device state follows the device**: latency, signal, throughput, AP and battery sit at the
+  top of that device's submenu
+- **Multi-device isolation**: "Reconnect this device" only touches that device (no LAN scan);
+  bulk work is confined to "All devices → Reconnect each device"
+- **The diagnosis line only appears on problems**: hidden while `DIAG_LEVEL` is `ok`
 
 Diagnosis is produced centrally by `DIAG_LEVEL / DIAG_CODE / DIAG_TITLE / DIAG_HINT / DIAG_ACTION`
 in the script, so the menu bar and TUI never diverge. `DIAG_CODE` is a machine-readable
@@ -460,17 +483,23 @@ When wireless adb is slow, the transfer rate alone does not tell you where the t
 The menu bar's **Network Link** submenu and the TUI's **Network link** block show the same
 set of metrics (same fields, order and units, same data source):
 
-| Metric | Meaning | Normal range | Source |
-|---|---|---|---|
-| Latency (RTT) | Mac → phone round trip | <20ms good / 20–50 high / >50 very high | `ping` |
-| Signal | Phone-side RSSI | >-60 great / -60~-70 good / <-70 weak | `dumpsys wifi` |
-| Link rate | Negotiated Wi-Fi rate | — | `dumpsys wifi` (Link speed) |
-| Actual avg / peak | Throughput while transferring | compare against ceiling | sliding window over `netstat` byte counters |
-| Ceiling | Theoretical TCP ceiling = link rate × 60% | — | derived |
-| AP / channel / frequency | SSID, channel and frequency the phone is on | — | `dumpsys wifi` |
-| Battery | Phone / Mac battery and charging state | below 15% throttles | `dumpsys battery` / `pmset` |
+| Metric | Unit | Meaning and method | Grade | Source |
+|---|---|---|---|---|
+| Latency (RTT) | ms | `ping -c 3` from Mac to the phone IP, average round trip | <20 good / 20–50 fair / >50 poor | `ping` |
+| Signal | dBm | Phone-side RSSI | >-50 excellent / -50~-60 good / -60~-70 ok / -70~-80 weak / <-80 very weak | `dumpsys wifi` |
+| Throughput · ceiling | MB/s | Negotiated rate × 60% (half-duplex + overhead) | — | derived |
+| Throughput · avg | MB/s | Mean of samples **with traffic** over the last 10 minutes (`<0.1` when negligible) | read with peak | `netstat` sliding window |
+| Throughput · peak | MB/s | Highest sample in the window; drives large push/pull times | ≥30% of ceiling good / 10–30% fair / <10% low | `netstat` sliding window |
+| AP / channel / frequency | — / — / MHz | SSID, channel and frequency the phone is on | matching BSSID is best | `dumpsys wifi` |
+| Battery | % | Phone / Mac battery and charging state | below 15% throttles | `dumpsys battery` / `pmset` |
 
-All rates use **byte units (MB/s)**, matching the `↓/↑` transfer rate in the main menu.
+All rates use **byte units (MB/s)**, matching the `↓/↑` transfer rate in the main menu;
+the negotiated rate keeps its raw **Mbps** value (`433 Mbps ≈ 54 MB/s theoretical max`) so a
+theoretical peak is never mistaken for achievable speed.
+
+**Why throughput is graded by ratio, not absolute speed**: 433 / 866 / 1200 Mbps Wi-Fi
+generations map to 32 / 64 / 90 MB/s ceilings, so only "peak ÷ ceiling" is comparable
+across devices.
 
 How to read it:
 
@@ -511,14 +540,32 @@ VIA=known
 
 | Command | Field | Values |
 |---|---|---|
-| `recover` | `RESULT` | `already` / `recovered` / `failed` |
+| `devices` | `DEV_COUNT` | Device count; one `DEV_<n>_*` group per device |
+| | `DEV_<n>_SERIAL` / `_TRANSPORT` | `IP:PORT` or USB serial; `wifi` / `usb` |
+| | `DEV_<n>_STATE` | `device` / `offline` / `unauthorized` |
+| | `DEV_<n>_MODEL` | Phone model (`_` turned back into spaces) |
+| `recover [--serial S] [--all]` | `RESULT` | `already` / `recovered` / `failed` |
 | | `ENDPOINT` | `IP:PORT` (on success) |
 | | `VIA` | `existing` / `known` / `scan` / `usb` |
 | | `ERROR` | `no_usb` / `tcpip_failed` (failures only) |
-| `open <page>` | `RESULT` | `opened` / `partial` / `need_usb` / `no_device` / `failed` |
+| `open <page> [--serial S] [--all]` | `RESULT` | `opened` / `partial` / `need_usb` / `no_device` / `failed` |
 | | `PAGE` | Requested page: `wireless` / `dev` |
+| | `SERIAL` | Device actually used (echoed back with `--serial`) |
 | | `TITLE` | Page actually reached: `wireless` / `dev` |
 | | `WIFI_TOGGLE` | `on` / `off` / `unknown` |
+
+In **batch mode** (`--all`) `recover` / `open` emit per-device rows and no top-level `RESULT`:
+
+| Field | Values |
+|---|---|
+| `DEV_<n>_SERIAL` | Serial / endpoint of that device |
+| `DEV_<n>_RESULT` | Same value set as the single-device `RESULT` (`recover` adds `DEV_<n>_ENDPOINT` / `_VIA`) |
+| `DONE_COUNT` / `OK_COUNT` / `FAIL_COUNT` | Processed / succeeded / failed |
+| `OK` | `1` / `0` (`1` only when nothing failed) |
+
+Single-device mode (no `--all`) behaves exactly as before; `--serial` merely replaces
+"pick one automatically" with "use this one". Batch `recover` **never scans the /24 LAN**,
+so many devices cannot trigger a network storm.
 | `diag` | `DIAG_CODE` | See below (always emitted, regardless of `ADBWIFI_FORMAT`) |
 | `netinfo` | `NET_DEV_COUNT` | Device count; one `NET_DEV_<n>_*` group per device |
 | | `NET_DEV_<n>_SERIAL` / `_TRANSPORT` | `IP:PORT` or USB serial; `wifi` / `usb` |

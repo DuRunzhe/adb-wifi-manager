@@ -143,12 +143,34 @@ struct DevLink {
     var isWifi: Bool { transport == "wifi" }
 }
 
+/// 单台「当前在线设备」，来自脚本 `devices` 子命令的 DEV_<n>_* 字段。
+/// 与 DevLink（链路质量）分开：这里只关心"能对哪台设备下指令"，
+/// 不做任何耗时采集，保证菜单打开速度。
+struct DevEntry {
+    var serial = "", state = "", transport = "", model = ""
+    var isWifi: Bool { transport == "wifi" }
+    var isUsb: Bool { transport == "usb" }
+    /// 可作为"在手机上打开设置页"的对象：只有在线设备才行
+    var usable: Bool { state == "device" }
+    var displayName: String { model.isEmpty ? serial : "\(model)" }
+    var stateText: String {
+        switch state {
+        case "device": return ""
+        case "unauthorized": return "unauthorized"
+        case "offline": return "offline"
+        default: return state
+        }
+    }
+}
+
 struct Status {
     var running = false
     var pid = ""
     var mode = ""              // launchd / manual / stopped
     var endpoints: [String] = []
     var allDevices: [(String, String)] = []
+    /// 由脚本 `devices` 子命令填充；与 allDevices 同源但带通道/状态标记
+    var devEntries: [DevEntry] = []
     var hasUSB = false
     var usbFound: [String] = []
     var mdnsOK = false
@@ -298,7 +320,29 @@ func loadStatus() -> Status {
         let parts = item.split(separator: "|", maxSplits: 1).map(String.init)
         if parts.count == 2 { s.allDevices.append((parts[0], parts[1])) }
     }
+    s.devEntries = loadDevices()
     return s
+}
+
+/// 当前在线设备清单（脚本 `devices` 子命令）。
+/// 失败时退回 `diag` 里已有的 ALL_DEVICES，保证旧脚本也能列出设备。
+func loadDevices() -> [DevEntry] {
+    // 必须显式带 kv：不加时脚本走 text 模式，输出的是对齐过的中文表格，
+    // parseKV 解析不到 DEV_n_* 字段（曾导致多设备只显示一台）。
+    let kv = parseKV(runScript(["devices"], timeout: 15, env: KV_ENV).out)
+    let n = Int(kv["DEV_COUNT"] ?? "0") ?? 0
+    var list: [DevEntry] = []
+    if n > 0 {
+        for i in 1...n {
+            var d = DevEntry()
+            d.serial = kv["DEV_\(i)_SERIAL"] ?? ""
+            d.state = kv["DEV_\(i)_STATE"] ?? ""
+            d.transport = kv["DEV_\(i)_TRANSPORT"] ?? ""
+            d.model = kv["DEV_\(i)_MODEL"] ?? ""
+            if !d.serial.isEmpty { list.append(d) }
+        }
+    }
+    return list
 }
 
 // MARK: - App
@@ -352,6 +396,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     var busy = false
+    /// 「立即开启 TCP 模式」待处理的 USB 序列号（菜单重建时写入，动作触发时读取）
+    var pendingTcpipSerials: [String] = []
     var lastLoadedAt = Date.distantPast
 
     var refreshing = false
@@ -437,114 +483,192 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return it
     }
 
-    /// 链路质量指标：每台设备一份（RTT / 信号 / 链路速率 / AP / 频率 / 电量），
-    /// Max 侧（信道 / 速率 / 信号 / 电量）全局一份。
-    /// 收到子菜单里，避免多设备时把主菜单撑爆。
-    /// 每一项都带“正常区间”提示，tooltip 解释其与传输速度的关系。
-    func addLinkQualityItems(to menu: NSMenu, s: Status) {
-        guard !s.devLinks.isEmpty || !s.macRate.isEmpty else { return }
+    /// 设备区：每台在线设备一个子菜单（复制地址 / 重连本机 / 打开手机设置页）。
+    /// 只有一台时直接平铺，不增加点击层级；多台时逐台成项，避免"点谁都一样"。
+    /// 菜单底部再放一个「全部设备」子菜单承载批量动作。
+    func addDeviceItems(to menu: NSMenu, s: Status) {
+        for d in s.devEntries {
+            let mark = d.usable ? "✓" : (d.state == "unauthorized" ? "!" : "✗")
+            var head = "  \(mark) \(d.displayName)"
+            var notes: [String] = []
+            notes.append(d.isWifi ? L.t("dev.tag.wifi") : L.t("dev.tag.usb"))
+            if d.state == "unauthorized" { notes.append(L.t("dev.state.unauthorized")) }
+            else if d.state == "offline" { notes.append(L.t("dev.state.offline")) }
+            head += " · " + notes.joined(separator: " · ")
 
-        menu.addItem(.separator())
-        let header = NSMenuItem(title: L.t("net.menu"), action: nil, keyEquivalent: "")
-        header.image = NSImage(systemSymbolName: "wifi", accessibilityDescription: nil)
-        let sub = NSMenu()
+            // 单设备：保持旧的扁平结构，不额外增加层级
+            if s.devEntries.count <= 1 {
+                menu.addItem(disabledItem(head, tooltip: d.serial))
+                if d.isWifi { menu.addItem(copyItem(d, indent: "    ")) }
+                for it in deviceActionItems(d, indent: "    ") { menu.addItem(it) }
+                continue
+            }
 
-        // 全局实测吞吐（adb server 侧统计，多设备共用）
-        if !s.rateDownHuman.isEmpty {
-            sub.addItem(disabledItem(
-                L.t("net.actual.line", s.rateDownHuman, s.rateUpHuman),
-                tooltip: L.t("net.actual.tip")))
-            sub.addItem(.separator())
+            // 多设备：每台一个子菜单，但所有操作**只有一级**
+            // （不再嵌套「在手机上打开设置…」这种二级菜单）
+            let item = NSMenuItem(title: head, action: nil, keyEquivalent: "")
+            item.toolTip = d.serial
+            item.image = NSImage(systemSymbolName: d.isWifi ? "wifi" : "cable.connector",
+                                 accessibilityDescription: nil)
+            let sub = NSMenu()
+
+            // ① 该设备的状态（延迟 / 信号 / 链路 / 电量），只读，放最上面
+            for line in deviceStatusLines(d, s: s) {
+                sub.addItem(disabledItem(line.text, tooltip: line.tip))
+            }
+            // ② 该设备的操作，平铺在一级
+            let acts = deviceActionItems(d, indent: "")
+            if !acts.isEmpty {
+                if !sub.items.isEmpty { sub.addItem(.separator()) }
+                for it in acts { sub.addItem(it) }
+            }
+            item.submenu = sub
+            menu.addItem(item)
         }
+        addAllDevicesItems(to: menu, s: s)
+    }
 
-        for (idx, d) in s.devLinks.enumerated() {
-            if idx > 0 { sub.addItem(.separator()) }
+    /// 单台设备可执行的动作（平铺，不嵌套子菜单）
+    func deviceActionItems(_ d: DevEntry, indent: String) -> [NSMenuItem] {
+        var out: [NSMenuItem] = []
+        if d.isWifi { out.append(copyItem(d, indent: indent)) }
 
-            // 设备标题：地址 · 机型（USB 设备加标注）
-            let name = d.model.isEmpty ? d.serial : "\(d.serial) · \(d.model)"
-            sub.addItem(disabledItem(L.t("net.dev.header", name),
-                                     tooltip: d.isWifi ? nil : L.t("net.dev.usb")))
+        let reconnect = NSMenuItem(title: indent + L.t("dev.reconnect"),
+                                   action: #selector(reconnectDevice(_:)), keyEquivalent: "")
+        reconnect.target = self
+        reconnect.representedObject = d.serial
+        reconnect.isEnabled = d.usable
+        reconnect.toolTip = d.usable ? L.t("dev.reconnect.tip") : L.t("dev.phone.tip.unusable")
+        out.append(reconnect)
 
-            if d.isWifi {
-                if let rtt = Double(d.rttAvg) {
-                    let grade = rtt < 20 ? L.t("net.rtt.good")
-                        : (rtt < 50 ? L.t("net.rtt.fair") : L.t("net.rtt.poor"))
-                    var tip = L.t("net.rtt.tip")
-                    if !d.rttMin.isEmpty && !d.rttMax.isEmpty {
-                        tip += "\n" + L.t("net.rtt.range", d.rttMin, d.rttMax)
+        let entries: [(String, Selector)] = [
+            ("dev.phone.wireless", #selector(openWirelessForDevice(_:))),
+            ("dev.phone.dev", #selector(openDevForDevice(_:))),
+        ]
+        for (key, sel) in entries {
+            let it = NSMenuItem(title: indent + L.t(key), action: sel, keyEquivalent: "")
+            it.target = self
+            it.representedObject = d.serial
+            it.isEnabled = d.usable
+            it.toolTip = d.usable ? L.t("menu.phone.tip.connected")
+                                  : L.t("dev.phone.tip.unusable")
+            out.append(it)
+        }
+        return out
+    }
+
+    /// 单台设备的状态行：每个指标都带单位、分级和 tooltip 释义。
+    ///
+    /// 数值来源（见 bin/adb-wifi.sh 的 net_dev_collect）：
+    ///   RTT   = Mac 对手机 IP 做 `ping -c 3` 的往返时延
+    ///   RSSI  = 手机 `dumpsys wifi` 上报的信号强度（dBm）
+    ///   Link  = 手机上报的 Wi-Fi 协商速率（Mbps，理论值，非实测吞吐）
+    ///   实测  = adb server 侧统计的传输速率（最近 10 分钟有流量时的平均/峰值）
+    func deviceStatusLines(_ d: DevEntry, s: Status) -> [(text: String, tip: String?)] {
+        guard let link = s.devLinks.first(where: { $0.serial == d.serial }) else { return [] }
+        var out: [(text: String, tip: String?)] = []
+
+        if link.isWifi {
+            // ---- RTT ----
+            if let rtt = Double(link.rttAvg) {
+                let grade = rtt < 20 ? L.t("net.rtt.good")
+                    : (rtt < 50 ? L.t("net.rtt.fair") : L.t("net.rtt.poor"))
+                var tip = L.t("net.rtt.tip")
+                if !link.rttMin.isEmpty && !link.rttMax.isEmpty {
+                    tip += "\n\n" + L.t("net.rtt.range", link.rttMin, link.rttMax)
+                }
+                out.append(("    " + L.t("net.rtt.line", String(format: "%.1f", rtt), grade), tip))
+            }
+            // ---- 信号 ----
+            if let rssi = Double(link.rssi) {
+                let grade = rssi > -60 ? L.t("net.signal.strong")
+                    : (rssi > -70 ? L.t("net.signal.ok") : L.t("net.signal.weak"))
+                var tip = L.t("net.signal.tip")
+                if !s.macRSSI.isEmpty { tip += "\n\n" + L.t("net.signal.mac", s.macRSSI) }
+                out.append(("    " + L.t("net.signal.line", link.rssi, grade), tip))
+            }
+            // ---- adb 吞吐量（用户最关心：现在能跑多快，以及跑得好不好）----
+            // 三个数一起看：
+            //   上限 = 协商速率 × 60%，这台设备理论上能达到的 adb 速度天花板
+            //   平均 = 最近 10 分钟「有流量时」的平均，代表日常典型速度
+            //   最大 = 同期峰值，决定大文件 push/pull 的耗时
+            // 评级按「实测峰值 ÷ 上限」的实际利用率来算，而不是看绝对速度：
+            // 不同 Wi-Fi 制式（433 / 866 / 1200 Mbps）对应一个 32 / 64 / 90 MB/s 的上限，
+            // 只有利用率才能跨设备横向比较。
+            if let mbps = Double(link.linkMbps) {
+                let capText = linkRateText(mbps * 0.6)
+                let avgMBs = Double(s.rateAvgMbps) ?? 0
+                let peakMBs = Double(s.rateMaxMbps) ?? 0
+                let hasTraffic = avgMBs > 0 || peakMBs > 0
+
+                var tip = L.t("net.tp.tip", link.linkMbps, capText)
+                let avgText = avgMBs < 0.8 ? L.t("net.tp.negligible") : linkRateText(avgMBs)
+
+                if hasTraffic, mbps > 0 {
+                    // 利用率：峰值占上限的百分比（上限已经是 60%，这里再取一次比例）
+                    let usage = peakMBs / (mbps * 0.6) * 100
+                    let grade: String
+                    switch usage {
+                    case 30...:      grade = L.t("net.tp.good")
+                    case 10..<30:    grade = L.t("net.tp.fair")
+                    default:         grade = L.t("net.tp.poor")
                     }
-                    sub.addItem(disabledItem(
-                        "    " + L.t("net.rtt.line", String(format: "%.0f", rtt), grade),
-                        tooltip: tip))
+                    tip += "\n\n" + L.t("net.tp.tip.usage", String(format: "%.0f", usage))
+                    out.append(("    " + L.t("net.tp.main", capText, avgText,
+                                             linkRateText(peakMBs), grade), tip))
+                } else {
+                    out.append(("    " + L.t("net.tp.idle", capText), tip))
                 }
-                if let rssi = Double(d.rssi) {
-                    let grade = rssi > -60 ? L.t("net.signal.strong")
-                        : (rssi > -70 ? L.t("net.signal.ok") : L.t("net.signal.weak"))
-                    var tip = L.t("net.signal.tip")
-                    if !s.macRSSI.isEmpty { tip += "\n" + L.t("net.signal.mac", s.macRSSI) }
-                    sub.addItem(disabledItem(
-                        "    " + L.t("net.signal.line", d.rssi, grade),
-                        tooltip: tip))
-                }
-                if let link = Double(d.linkMbps) {
-                    sub.addItem(disabledItem(
-                        "    " + L.t("net.link.simple", linkRateText(link)),
-                        tooltip: L.t("net.link.tip")))
-                    // 平均 / 峰值 / 理论极限 三者对比（统一字节基准，一眼看出差多少）
-                    let avg = (s.rateAvgMbps.isEmpty || s.rateAvgMbps == "0.0")
-                        ? "-" : linkRateText(Double(s.rateAvgMbps) ?? 0)
-                    let peak = (s.rateMaxMbps.isEmpty || s.rateMaxMbps == "0.0")
-                        ? "-" : linkRateText(Double(s.rateMaxMbps) ?? 0)
-                    sub.addItem(disabledItem(
-                        "    " + L.t("net.compare.line", avg, peak,
-                                    linkRateText(link * 0.6)),
-                        tooltip: L.t("net.compare.tip")))
-                }
-                if !d.ssid.isEmpty {
-                    let ch = d.channel.isEmpty ? "-" : d.channel
-                    let freq = d.freq.isEmpty ? "-" : d.freq
-                    sub.addItem(disabledItem(
-                        "    " + L.t("net.ap.line", d.ssid, ch, freq),
-                        tooltip: L.t("net.ap.tip",
-                                     d.bssid.isEmpty ? "-" : d.bssid,
-                                     s.macChannel.isEmpty ? "-" : s.macChannel)))
-                }
-            } else {
-                sub.addItem(disabledItem("    " + L.t("net.dev.usb")))
             }
-
-            if !d.battery.isEmpty {
-                let text = d.charging == "1"
-                    ? L.t("net.battery.line", d.battery, L.t("net.battery.charging"))
-                    : L.t("net.battery.lineNoCharge", d.battery)
-                sub.addItem(disabledItem("    " + text, tooltip: L.t("net.battery.tip")))
+            // ---- AP 信息 ----
+            if !link.ssid.isEmpty {
+                let ch = link.channel.isEmpty ? "-" : link.channel
+                let freq = link.freq.isEmpty ? "-" : link.freq
+                out.append(("    " + L.t("net.ap.line", link.ssid, ch, freq),
+                            L.t("net.ap.tip", link.bssid.isEmpty ? "-" : link.bssid,
+                                s.macChannel.isEmpty ? "-" : s.macChannel)))
             }
+        } else {
+            // USB 设备：走本地总线，不存在网络往返；也拿不到无线指标
+            out.append(("    " + L.t("net.usb.line"), L.t("net.usb.tip")))
         }
-
-        // ---- Mac 侧（全局）----
-        if !s.macRate.isEmpty || !s.macBattery.isEmpty {
-            sub.addItem(.separator())
-            if !s.macRate.isEmpty {
-                sub.addItem(disabledItem(
-                    L.t("net.mac.link", linkRateText(Double(s.macRate) ?? 0),
-                        s.macRSSI.isEmpty ? "-" : s.macRSSI,
-                        s.macChannel.isEmpty ? "-" : s.macChannel),
-                    tooltip: L.t("net.mac.link.tip")))
-            }
-            if !s.macBattery.isEmpty {
-                let mode: String
-                switch s.macPower {
-                case "charging":    mode = L.t("net.macbattery.charging")
-                case "charged":     mode = L.t("net.macbattery.charged")
-                case "ac":          mode = L.t("net.macbattery.ac")
-                default:            mode = L.t("net.macbattery.discharging")
-                }
-                sub.addItem(disabledItem(L.t("net.macbattery.line", s.macBattery, mode)))
-            }
+        // ---- 电量 ----
+        if !link.battery.isEmpty {
+            let text = link.charging == "1"
+                ? L.t("net.battery.line", link.battery, L.t("net.battery.charging"))
+                : L.t("net.battery.lineNoCharge", link.battery)
+            out.append(("    " + text, L.t("net.battery.tip")))
         }
+        return out
+    }
 
-        header.submenu = sub
-        menu.addItem(header)
+    /// 「复制设备地址」：仅无线端点有意义（USB 序列号拔线即失效，不提供复制）
+    func copyItem(_ d: DevEntry, indent: String) -> NSMenuItem {
+        let copy = NSMenuItem(title: indent + L.t("dev.copy"),
+                              action: #selector(copySerial(_:)), keyEquivalent: "")
+        copy.target = self
+        copy.representedObject = d.serial
+        copy.toolTip = d.serial
+        return copy
+    }
+
+    /// 「全部设备」子菜单：多设备时唯一有意义的批量入口 —— 逐台重连。
+    /// 「全部打开设置页」「复制全部地址」使用价值低，已移除。
+    func addAllDevicesItems(to menu: NSMenu, s: Status) {
+        guard s.devEntries.count > 1 || s.endpoints.count > 1 else { return }
+        let count = max(s.devEntries.count, s.endpoints.count)
+        let item = NSMenuItem(title: L.t("dev.all.header", String(count)), action: nil,
+                              keyEquivalent: "")
+        item.image = NSImage(systemSymbolName: "square.stack.3d.up",
+                             accessibilityDescription: nil)
+        let sub = NSMenu()
+        let rec = NSMenuItem(title: L.t("dev.all.recover"),
+                             action: #selector(recoverAllDevices), keyEquivalent: "")
+        rec.target = self
+        rec.toolTip = L.t("dev.all.recover.tip")
+        sub.addItem(rec)
+        item.submenu = sub
+        menu.addItem(item)
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -569,132 +693,79 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(disabledItem("  ⚠ \(s.loadError)"))
         }
 
-        // ---- 设备 ----
-        if s.endpoints.isEmpty {
-            menu.addItem(disabledItem(L.t("device.none")))
-        } else {
-            for ep in s.endpoints {
-                let it = NSMenuItem(title: "  ✓ \(ep)", action: #selector(copyEndpoint(_:)), keyEquivalent: "")
-                it.target = self
-                it.toolTip = L.t("device.copyTip")
-                menu.addItem(it)
-            }
-        }
+        // ================= 分区一：状态 + 设备 =================
+        // 状态区：顶部 1–2 行说清「现在什么情况、需不需要我动手」
+        addStatusItems(to: menu, s: s)
 
-        // ---- 诊断结论（与 TUI 同源，但文案由本地 i18n 渲染）----
-        let diag = localizedDiag(s)
-        if !diag.title.isEmpty {
-            menu.addItem(.separator())
-            let icon = s.diagLevel == "ok" ? "✓" : (s.diagLevel == "warn" ? "!" : "✗")
-            menu.addItem(disabledItem("  [\(icon)] \(diag.title)"))
-            if !diag.hint.isEmpty {
-                menu.addItem(disabledItem("        \(diag.hint)"))
-            }
-            if !s.diagAction.isEmpty {
-                let fix = NSMenuItem(title: L.t("diag.actionPrefix") + actionLabel(s.diagAction),
-                                     action: #selector(runDiagAction(_:)), keyEquivalent: "")
-                fix.target = self
-                fix.toolTip = diag.hint
-                menu.addItem(fix)
-            }
-        }
-
-        // ---- 环境信息 ----
-        menu.addItem(.separator())
-        var env: [String] = []
-        env.append(L.t("env.mdns") + (s.mdnsOK ? L.t("env.mdns.ok") : L.t("env.mdns.blocked")))
-        env.append(L.t("env.usb") + (s.hasUSB ? L.t("env.usb.connected") : L.t("env.usb.disconnected")))
-        // 插 USB 自动转 TCP：状态一目了然
-        if s.autoTcpip {
-            if s.tcpipListen {
-                env.append(L.t("env.tcp") + L.t("env.tcp.on", s.tcpipPort))
-            } else if s.hasUSB {
-                env.append(L.t("env.tcp") + L.t("env.tcp.pending"))
+        if s.devEntries.isEmpty {
+            if s.endpoints.isEmpty {
+                menu.addItem(disabledItem(L.t("device.none")))
             } else {
-                env.append(L.t("env.tcp") + L.t("env.tcp.off"))
+                for ep in s.endpoints {
+                    let it = NSMenuItem(title: "  ✓ \(ep)", action: #selector(copyEndpoint(_:)),
+                                        keyEquivalent: "")
+                    it.target = self
+                    it.toolTip = L.t("device.copyTip")
+                    menu.addItem(it)
+                }
             }
         } else {
-            env.append(L.t("env.tcp") + L.t("env.tcp.autoOff"))
-        }
-        var how: [String] = []
-        if !s.usbFound.isEmpty { how.append(L.t("env.discovery.usb")) }
-        if !s.knownFound.isEmpty { how.append(L.t("env.discovery.known")) }
-        if s.mdnsOK { how.append(L.t("env.discovery.mdns")) }
-        env.append(L.t("env.discovery")
-            + (how.isEmpty ? L.t("env.discovery.none") : how.joined(separator: L.t("env.discovery.sep"))))
-        for line in env {
-            menu.addItem(disabledItem("  " + line))
-        }
-        if !s.macIP.isEmpty {
-            menu.addItem(disabledItem(L.t("env.host") + s.macIP))
-        }
-        if !s.devModel.isEmpty {
-            menu.addItem(disabledItem(L.t("env.phone") + s.devModel))
-        }
-        // 传输速率：只在有设备时显示，避免无连接时的无用信息
-        if !s.allDevices.isEmpty && !s.rateDownHuman.isEmpty {
-            menu.addItem(disabledItem(
-                "  ↓ \(s.rateDownHuman)   ↑ \(s.rateUpHuman)",
-                tooltip: L.t("env.rate.tip")))
-            if !s.rateTotalDown.isEmpty {
-                menu.addItem(disabledItem(
-                    L.t("env.rate.total", s.rateTotalDown, s.rateTotalUp)))
-            }
+            addDeviceItems(to: menu, s: s)
         }
 
-        // ---- 链路质量（解释“为什么无线会慢”，数据来自 netinfo 缓存）----
-        addLinkQualityItems(to: menu, s: s)
-
+        // ================= 分区二：操作 =================
+        // 守护开关、重连、打开设置页、日志、TUI —— 用户日常真正会点的动作
         menu.addItem(.separator())
 
-        let toggle = NSMenuItem(
-            title: s.running ? L.t("menu.stopDaemon") : L.t("menu.startDaemon"),
-            action: #selector(toggleDaemon), keyEquivalent: "")
-        toggle.target = self
-        menu.addItem(toggle)
-
-        // 恢复无线连接：无连接时也能用（依次尝试 记忆端点 → 扫描本网段）
-        // 前提：手机此前通过 USB 执行过 adb tcpip，adbd 会常驻监听 TCP 端口
-        let reconnect = NSMenuItem(
-            title: s.endpoints.isEmpty ? L.t("menu.recover") : L.t("menu.reconnect"),
-            action: #selector(recoverConnection), keyEquivalent: "r")
-        reconnect.target = self
-        reconnect.toolTip = s.endpoints.isEmpty
-            ? L.t("menu.recover.tip.none")
-            : L.t("menu.recover.tip.has")
-        menu.addItem(reconnect)
+        if s.devEntries.count > 1 {
+            // 多设备时「重连」属于全量动作，放到「全部设备」子菜单里，
+            // 主菜单只保留守护开关，避免和逐台重连混淆。
+            let toggle = daemonToggleItem(s)
+            menu.addItem(toggle)
+        } else {
+            menu.addItem(daemonToggleItem(s))
+            // 单设备时保留快捷重连（⌘R），与旧版行为一致
+            let reconnect = NSMenuItem(
+                title: s.endpoints.isEmpty ? L.t("menu.recover") : L.t("menu.reconnect"),
+                action: #selector(recoverConnection), keyEquivalent: "r")
+            reconnect.target = self
+            reconnect.toolTip = s.endpoints.isEmpty
+                ? L.t("menu.recover.tip.none") : L.t("menu.recover.tip.has")
+            menu.addItem(reconnect)
+        }
 
         // 插着 USB 且尚未开启 TCP 模式时，提供一键触发（无需等守护的节流周期）
         if s.hasUSB && s.autoTcpip && !s.tcpipListen {
+            let usbDevs = s.devEntries.filter { $0.isUsb && $0.usable }
             let tcp = NSMenuItem(title: L.t("menu.enableTcpip"),
                                  action: #selector(enableTcpipNow), keyEquivalent: "t")
             tcp.target = self
             tcp.toolTip = L.t("menu.enableTcpip.tip", s.tcpipPort)
+            tcp.representedObject = usbDevs.map { $0.serial }
+            pendingTcpipSerials = usbDevs.map { $0.serial }
             menu.addItem(tcp)
         }
 
-        let devs = NSMenuItem(title: L.t("menu.adbDevices"), action: #selector(openDevices), keyEquivalent: "d")
-        devs.target = self
-        menu.addItem(devs)
+        // 单设备时保留设置页快捷入口；多设备时只在各设备子菜单里出现，避免歧义
+        if s.devEntries.count <= 1, let only = s.devEntries.first, only.usable {
+            let openWireless = NSMenuItem(title: L.t("menu.phoneWireless"),
+                                          action: #selector(openWirelessForDevice(_:)),
+                                          keyEquivalent: "w")
+            openWireless.target = self
+            openWireless.representedObject = only.serial
+            openWireless.toolTip = L.t("menu.phone.tip.connected")
+            menu.addItem(openWireless)
 
-        // 一键跳转手机设置页：常驻入口，不依赖诊断结论
-        // 已连接设备（USB 或无线）时可用；跳转策略见 adb-wifi.sh 的 open 子命令
-        let connected = !s.allDevices.isEmpty
-        let openWireless = NSMenuItem(title: L.t("menu.phoneWireless"),
-                                      action: #selector(openPhoneWirelessSettings), keyEquivalent: "w")
-        openWireless.target = self
-        openWireless.isEnabled = connected
-        openWireless.toolTip = connected ? L.t("menu.phone.tip.connected") : L.t("menu.phone.tip.disconnected")
-        menu.addItem(openWireless)
+            let openDev = NSMenuItem(title: L.t("menu.phoneDev"),
+                                     action: #selector(openDevForDevice(_:)), keyEquivalent: "")
+            openDev.target = self
+            openDev.representedObject = only.serial
+            openDev.toolTip = L.t("menu.phone.tip.dev")
+            menu.addItem(openDev)
+        }
 
-        let openDev = NSMenuItem(title: L.t("menu.phoneDev"),
-                                 action: #selector(openPhoneDevSettings), keyEquivalent: "")
-        openDev.target = self
-        openDev.isEnabled = connected
-        openDev.toolTip = connected ? L.t("menu.phone.tip.dev") : L.t("menu.phone.tip.disconnected")
-        menu.addItem(openDev)
-
-        let log = NSMenuItem(title: L.t("menu.viewLog"), action: #selector(showLog), keyEquivalent: "l")
+        let log = NSMenuItem(title: L.t("menu.viewLog"), action: #selector(showLog),
+                             keyEquivalent: "l")
         log.target = self
         menu.addItem(log)
 
@@ -706,10 +777,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tui.toolTip = L.t("menu.openTUI.tip")
         menu.addItem(tui)
 
+        // ================= 分区三：更多信息 =================
+        // 环境 / 链路质量 / adb devices 都收进一个子菜单，主菜单保持精简
+        addMoreInfoItems(to: menu, s: s)
+
+        // ================= 底部：设置 / 关于 / 退出 =================
         menu.addItem(.separator())
 
-        // ---- 设置 → 语言 ----
-        // 设置/语言项配图标，即使切换成不认识的界面语言也能凭图标找回
         let settings = NSMenuItem(title: L.t("menu.settings"), action: nil, keyEquivalent: "")
         settings.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
         let settingsMenu = NSMenu()
@@ -733,21 +807,160 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.submenu = settingsMenu
         menu.addItem(settings)
 
-        menu.addItem(.separator())
-
-        // 主菜单展示当前版本，不必打开「关于」也能确认
+        // 关于：版本信息与「检查更新」入口都收敛在这里。
+        // 版本号作为副标题挂在这里，不再单独占一行。
+        let about = NSMenuItem(title: L.t("menu.about"), action: #selector(showAbout),
+                               keyEquivalent: "")
+        about.target = self
         var menuVersion = L.t("about.version", APP_VERSION)
         if !APP_BUILD.isEmpty { menuVersion += L.t("about.buildSuffix", APP_BUILD) }
-        menu.addItem(disabledItem("  " + menuVersion))
-
-        // 关于：版本信息与「检查更新」入口都收敛在这里，主菜单保持精简
-        let about = NSMenuItem(title: L.t("menu.about"), action: #selector(showAbout), keyEquivalent: "")
-        about.target = self
+        about.toolTip = menuVersion.trimmingCharacters(in: .whitespaces)
         menu.addItem(about)
 
-        let quit = NSMenuItem(title: L.t("menu.quit"), action: #selector(quitApp), keyEquivalent: "q")
+        let quit = NSMenuItem(title: L.t("menu.quit"), action: #selector(quitApp),
+                              keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
+    }
+
+    /// 守护开关项（两个分区都要用，抽出来避免重复代码）
+    func daemonToggleItem(_ s: Status) -> NSMenuItem {
+        let toggle = NSMenuItem(
+            title: s.running ? L.t("menu.stopDaemon") : L.t("menu.startDaemon"),
+            action: #selector(toggleDaemon), keyEquivalent: "")
+        toggle.target = self
+        return toggle
+    }
+
+    /// 「更多信息」子菜单：环境状态、链路质量、adb devices。
+    /// 这些是「看」而不是「做」的内容，运行时不需要出现在主菜单里。
+    /// 主菜单顶部状态区：把「当前能不能用、需不需要动作」压缩成 1–2 行。
+    ///
+    /// 设计原则：
+    ///   - 正常状态**不报喜**（不再有「连接正常」这种同义反复），只陈述客观事实：
+    ///     连了几台、走的什么通道
+    ///   - 异常状态**必须报**，并且和「怎么办」写在同一行/紧邻行
+    ///   - 只在真正影响决策时才多占一行（USB 可拔、TCP 待切换、mDNS 被屏蔽）
+    /// 只读的细节（本机 IP、发现方式、累计流量、adb devices）留在「更多信息」里。
+    func addStatusItems(to menu: NSMenu, s: Status) {
+        // ① 主状态行：设备数量 + 通道构成
+        let wifiCount = s.devEntries.filter { $0.isWifi && $0.usable }.count
+        let usbCount = s.devEntries.filter { $0.isUsb && $0.usable }.count
+        let total = s.devEntries.filter { $0.usable }.count
+        var main: String
+
+        if !s.running && total == 0 {
+            main = L.t("status.daemonDown")
+        } else if total == 0 {
+            main = L.t("status.noDevice")
+        } else {
+            var parts: [String] = []
+            if wifiCount > 0 { parts.append(L.t("status.countWifi", String(wifiCount))) }
+            if usbCount > 0 { parts.append(L.t("status.countUsb", String(usbCount))) }
+            main = L.t("status.connected", parts.joined(separator: L.t("status.sep")))
+        }
+        // 未授权/离线设备单独计数：这是「看得见但用不了」，必须明确说
+        let bad = s.devEntries.count - total
+        if bad > 0 { main += "  " + L.t("status.badDevices", String(bad)) }
+        if !s.running && total > 0 {
+            main += "  " + L.t("status.daemonOffSuffix")
+        }
+        menu.addItem(disabledItem(main))
+
+        // ② 当前存在的「需要注意但不致命」的情况，每条一行，带可执行提示
+        for line in statusNotes(s) {
+            if line.action == nil {
+                menu.addItem(disabledItem(line.text, tooltip: line.tip))
+            } else {
+                let it = NSMenuItem(title: line.text, action: #selector(runDiagAction(_:)),
+                                    keyEquivalent: "")
+                it.target = self
+                it.toolTip = line.tip
+                menu.addItem(it)
+            }
+        }
+
+        // ③ 真正的故障：诊断结论（只有 warn / error 才出现，正常时不占位）
+        let diag = localizedDiag(s)
+        if !diag.title.isEmpty && s.diagLevel != "ok" {
+            let icon = s.diagLevel == "warn" ? "!" : "✗"
+            menu.addItem(disabledItem("  [\(icon)] \(diag.title)",
+                                      tooltip: diag.hint.isEmpty ? nil : diag.hint))
+            if !s.diagAction.isEmpty {
+                let fix = NSMenuItem(title: L.t("diag.actionPrefix") + actionLabel(s.diagAction),
+                                     action: #selector(runDiagAction(_:)), keyEquivalent: "")
+                fix.target = self
+                fix.toolTip = diag.hint
+                menu.addItem(fix)
+            }
+        }
+    }
+
+    /// 状态区里「值得多说一句」的情况。顺序按紧急程度：
+    /// 能让你省事的（USB 可拔）→ 正在进行的（TCP 切换中）→ 环境限制（mDNS 被屏蔽）
+    func statusNotes(_ s: Status) -> [(text: String, tip: String?, action: String?)] {
+        var out: [(text: String, tip: String?, action: String?)] = []
+
+        // USB 只是把无线连接"拉起来"的手段；连上之后插着线反而是累赘，值得提示可拔
+        let wifiOK = s.devEntries.contains { $0.isWifi && $0.usable }
+        if wifiOK && s.hasUSB {
+            out.append((L.t("status.note.usbCanUnplug"), L.t("status.note.usbCanUnplug.tip"),
+                        nil))
+        }
+        // 插着 USB 但还没切 TCP：守护正在处理，告诉用户不用动手
+        if s.hasUSB && s.autoTcpip && !s.tcpipListen && !wifiOK {
+            out.append((L.t("status.note.tcpPending"), L.t("status.note.tcpPending.tip"),
+                        nil))
+        }
+        // mDNS 被屏蔽：已有连接时它只是"未来可能掉线"的隐患，值得提醒；
+        // 没连上设备时诊断行会直接报这条，这里不重复。
+        if !s.mdnsOK && s.devEntries.contains(where: { $0.usable }) {
+            out.append((L.t("status.note.mdnsBlocked"), L.t("status.note.mdnsBlocked.tip"),
+                        nil))
+        }
+        return out
+    }
+
+    func addMoreInfoItems(to menu: NSMenu, s: Status) {
+        let item = NSMenuItem(title: L.t("more.header"), action: nil, keyEquivalent: "")
+        item.image = NSImage(systemSymbolName: "info.circle", accessibilityDescription: nil)
+        let sub = NSMenu()
+
+        // ---- 环境细节（「能不能用」已经在主菜单状态区说过了，这里只放排查用的细节）----
+        var env: [String] = []
+        var how: [String] = []
+        if !s.usbFound.isEmpty { how.append(L.t("env.discovery.usb")) }
+        if !s.knownFound.isEmpty { how.append(L.t("env.discovery.known")) }
+        if s.mdnsOK { how.append(L.t("env.discovery.mdns")) }
+        env.append(L.t("env.discovery")
+                   + (how.isEmpty ? L.t("env.discovery.none")
+                                  : how.joined(separator: L.t("env.discovery.sep"))))
+        if s.autoTcpip && s.tcpipListen {
+            env.append(L.t("env.tcp") + L.t("env.tcp.on", s.tcpipPort))
+        } else if !s.autoTcpip {
+            env.append(L.t("env.tcp") + L.t("env.tcp.autoOff"))
+        }
+        for line in env { sub.addItem(disabledItem(line)) }
+        if !s.macIP.isEmpty { sub.addItem(disabledItem(L.t("env.host") + s.macIP)) }
+        // 传输速率：只在有设备时显示
+        if !s.allDevices.isEmpty && !s.rateDownHuman.isEmpty {
+            sub.addItem(disabledItem(L.t("env.rate.line", s.rateDownHuman, s.rateUpHuman),
+                                     tooltip: L.t("env.rate.tip")))
+            if !s.rateTotalDown.isEmpty {
+                sub.addItem(disabledItem(L.t("env.rate.total", s.rateTotalDown,
+                                             s.rateTotalUp)))
+            }
+        }
+
+        // ---- adb devices ----
+        sub.addItem(.separator())
+        let devs = NSMenuItem(title: L.t("menu.adbDevices"), action: #selector(openDevices),
+                              keyEquivalent: "d")
+        devs.target = self
+        sub.addItem(devs)
+
+        item.submenu = sub
+        menu.addItem(item)
     }
 
     /// 切换界面语言：立即重建菜单与关于窗口
@@ -828,16 +1041,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 统一渲染 `open` 子命令的结果。
     /// 脚本以 kv 模式返回 RESULT/PAGE/TITLE/WIFI_TOGGLE（见 adb-wifi.sh 文件头
     /// 「输出协议」），界面文案完全由本地 i18n 渲染，不再解析脚本里的中文。
-    func handleOpenResult(_ out: String, page: String, withFlash: Bool) {
+    func handleOpenResult(_ out: String, page: String, withFlash: Bool, serial: String = "") {
         let kv = parseKV(out)
         let result = kv["RESULT"] ?? "failed"
         let toggle = kv["WIFI_TOGGLE"] ?? "unknown"
         let label = page == "wireless" ? L.t("phone.wireless") : L.t("phone.dev")
+        // 多设备时务必在文案里标明是哪台，否则用户无法确认操作落到了哪台手机
+        let who = serial.isEmpty ? "" : L.t("dev.onDevice", deviceLabel(serial))
 
         switch result {
         case "opened":
             if withFlash { flash(title: L.t("flash.opened"), text: L.t("flash.checkPhone")) }
             var body = L.t("phone.open.body", label)
+            if !who.isEmpty { body = who + "\n\n" + body }
             if toggle == "off" { body += "\n\n" + L.t("phone.open.toggleOff") }
             else if toggle == "unknown" { body += "\n\n" + L.t("phone.open.toggleUnknown") }
             showTextWindow(title: L.t("phone.openTitle", label), content: body)
@@ -845,14 +1061,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // 只能带到开发者选项页，无线调试要用户自己点
             if withFlash { flash(title: L.t("flash.opened"), text: L.t("flash.manualWireless")) }
             var body = L.t("phone.open.partial")
+            if !who.isEmpty { body = who + "\n\n" + body }
             if toggle == "off" { body += "\n\n" + L.t("phone.open.toggleOff") }
             showTextWindow(title: L.t("phone.open.partialTitle"), content: body)
         case "need_usb", "no_device":
             if withFlash { flash(title: L.t("flash.openFailed"), text: L.t("flash.connectFirst")) }
-            showTextWindow(title: L.t("phone.open.failedTitle"), content: L.t("phone.open.noDevice"))
+            showTextWindow(title: L.t("phone.open.failedTitle"),
+                           content: who.isEmpty ? L.t("phone.open.noDevice")
+                                                : who + "\n\n" + L.t("phone.open.noDevice"))
         default:
             if withFlash { flash(title: L.t("flash.openFailed"), text: L.t("flash.connectFirst")) }
-            showTextWindow(title: L.t("phone.open.failedTitle"), content: L.t("phone.open.failedBody"))
+            showTextWindow(title: L.t("phone.open.failedTitle"),
+                           content: who.isEmpty ? L.t("phone.open.failedBody")
+                                                : who + "\n\n" + L.t("phone.open.failedBody"))
+        }
+    }
+
+    /// 把序列号渲染成用户看得懂的名字（优先机型）
+    func deviceLabel(_ serial: String) -> String {
+        if let d = status.devEntries.first(where: { $0.serial == serial }) {
+            if !d.model.isEmpty {
+                d.isWifi ? "\(d.model) · \(serial)" : d.model + " · " + L.t("dev.tag.usb")
+            } else {
+                serial
+            }
+        } else {
+            serial
         }
     }
 
@@ -861,6 +1095,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(ep, forType: .string)
         flash(title: L.t("flash.copied"), text: ep)
+    }
+
+    @objc func copySerial(_ sender: NSMenuItem) {
+        let serial = (sender.representedObject as? String) ?? ""
+        guard !serial.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(serial, forType: .string)
+        flash(title: L.t("flash.copied"), text: serial)
     }
 
     @objc func toggleDaemon() {
@@ -883,9 +1125,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func recoverConnection() {
         guard !busy else { return }
         busy = true
+        // 多设备：逐台校验（脚本内串行），不做网段风暴式扫描
+        let multi = status.devEntries.count > 1 || status.endpoints.count > 1
+        let args = multi ? ["recover", "--all"] : ["recover"]
         DispatchQueue.global().async {
-            let r = runScript(["recover"], timeout: 90, env: KV_ENV)
+            let r = runScript(args, timeout: multi ? 180 : 90, env: KV_ENV)
             let kv = parseKV(r.out)
+            if multi {
+                DispatchQueue.main.async {
+                    self.busy = false
+                    self.handleRecoverAllResult(kv)
+                    self.refresh()
+                }
+                return
+            }
             DispatchQueue.main.async {
                 self.busy = false
                 let ep = kv["ENDPOINT"] ?? ""
@@ -910,71 +1163,180 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// 一键开启 TCP 模式：通过 USB 对手机执行 adb tcpip，然后立即无线连接。
-    /// 这是「插上 USB 就自动搞定」的手动触发版，主要给想立刻生效的场景用，
-    /// 不必等守护那边的节流周期。真正的自动化由守护的 ensure_tcpip 完成。
-    @objc func enableTcpipNow() {
-        guard let serial = status.allDevices.first(where: { !$0.0.contains(":") })?.0,
-              !serial.isEmpty else {
-            showTextWindow(title: L.t("usb.none.title"),
-                           content: L.t("usb.none.body"))
-            return
-        }
-        let port = status.tcpipPort.isEmpty ? "5555" : status.tcpipPort
+    /// 单台设备重连：只针对这台，只在它的记忆端点 / 自己的 USB 通道上找，
+    /// 不做整段网段扫描（多设备时那样会拖慢网络）。
+    @objc func reconnectDevice(_ sender: NSMenuItem) {
+        guard let serial = sender.representedObject as? String, !serial.isEmpty else { return }
+        guard !busy else { return }
         busy = true
+        flash(title: L.t("dev.reconnect.flash"), text: deviceLabel(serial))
         DispatchQueue.global().async {
-            // 用退出码判定 adb tcpip 是否成功，不匹配 adb 的英文提示
-            let tcpip = self.shellCode("/usr/bin/env",
-                                       ["adb", "-s", serial, "tcpip", port])
-            var msg = tcpip.out.trimmingCharacters(in: .whitespacesAndNewlines)
-            var ok = tcpip.code == 0
-            if ok {
-                // 等 adbd 重启后取手机 IP 并连接
-                var ip = self.shell("/usr/bin/env", ["adb", "-s", serial, "shell",
-                    "ip -4 addr show wlan0 | grep -oE 'inet [0-9.]+' | head -1 | cut -d' ' -f2"])
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if ip.isEmpty {
-                    ip = self.shell("/usr/bin/env", ["adb", "-s", serial, "shell",
-                        "ip -4 route get 1.1.1.1 | grep -oE 'src [0-9.]+' | cut -d' ' -f2"])
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                }
-                sleep(3)
-                if !ip.isEmpty {
-                    let c = self.shell("/usr/bin/env", ["adb", "connect", "\(ip):\(port)"])
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    msg = c
-                    ok = c.contains("connected")
-                } else {
-                    msg = L.t("err.noWifiIP")
-                    ok = false
-                }
-            }
+            let r = runScript(["recover", "--serial", serial], timeout: 90, env: KV_ENV)
+            let kv = parseKV(r.out)
             DispatchQueue.main.async {
                 self.busy = false
-                self.flash(title: ok ? L.t("flash.tcpOn") : L.t("flash.tcpFail"), text: msg)
+                let res = kv["RESULT"] ?? "failed"
+                let ep = kv["ENDPOINT"] ?? serial
+                if res == "already" || res == "recovered" {
+                    self.flash(title: L.t("flash.recovered"), text: "\(self.deviceLabel(serial)) → \(ep)")
+                } else {
+                    self.showTextWindow(title: L.t("recover.failed.title"),
+                                        content: L.t("dev.reconnect.failed.body",
+                                                     self.deviceLabel(serial)))
+                }
                 self.refresh()
             }
         }
     }
 
+    /// 「全部设备 → 逐台重连」：带明确意图的批量恢复（用户点了才知道会逐台尝试）
+    @objc func recoverAllDevices() {
+        guard !busy else { return }
+        busy = true
+        DispatchQueue.global().async {
+            let r = runScript(["recover", "--all"], timeout: 180, env: KV_ENV)
+            let kv = parseKV(r.out)
+            DispatchQueue.main.async {
+                self.busy = false
+                self.handleRecoverAllResult(kv)
+                self.refresh()
+            }
+        }
+    }
+
+    /// 批量恢复结果的渲染
+    func handleRecoverAllResult(_ kv: [String: String]) {
+        let done = Int(kv["DONE_COUNT"] ?? "0") ?? 0
+        guard done > 0 else {
+            showTextWindow(title: L.t("recover.failed.title"), content: L.t("recover.failed.body"))
+            return
+        }
+        var lines: [String] = []
+        for i in 1...done {
+            let serial = kv["DEV_\(i)_SERIAL"] ?? ""
+            let r = kv["DEV_\(i)_RESULT"] ?? "failed"
+            let ep = kv["DEV_\(i)_ENDPOINT"] ?? ""
+            let via = kv["DEV_\(i)_VIA"] ?? ""
+            let mark = (r == "already" || r == "recovered") ? "✓" : "✗"
+            var line = "\(mark) \(deviceLabel(serial))  "
+            switch r {
+            case "already":   line += L.t("dev.all.recover.already")
+            case "recovered": line += L.t("dev.all.recover.recovered", ep, via)
+            default:          line += L.t("dev.all.recover.failed")
+            }
+            lines.append(line)
+        }
+        let okCount = kv["OK_COUNT"] ?? "0"
+        let failCount = kv["FAIL_COUNT"] ?? "0"
+        let allOK = (kv["OK"] ?? "0") == "1"
+        flash(title: allOK ? L.t("flash.recovered") : L.t("recover.failed.title"),
+              text: L.t("dev.all.recover.flash", okCount, failCount))
+        var body = L.t("dev.all.recover.body", okCount, failCount) + "\n\n"
+        body += lines.joined(separator: "\n")
+        showTextWindow(title: L.t("dev.all.recover.title"), content: body)
+    }
+
+    /// 一键开启 TCP 模式：通过 USB 对手机执行 adb tcpip，然后立即无线连接。
+    /// 这是「插上 USB 就自动搞定」的手动触发版，主要给想立刻生效的场景用，
+    /// 不必等守护那边的节流周期。真正的自动化由守护的 ensure_tcpip 完成。
+    /// 多台 USB 设备时逐台处理（representedObject 里带着待处理的序列号列表）。
+    @objc func enableTcpipNow() {
+        var serials = pendingTcpipSerials
+        if serials.isEmpty {
+            serials = status.devEntries.filter { $0.isUsb && $0.usable }.map { $0.serial }
+        }
+        if serials.isEmpty, let only = status.allDevices.first(where: { !$0.0.contains(":") })?.0 {
+            serials = [only]
+        }
+        guard !serials.isEmpty else {
+            showTextWindow(title: L.t("usb.none.title"),
+                           content: L.t("usb.none.body"))
+            return
+        }
+        guard !busy else { return }
+        busy = true
+        let port = status.tcpipPort.isEmpty ? "5555" : status.tcpipPort
+        DispatchQueue.global().async {
+            var results: [(serial: String, ok: Bool, message: String)] = []
+            for serial in serials {
+                results.append(self.enableTcpipOne(serial, port: port))
+            }
+            DispatchQueue.main.async {
+                self.busy = false
+                let okCount = results.filter { $0.ok }.count
+                let body = results
+                    .map { "\($0.ok ? "✓" : "✗") \($0.serial)\n    \($0.message)" }
+                    .joined(separator: "\n\n")
+                self.flash(title: okCount == results.count ? L.t("flash.tcpOn")
+                                                           : L.t("flash.tcpFail"),
+                           text: L.t("dev.usb.tcpip.flash", String(okCount), String(results.count)))
+                self.showTextWindow(title: L.t("menu.enableTcpip"), content: body)
+                self.refresh()
+            }
+        }
+    }
+
+    /// 对单台 USB 设备执行 tcpip + 连接，返回结果（不碰 UI，供主线程之外调用）
+    func enableTcpipOne(_ serial: String, port: String) -> (serial: String, ok: Bool, message: String) {
+        let tcpip = shellCode("/usr/bin/env", ["adb", "-s", serial, "tcpip", port])
+        var msg = tcpip.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        var ok = tcpip.code == 0
+        if ok {
+            var ip = shell("/usr/bin/env", ["adb", "-s", serial, "shell",
+                "ip -4 addr show wlan0 | grep -oE 'inet [0-9.]+' | head -1 | cut -d' ' -f2"])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if ip.isEmpty {
+                ip = shell("/usr/bin/env", ["adb", "-s", serial, "shell",
+                    "ip -4 route get 1.1.1.1 | grep -oE 'src [0-9.]+' | cut -d' ' -f2"])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            sleep(3)
+            if !ip.isEmpty {
+                let c = shell("/usr/bin/env", ["adb", "connect", "\(ip):\(port)"])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                msg = c
+                ok = c.contains("connected")
+            } else {
+                msg = L.t("err.noWifiIP")
+                ok = false
+            }
+        }
+        return (serial, ok, msg)
+    }
+
     /// 一键在手机上打开「无线调试」页面并定位到开关。
     /// 具体跳转策略（多 ROM 自适应）由 adb-wifi.sh 的 open 子命令实现，
     /// 与 TUI、命令行共用同一套逻辑。
+    /// 多设备时必须带上具体设备，否则脚本只能"自动挑一台"，结果不可预期。
     @objc func openPhoneWirelessSettings() {
-        jumpToPhoneSettings(page: "wireless")
+        jumpToPhoneSettings(page: "wireless", serial: nil)
     }
 
     @objc func openPhoneDevSettings() {
-        jumpToPhoneSettings(page: "dev")
+        jumpToPhoneSettings(page: "dev", serial: nil)
     }
 
-    func jumpToPhoneSettings(page: String) {
+    @objc func openWirelessForDevice(_ sender: NSMenuItem) {
+        jumpToPhoneSettings(page: "wireless", serial: sender.representedObject as? String)
+    }
+
+    @objc func openDevForDevice(_ sender: NSMenuItem) {
+        jumpToPhoneSettings(page: "dev", serial: sender.representedObject as? String)
+    }
+
+    /// 对所有在线设备逐台打开设置页（逐台串行，避免同时拉起多份 adb）
+
+    func jumpToPhoneSettings(page: String, serial: String?) {
+        guard !busy else { return }
         busy = true
+        var args = ["open", page]
+        if let serial, !serial.isEmpty { args += ["--serial", serial] }
+        let target = serial ?? ""
         DispatchQueue.global().async {
-            let r = runScript(["open", page], timeout: 60, env: KV_ENV)
+            let r = runScript(args, timeout: 60, env: KV_ENV)
             DispatchQueue.main.async {
                 self.busy = false
-                self.handleOpenResult(r.out, page: page, withFlash: true)
+                self.handleOpenResult(r.out, page: page, withFlash: true, serial: target)
                 self.refresh()
             }
         }
