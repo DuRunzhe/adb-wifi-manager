@@ -807,14 +807,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.submenu = settingsMenu
         menu.addItem(settings)
 
-        // 关于：版本信息与「检查更新」入口都收敛在这里。
-        // 版本号作为副标题挂在这里，不再单独占一行。
+        // 版本号常驻主菜单：不必打开「关于」就能确认当前跑的是哪个版本，
+        // 排查问题、确认更新是否生效时都要靠它。
+        var menuVersion = L.t("about.version", APP_VERSION)
+        if !APP_BUILD.isEmpty { menuVersion += L.t("about.buildSuffix", APP_BUILD) }
+        menu.addItem(disabledItem("  " + menuVersion))
+
+        // 关于：版本详情与「检查更新」入口
         let about = NSMenuItem(title: L.t("menu.about"), action: #selector(showAbout),
                                keyEquivalent: "")
         about.target = self
-        var menuVersion = L.t("about.version", APP_VERSION)
-        if !APP_BUILD.isEmpty { menuVersion += L.t("about.buildSuffix", APP_BUILD) }
-        about.toolTip = menuVersion.trimmingCharacters(in: .whitespaces)
         menu.addItem(about)
 
         let quit = NSMenuItem(title: L.t("menu.quit"), action: #selector(quitApp),

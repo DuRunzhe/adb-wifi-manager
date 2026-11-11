@@ -483,21 +483,46 @@ MOUSE_WHEEL_DOWN = _btn("BUTTON5_PRESSED", 0x8000000)
 # ---------------- 显示宽度工具（中文占 2 列，必须按列而非字符计算） ----------------
 
 def rtt_grade(v):
-    """延迟等级（与菜单栏文案保持一致）"""
+    """延迟等级（与菜单栏 net.rtt.good/fair/poor 文案一致）"""
     if v < 20:
-        return "正常 <20"
+        return "优秀 <20 ms"
     if v < 50:
-        return "偏高 20–50"
-    return "过高 >50"
+        return "一般 20–50 ms"
+    return "较差 >50 ms"
 
 
 def signal_grade(v):
-    """信号等级（与菜单栏文案保持一致）"""
+    """信号等级（与菜单栏 net.signal.* 文案一致）"""
+    if v > -50:
+        return "极佳 >-50 dBm"
     if v > -60:
-        return "优秀 >-60"
+        return "优秀 >-60 dBm"
     if v > -70:
-        return "良好 -60~-70"
-    return "偏弱 <-70"
+        return "良好 -60~-70 dBm"
+    if v > -80:
+        return "偏弱 <-70 dBm"
+    return "很差 <-80 dBm"
+
+
+def throughput_grade(peak_mbps, ceiling_mbps):
+    """吞吐利用率评级（与菜单栏 net.tp.good/fair/poor 一致）。
+
+    依据「峰值 ÷ 上限」而不是绝对速度：不同 Wi-Fi 制式上限不同，
+    只有比例才能跨设备横向比较。
+    """
+    try:
+        peak = float(peak_mbps or 0)
+        ceil = float(ceiling_mbps or 0)
+    except (TypeError, ValueError):
+        return None, None
+    if ceil <= 0 or peak <= 0:
+        return None, None
+    usage = peak / ceil * 100.0
+    if usage >= 30:
+        return usage, "良好 ≥30%"
+    if usage >= 10:
+        return usage, "一般 10–30%"
+    return usage, "偏低 <10%"
 
 
 def link_rate_text(mbps):
@@ -639,6 +664,7 @@ class App:
         self.scroll = 0
         self.mouse_enabled = False
         self.click_regions = []      # (y, x1, x2, callback)
+        self.dev_focus = 0           # 0 = 显示全部设备；N = 只展开第 N 台（1 起）
         self.last_event_seq = (0, 0)
 
     # -------------------------- 配色 --------------------------
@@ -734,14 +760,43 @@ class App:
             self.scr.refresh()
             return
 
+        # ---- 设备视图指示（聚焦时置顶显示，切换后立刻可见）----
+        links_now = st.dev_links
+        focus = self.dev_focus
+        if focus and 1 <= focus <= len(links_now):
+            fd = links_now[focus - 1]
+            fname = (fd["model"] or fd["serial"]) + " · " + fd["serial"]
+            bar = " 当前仅显示设备 [%d/%d] %s —— 按 0 恢复全部 " % (
+                focus, len(links_now), fname)
+            attr = curses.color_pair(C_WARN) | curses.A_BOLD
+            self.addstr(y, 1, pad_to(bar, min(w - 2, dwidth(bar) + 1)), attr)
+            self.click_regions.append((y, 1, w - 2,
+                                       lambda: self.set_device_focus(0)))
+            y += 1
+
         # ---- 连接状态区 ----
         self.addstr(y, 1, "连接状态", curses.color_pair(C_TITLE) | curses.A_BOLD)
         y += 1
+        # 设备列表：聚焦某台时只高亮它，其余变暗；未聚焦时全部正常显示。
+        # 原来固定只列前 3 台，多设备时第 4 台起完全不可见，现在按剩余高度显示并计数。
         devs = st.wifi_devices
+        f_idx = self.dev_focus if 1 <= self.dev_focus <= len(links_now) else 0
+        f_serial = links_now[f_idx - 1]["serial"] if f_idx else None
         if devs:
-            for i, d in enumerate(devs[:3]):
-                mark = "✓" if i == 0 else " "
-                self.addstr(y, 2, "%s %s" % (mark, d), curses.color_pair(C_OK) | curses.A_BOLD)
+            room = max(1, h - y - 8)
+            for i, d in enumerate(devs[:room]):
+                if f_serial and d == f_serial:
+                    self.addstr(y, 2, "▶ %s" % d,
+                                curses.color_pair(C_WARN) | curses.A_BOLD)
+                elif f_serial:
+                    self.addstr(y, 2, "  %s" % d, curses.color_pair(C_DIM))
+                else:
+                    self.addstr(y, 2, "✓ %s" % d,
+                                curses.color_pair(C_OK) | curses.A_BOLD)
+                y += 1
+            if len(devs) > room:
+                self.addstr(y, 2, "…另有 %d 台（视窗过小）" % (len(devs) - room),
+                            curses.color_pair(C_DIM))
                 y += 1
         else:
             self.addstr(y, 2, "✗ 没有无线设备连接", curses.color_pair(C_ERR))
@@ -749,7 +804,8 @@ class App:
 
         usb = [d for d, s in st.all_devices if ":" not in d]
         if usb:
-            self.addstr(y, 2, "USB: %s" % ", ".join(usb), curses.color_pair(C_INFO))
+            shown_usb = ", ".join(usb[:3]) + ("…" if len(usb) > 3 else "")
+            self.addstr(y, 2, "USB: %s" % shown_usb, curses.color_pair(C_INFO))
         else:
             self.addstr(y, 2, "USB: 未连接", curses.color_pair(C_DIM))
         y += 1
@@ -796,74 +852,168 @@ class App:
             y += 1
 
         # ---- 链路质量 ----
-        # 字段与顺序与菜单栏「网络链路」子菜单保持一致：
-        #   设备名 → 延迟（含正常区间）→ 信号（含区间）→ 链路/实测均值/峰值/上限
-        #   → AP/信道/频率 → 电量；最后是 Mac 侧一行。
-        # 每台设备占 4 行，最多 2 台，避免挤占下方诊断区。
+        # 与菜单栏同一份 netinfo 数据、同一套评级文案，但按 TUI 特性做了三层适配：
+        #   1) 宽度：菜单栏用 tooltip 承载说明，TUI 没有 tooltip，改为按列宽自适应
+        #      短布局只留关键数字，宽终端才追加「评级 + 说明」
+        #   2) 行数：菜单栏能无限纵向展开，TUI 固定屏。每台设备严格 3 行
+        #      （名称 / 延迟+信号 / 吞吐），超出的设备数按剩余高度截断并提示
+        #   3) 单位：表头统一声明，行内不重复 mm/dBm/MB/s，省出宽度给评级
         links = st.dev_links
         if links:
             self.addstr(y, 1, "链路质量", curses.color_pair(C_TITLE) | curses.A_BOLD)
+            unit_txt = "延迟 ms · 信号 dBm · 吞吐 MB/s"
+            if dwidth(unit_txt) + 12 < w:
+                self.addstr(y, 11, unit_txt, curses.color_pair(C_DIM))
+            # 设备聚焦提示：聚焦时显示「只看 2/3」，否则在设备多时提示可以按数字
+            if self.dev_focus and 1 <= self.dev_focus <= len(links):
+                tag = "只看 %d/%d  按 0 显示全部" % (self.dev_focus, len(links))
+                self.addstr(y, w - dwidth(tag) - 2, tag, curses.color_pair(C_WARN))
+            elif len(links) > 1 and w >= 90:
+                tag = "按 1-%d 只看某台" % min(9, len(links))
+                self.addstr(y, w - dwidth(tag) - 2, tag, curses.color_pair(C_DIM))
             y += 1
             avg, peak = st.rate_stats
 
-            for d in links[:2]:
-                # 1) 设备名 + 电量
-                label = d["serial"] + ((" · " + d["model"]) if d["model"] else "")
+            # 行数预算：留 6 行给下方诊断区，Mac 侧再占 1 行。
+            # 每台设备占用行数并不固定（无线含 AP 行是 4 行，USB 是 3 行，窄终端无线是 3 行），
+            # 必须逐台累加计算，不能用「每台 3 行」的固定值估算，否则会超预算挤压诊断区。
+            def device_rows(d):
+                n = 2                     # 设备名 + 延迟/信号
+                if d["transport"] != "wifi":
+                    return 2              # 名称 + USB 直连
+                n += 1                    # 吞吐行
+                if d["ssid"] and w >= 78:
+                    n += 1                # AP 行（窄终端不显示）
+                return n
+
+            budget = h - y - 6 - 1        # 扣掉诊断区与 Mac 侧
+            shown, used = [], 0
+            for d in links:
+                need = device_rows(d)
+                if used + need > budget and shown:
+                    break
+                shown.append(d)
+                used += need
+
+            # 设备聚焦：按 1–9 只看某一台（设备多到一屏放不下时用）。
+            # 聚焦后不再受高度预算限制，可以完整展示该设备的所有指标。
+            focusing = bool(self.dev_focus and 1 <= self.dev_focus <= len(links))
+            if focusing:
+                shown = [links[self.dev_focus - 1]]
+                hidden = 0
+                budget = 10 ** 6          # 聚焦时忽略高度预算
+            for d in shown:
+                # 1) 设备名 + 电量（一行搞定，不额外占行）
+                # 序号前缀：与数字键一一对应，用户才知道该按几
+                idx = links.index(d) + 1
+                label = "[%d] " % idx + d["serial"] + (
+                    (" · " + d["model"]) if d["model"] else "")
                 if d["battery"]:
-                    label += "   电量 %s%%%s" % (
-                        d["battery"], "（充电中）" if d["charging"] == "1" else "")
+                    label += "  %s%%%s" % (
+                        d["battery"], "⚡" if d["charging"] == "1" else "")
                 self.addstr(y, 2, label, curses.color_pair(C_DIM) | curses.A_BOLD)
+                # 点击设备名同样可以聚焦（仅非聚焦状态下有意义）
+                if not (self.dev_focus and 1 <= self.dev_focus <= len(links)):
+                    self.click_regions.append(
+                        (y, 2, min(w - 2, 2 + dwidth(label)),
+                         lambda i=idx: self.set_device_focus(i)))
                 y += 1
 
                 if d["transport"] != "wifi":
-                    self.addstr(y, 4, "USB 连接（无网络往返延迟）", curses.color_pair(C_DIM))
+                    # USB 设备没有网络指标，一行说完即可；不再补占位符
+                    self.addstr(y, 4, "USB 直连（不经过 Wi-Fi，不上报无线指标）",
+                                curses.color_pair(C_DIM))
                     y += 1
                     continue
 
-                # 2) 延迟 / 信号（带正常区间）
-                line2 = []
-                rtt_val = None
+                # 2) 延迟 + 信号 合并一行：窄终端只给数值，宽终端追加评级
+                segs, rtt_val = [], None
                 if d["rtt"]:
                     try:
                         rtt_val = float(d["rtt"])
-                        line2.append("延迟 %.0fms（%s）" % (rtt_val, rtt_grade(rtt_val)))
+                        segs.append("延迟 %.1f" % rtt_val)
+                        if w >= 96:
+                            segs[-1] += "（%s）" % rtt_grade(rtt_val)
                     except ValueError:
                         pass
                 if d["rssi"]:
+                    segs.append("信号 %s" % d["rssi"])
                     try:
-                        line2.append("信号 %s dBm（%s）"
-                                     % (d["rssi"], signal_grade(float(d["rssi"]))))
+                        if w >= 96:
+                            segs[-1] += "（%s）" % signal_grade(float(d["rssi"]))
                     except ValueError:
-                        line2.append("信号 %s dBm" % d["rssi"])
+                        pass
                 attr2 = curses.color_pair(C_WARN if (rtt_val and rtt_val > 50) else C_DIM)
-                self.addstr(y, 4, " · ".join(line2) if line2 else "-", attr2)
+                self.addstr(y, 4, " · ".join(segs) if segs else "-", attr2)
                 y += 1
 
-                # 3) 链路速率 + 实测平均/峰值/上限（与菜单同一口径、同一单位）
+                # 3) 吞吐：上限 / 平均 / 最大（+评级）
                 if d["link"]:
                     try:
-                        ceiling = link_rate_text(float(d["link"]) * 0.6)
+                        link_mbps = float(d["link"])
+                        ceiling_mbps = link_mbps * 0.6
+                        ceiling = link_rate_text(ceiling_mbps)
                     except ValueError:
-                        ceiling = "-"
-                    avg_txt = link_rate_text(avg) if avg and avg != "0.0" else "-"
-                    peak_txt = link_rate_text(peak) if peak and peak != "0.0" else "-"
-                    line3 = "链路 %s MB/s · 实测 平均 %s / 峰值 %s / 上限 %s MB/s" % (
-                        link_rate_text(d["link"]), avg_txt, peak_txt, ceiling)
-                    self.addstr(y, 4, line3, curses.color_pair(C_DIM))
+                        link_mbps, ceiling_mbps, ceiling = None, None, "-"
+                    try:
+                        avg_v = float(avg or 0)
+                    except ValueError:
+                        avg_v = 0.0
+                    try:
+                        peak_v = float(peak or 0)
+                    except ValueError:
+                        peak_v = 0.0
+
+                    if avg_v <= 0 and peak_v <= 0:
+                        line3 = "吞吐 上限 %s · 暂无传输数据" % ceiling
+                        attr3 = curses.color_pair(C_DIM)
+                        usage = None
+                    else:
+                        avg_txt = "<0.1" if avg_v < 0.8 else link_rate_text(avg_v)
+                        peak_txt = link_rate_text(peak_v)
+                        usage, grade = throughput_grade(peak_v, ceiling_mbps)
+                        # 宽度不足时省略均值（它变化最慢、参考价值最低）
+                        if w >= 96:
+                            line3 = "吞吐 上限 %s · 平均 %s · 最大 %s" % (
+                                ceiling, avg_txt, peak_txt)
+                        elif w >= 78:
+                            line3 = "吞吐 上限 %s · 最大 %s" % (ceiling, peak_txt)
+                        else:
+                            line3 = "吞吐 %s / %s" % (ceiling, peak_txt)
+                        if grade and w >= 78:
+                            line3 += "（%s）" % grade
+                        # 偏低时高亮：提醒瓶颈在延迟而非带宽
+                        attr3 = curses.color_pair(
+                            C_WARN if (usage is not None and usage < 10) else C_DIM)
+                    self.addstr(y, 4, line3, attr3)
                     y += 1
 
-                # 4) AP / 信道 / 频率（BSSID 在菜单的 tooltip 里，TUI 不显示避免超宽）
-                if d["ssid"]:
-                    self.addstr(y, 4, "AP %s · 信道 %s · %s MHz" % (
-                        d["ssid"], d["channel"] or "-", d["freq"] or "-"),
-                        curses.color_pair(C_DIM))
-                    y += 1
+                    # 窄终端放不下 AP 行时不显示，避免挤占诊断区
+                    if d["ssid"] and w >= 78 and y < h - 7:
+                        self.addstr(y, 4, "AP %s · 信道 %s · %s MHz" % (
+                            d["ssid"], d["channel"] or "-", d["freq"] or "-"),
+                            curses.color_pair(C_DIM))
+                        y += 1
 
-            # Mac 侧（全局）
+            # 设备多到放不下时明确告知，而不是静默丢弃。
+            # 聚焦模式下 shown 只有一台，不能按「总台数 - 已显示」算折叠数。
+            hidden = 0 if focusing else len(links) - len(shown)
+            if hidden > 0 and y < h - 7:
+                self.addstr(y, 4, "…另有 %d 台设备（终端高度不足，放大窗口可显示）" % hidden,
+                            curses.color_pair(C_DIM))
+                y += 1
+
+            # Mac 侧（全局）：协商速率保留 Mbps 原值 + MB/s 参考，
+            # 与菜单栏「更多信息 → 网络链路」的 Mac 口径一致
             ml = st.mac_link
-            if ml["rate"]:
-                mac = "Mac  链路 %s MB/s（%s dBm）· 信道 %s" % (
-                    link_rate_text(ml["rate"]), ml["rssi"] or "-", ml["channel"] or "-")
+            if ml["rate"] and y < h - 6:
+                try:
+                    mac_rate = "%s Mbps（≈ %s MB/s）" % (
+                        ml["rate"], link_rate_text(float(ml["rate"])))
+                except ValueError:
+                    mac_rate = ml["rate"]
+                mac = "Mac  协商速率 %s · 信号 %s · 信道 %s" % (
+                    mac_rate, ml["rssi"] or "-", ml["channel"] or "-")
                 if ml["battery"]:
                     pw = {"charging": "充电中", "charged": "已充满",
                           "ac": "外接电源"}.get(ml["power"], "使用电池")
@@ -947,6 +1097,9 @@ class App:
         # ---- 底部操作栏 ----
         yb = h - 2
         self.hline(yb)
+        # 状态消息（如聚焦切换反馈）画在分隔线上方，不占用菜单栏位置
+        if self.status_msg and yb - 1 > y:
+            self.addstr(yb - 1, 1, self.status_msg, curses.color_pair(C_INFO))
         menu = self.build_menu()
         x = 2
         for i, m in enumerate(menu):
@@ -1172,6 +1325,27 @@ class App:
         self.show_text("配对结果", res + "\n\n配对成功后请按 C 输入【无线调试端口】进行连接"
                        "（注意这不是配对端口）。")
 
+    def set_device_focus(self, n):
+        """设备聚焦：0 显示全部，1–9 只看第 N 台。
+
+        多手机场景下一屏放不下所有设备时，用它单独看某台的完整指标。
+        序号与「链路质量」区的显示顺序一致（即 netinfo 的设备顺序）。
+        """
+        links = self.state.dev_links
+        if n == 0:
+            self.dev_focus = 0
+            self.status_msg = "显示全部设备"
+        elif 1 <= n <= len(links):
+            self.dev_focus = n
+            d = links[n - 1]
+            name = d["model"] or d["serial"]
+            self.status_msg = "只看 %s（按 0 显示全部）" % name
+        else:
+            # 超过实际设备数时给出明确反馈，而不是静默忽略
+            self.status_msg = "没有第 %d 台设备（当前共 %d 台）" % (n, len(links))
+            return
+        self.scroll = 0
+
     def show_devices(self):
         code, out = adb("devices", "-l")
         self.show_text("adb devices -l", out)
@@ -1224,6 +1398,8 @@ class App:
   C        手动输入 IP:端口 连接
   P        配对设备（Android 11+ 首次连接需要）
   D        查看设备列表
+  1-9      只看第 N 台设备的链路指标（多手机时用）
+  0        取消聚焦，显示全部设备
   L        查看守护日志
   R        重新诊断
   Q        退出界面（守护进程继续在后台工作）
@@ -1417,6 +1593,10 @@ def main_loop(stdscr):
             app.do_pair_dialog()
         elif ch in (ord('d'), ord('D')):
             app.show_devices()
+        elif ord('0') <= ch <= ord('9'):
+            # 0 = 显示全部设备；1-9 = 只看第 N 台（超出范围则忽略）
+            app.set_device_focus(ch - ord('0'))
+            last_draw = 0              # 立即重绘，否则要等下一次定时刷新才生效
         elif ch in (ord('l'), ord('L')):
             app.show_log()
         elif ch == ord('?'):
@@ -1432,6 +1612,61 @@ def cli_fallback():
     print("守护进程:", "运行中" if st.daemon_running else "已停止")
     print("无线设备:", ", ".join(st.wifi_devices) or "无")
     print("mDNS:", "可用" if st.mdns_works else "被屏蔽")
+    # 链路质量摘要：与交互界面同一份数据、同一套评级，纯文本下给一行精简版
+    links = st.dev_links
+    if links:
+        avg, peak = st.rate_stats
+        print()
+        print("链路质量:")
+        for d in links:
+            head = "  " + d["serial"] + ((" · " + d["model"]) if d["model"] else "")
+            if d["battery"]:
+                head += "  电量 %s%%%s" % (
+                    d["battery"], "（充电中）" if d["charging"] == "1" else "")
+            print(head)
+            if d["transport"] != "wifi":
+                print("    USB 直连（不经过 Wi-Fi）")
+                continue
+            segs = []
+            try:
+                if d["rtt"]:
+                    v = float(d["rtt"])
+                    segs.append("延迟 %.1f ms（%s）" % (v, rtt_grade(v)))
+            except ValueError:
+                pass
+            try:
+                if d["rssi"]:
+                    segs.append("信号 %s dBm（%s）" % (d["rssi"],
+                                                      signal_grade(float(d["rssi"]))))
+            except ValueError:
+                pass
+            if segs:
+                print("    " + " · ".join(segs))
+            if d["link"]:
+                try:
+                    ceil = float(d["link"]) * 0.6
+                    ceil_txt = link_rate_text(ceil)
+                except ValueError:
+                    ceil, ceil_txt = 0, "-"
+                try:
+                    avg_v = float(avg or 0)
+                except ValueError:
+                    avg_v = 0.0
+                try:
+                    peak_v = float(peak or 0)
+                except ValueError:
+                    peak_v = 0.0
+                if avg_v <= 0 and peak_v <= 0:
+                    print("    吞吐 上限 %s MB/s · 暂无传输数据" % ceil_txt)
+                else:
+                    avg_txt = "<0.1" if avg_v < 0.8 else link_rate_text(avg_v)
+                    _, grade = throughput_grade(peak_v, ceil)
+                    print("    吞吐 上限 %s MB/s · 平均 %s MB/s · 最大 %s MB/s（%s）" % (
+                        ceil_txt, avg_txt, link_rate_text(peak_v), grade or "-"))
+            if d["ssid"]:
+                print("    AP %s · 信道 %s · %s MHz" % (
+                    d["ssid"], d["channel"] or "-", d["freq"] or "-"))
+
     print()
     for iss in issues:
         icon = {"ok": "✓", "warn": "!", "error": "✗", "info": "i"}[iss.level]
