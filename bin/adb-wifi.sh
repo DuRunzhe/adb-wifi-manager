@@ -109,20 +109,56 @@ error() { log ERROR "$@"; }
 
 adbw() { "$ADB_BIN" "$@" 2>&1; }
 
-# 带超时执行（macOS 无 timeout 命令，用 perl alarm 实现）
+# 带超时执行（macOS 无 timeout 命令，用 perl 实现）
+#
+# 为什么不用最简单的 `perl -e 'alarm shift; exec @ARGV'`：
+#   那种写法超时杀死的是 exec *之后* 的进程本身，若该进程又派生了子进程
+#   （如 adb 的 shell 命令、包装脚本里的 sleep），子进程仍持有 stdout 管道，
+#   `$(tmo ... | tr)` 会一直等管道关闭 —— 超时形同失效（实测卡死 90 秒以上）。
+#
+# 现在改为：perl 先 fork，子进程自建进程组后 exec；超时时按**进程组**终止，
+#   连带所有后代一起杀掉，调用方的命令替换/管道能立即拿到 EOF 正常返回。
 tmo() {
     local secs="$1"; shift
-    perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+    perl -e '
+        my $secs = shift @ARGV;
+        my $pid = fork();
+        if (!defined $pid) { exit 125; }
+        if (!$pid) {
+            setpgrp(0, 0);            # 自成进程组，超时才能整组清理
+            exec @ARGV or exit 127;
+        }
+        my $timedout = 0;
+        $SIG{ALRM} = sub {
+            $timedout = 1;
+            kill "TERM", -$pid;
+            select undef, undef, undef, 0.3;
+            kill "KILL", -$pid;
+        };
+        alarm $secs;
+        waitpid($pid, 0);
+        alarm 0;
+        exit(124) if $timedout;
+        exit($? >> 8);
+    ' "$secs" "$@"
 }
 
 # 当前是否已有无线设备连接在 "device" 状态
+# adb devices 本身也可能卡住（server 异常时），统一加超时保护。
+# 注意不能写成 `tmo N "$ADB_BIN" devices | awk`：tmo 杀死 adb 后 awk 仍在等管道关闭，
+# 命令会一直挂着，超时形同失效。必须先取到变量再过滤。
 wifi_devices() {
-    "$ADB_BIN" devices 2>/dev/null | awk 'NR>1 && $2=="device" && $1 ~ /:[0-9]+$/ && $1 !~ /^\[/' | awk '{print $1}'
+    local raw
+    raw=$(tmo 10 "$ADB_BIN" devices 2>/dev/null)
+    printf '%s\n' "$raw" | awk 'NR>1 && $2=="device" && $1 ~ /:[0-9]+$/ && $1 !~ /^\[/' \
+        | awk '{print $1}'
 }
 
 # 所有设备的序列号(含 USB 与无线)
 all_serial() {
-    "$ADB_BIN" devices 2>/dev/null | awk 'NR>1 && $2!="" {print $1}'
+    local raw
+    raw=$(tmo 10 "$ADB_BIN" devices 2>/dev/null)
+    printf '%s\n' "$raw" | awk 'NR>1 && $2!="" {print $1}'
 }
 
 # 记录成功连接的端点
@@ -308,7 +344,9 @@ ensure_tcpip_for() {
 
     info "USB 设备 $serial 未开无线调试，自动切换 TCP 模式(端口 $TCPIP_PORT) ..." >&2
     local out
-    out=$(tmo 15 "$ADB_BIN" -s "$serial" tcpip "$TCPIP_PORT" 2>&1 | tr -d '\r')
+    local tcpip_raw
+    tcpip_raw=$(tmo 15 "$ADB_BIN" -s "$serial" tcpip "$TCPIP_PORT" 2>&1)
+    out=$(printf '%s' "$tcpip_raw" | tr -d '\r')
     info "  -> $out" >&2
     if ! echo "$out" | grep -q "restarting in TCP mode"; then
         warn "  切换 TCP 模式失败（部分系统需在手机上确认，或已被厂商限制）" >&2
@@ -1462,13 +1500,20 @@ net_dev_collect() {
 
     case "$serial" in *:*) transport=wifi ;; esac
 
-    raw=$(adbw -s "$serial" shell "
+    # 关键：必须带超时。dumpsys wifi 在设备繁忙（正在传输/锁屏/高负载）时
+    # 可能长时间不返回，没有超时会让整个 netinfo 采集卡死，进而拖住菜单栏。
+    # 15 秒足够正常设备完成三项取数，超时则本轮该设备各项留空。
+    # 同理不能把 tmo 直接接管道：perl 到期被 SIGALRM 杀掉后，
+    # tr 仍在等待写入端关闭，整条命令会一直挂着（实测卡死 90 秒以上）。
+    local shell_raw
+    shell_raw=$(tmo 15 "$ADB_BIN" -s "$serial" shell "
         dumpsys wifi | grep -m1 'SSID:'
         echo '@@MODEL@@'
         getprop ro.product.model
         echo '@@BATT@@'
         dumpsys battery | grep -E 'level:|status:'
-    " 2>/dev/null | tr -d '\r')
+    " 2>/dev/null)
+    raw=$(printf '%s' "$shell_raw" | tr -d '\r')
 
     wifi_line=$(printf '%s\n' "$raw" | awk '/@@MODEL@@/{exit} {print}' | head -1)
     model=$(printf '%s\n' "$raw" | awk '/@@MODEL@@/{f=1;next} /@@BATT@@/{exit} f' | head -1)
@@ -1485,10 +1530,15 @@ net_dev_collect() {
     status=$(printf '%s' "$batt" | sed -n 's/.*status: \([0-9]*\).*/\1/p' | head -1)
     case "$status" in 2|5) charging=1 ;; esac
 
-    # RTT 只对无线设备有意义（USB 走本地总线，不存在网络往返）
+    # RTT 只对无线设备有意义（USB 走本地总线，不存在网络往返）。
+    # 采样 12 包：3 包时抖动大的网络（如本例实测 8~102ms）均值偏差极大，
+    # 同一台设备两次采样可能相差 3 倍。12 包 + 0.2s 间隔约 2.6 秒，仍在缓存 TTL 内。
+    # 外层再套 8 秒硬超时，防止丢包时 ping 拖满整个采集窗口。
     if [ "$transport" = "wifi" ]; then
         dev_ip="${serial%%:*}"
-        rtt_line=$(ping -c 3 -i 0.2 -q "$dev_ip" 2>/dev/null | tail -1)
+        local ping_raw
+        ping_raw=$(tmo 8 ping -c 12 -i 0.2 -q "$dev_ip" 2>/dev/null)
+        rtt_line=$(printf '%s' "$ping_raw" | tail -1)
         rtt_min=$(printf '%s' "$rtt_line" | sed -n 's/.*= \([0-9.]*\)\/.*/\1/p')
         rtt_avg=$(printf '%s' "$rtt_line" | sed -n 's/.*= [0-9.]*\/\([0-9.]*\)\/.*/\1/p')
         rtt_max=$(printf '%s' "$rtt_line" | sed -n 's/.*\/\([0-9.]*\)\/[0-9.]* ms/\1/p')
@@ -1544,9 +1594,18 @@ net_mac_link_collect() {
 # 采集一次完整链路指标（慢，只在缓存过期时调用）
 # 多设备：每台一份 NET_DEV_<n>_*；Mac 侧（信道/速率/信号/电量）全局一份。
 net_info_collect() {
-    local idx=0 serial
+    local idx=0 serial started now elapsed
+    local budget="${NETINFO_BUDGET:-30}"   # 设备侧采集总预算（秒）
 
+    started=$(date +%s)
     for serial in $(all_serial); do
+        # 总预算保护：单台已有 15 秒超时，多台串行时仍可能叠加。
+        # 超过预算就停止采集剩余设备，宁可少几台也不让菜单栏/调用方长时间等待。
+        now=$(date +%s); elapsed=$((now - started))
+        if [ "$idx" -gt 0 ] && [ "$elapsed" -ge "$budget" ]; then
+            echo "NET_TRUNCATED=1" >&2
+            break
+        fi
         idx=$((idx + 1))
         net_dev_collect "$serial" "$idx"
     done
