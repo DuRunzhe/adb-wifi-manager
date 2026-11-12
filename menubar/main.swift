@@ -198,6 +198,14 @@ struct Status {
     // 传输时的平均值 / 峰值（Mbps，与链路速率对比用）
     var rateAvgMbps = ""
     var rateMaxMbps = ""
+    /// 链路数据采集时间戳（epoch 秒，来自 NET_AT），用于显示数据新鲜度
+    var netAt = ""
+    /// mDNS 细分状态：ok / stalled（adb server 卡死，已尝试自愈）/ blocked（网络屏蔽）
+    var mdnsState = ""
+    /// 连续为空的轮数（用于判断是短暂抖动还是持续失效）
+    var mdnsEmptyTurns = ""
+    /// Mac 侧当前 Wi-Fi 的 SSID（用于判断手机与电脑是否在同一 AP 下）
+    var macSSID = ""
     // 结构化诊断结论（由脚本层统一给出，与 TUI 完全同源）
     var diagLevel = ""
     var diagCode = ""
@@ -289,6 +297,10 @@ func loadStatus() -> Status {
     s.macPower = kv["NET_MAC_POWER"] ?? ""
     s.rateAvgMbps = kv["NET_RATE_AVG_MBPS"] ?? ""
     s.rateMaxMbps = kv["NET_RATE_MAX_MBPS"] ?? ""
+    s.netAt = kv["NET_AT"] ?? ""
+    s.mdnsState = kv["MDNS_STATE"] ?? ""
+    s.mdnsEmptyTurns = kv["MDNS_EMPTY_TURNS"] ?? ""
+    s.macSSID = kv["NET_MAC_SSID"] ?? ""
 
     let devCount = Int(kv["NET_DEV_COUNT"] ?? "0") ?? 0
     if devCount > 0 {
@@ -487,39 +499,51 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 只有一台时直接平铺，不增加点击层级；多台时逐台成项，避免"点谁都一样"。
     /// 菜单底部再放一个「全部设备」子菜单承载批量动作。
     func addDeviceItems(to menu: NSMenu, s: Status) {
+        // 单设备与多设备走**同一套结构**：每台设备一个子菜单，内部依次为
+        //   状态行 → 刷新链路质量 → 分隔线 → 操作
+        // 以前单设备时拍平成一级，导致"同一台设备在两种场景下长得不一样"：
+        // 缩进不同、分隔线位置不同、⌘W 这类快捷键时有时无。
+        // 统一后单设备只多一次点击，换来完全一致的认知模型。
         for d in s.devEntries {
             let mark = d.usable ? "✓" : (d.state == "unauthorized" ? "!" : "✗")
             var head = "  \(mark) \(d.displayName)"
             var notes: [String] = []
             notes.append(d.isWifi ? L.t("dev.tag.wifi") : L.t("dev.tag.usb"))
+            // 「同 AP」标记紧跟在无线/USB 之后，一眼看出连接是否经过 AP 中转
+            let apTag = sameAPTag(d, s: s)
+            if !apTag.isEmpty { notes.append(apTag) }
             if d.state == "unauthorized" { notes.append(L.t("dev.state.unauthorized")) }
             else if d.state == "offline" { notes.append(L.t("dev.state.offline")) }
             head += " · " + notes.joined(separator: " · ")
 
-            // 单设备：保持旧的扁平结构，不额外增加层级
-            if s.devEntries.count <= 1 {
-                menu.addItem(disabledItem(head, tooltip: d.serial))
-                if d.isWifi { menu.addItem(copyItem(d, indent: "    ")) }
-                for it in deviceActionItems(d, indent: "    ") { menu.addItem(it) }
-                continue
-            }
-
-            // 多设备：每台一个子菜单，但所有操作**只有一级**
-            // （不再嵌套「在手机上打开设置…」这种二级菜单）
             let item = NSMenuItem(title: head, action: nil, keyEquivalent: "")
-            item.toolTip = d.serial
+            // tooltip 说明标题里符号的含义（符号本身没有文字，需要可查的解释）
+            var tipText = d.serial
+            let apStat = sameAPStatus(d, s: s)
+            if d.isWifi {
+                switch apStat {
+                case .same:      tipText += "\n" + L.t("dev.ap.same.tip")
+                case .maybe:     tipText += "\n" + L.t("dev.ap.maybe.tip")
+                case .different: tipText += "\n" + L.t("dev.ap.different.tip")
+                case .unknown:   break
+                }
+            }
+            item.toolTip = tipText
             item.image = NSImage(systemSymbolName: d.isWifi ? "wifi" : "cable.connector",
                                  accessibilityDescription: nil)
             let sub = NSMenu()
 
-            // ① 该设备的状态（延迟 / 信号 / 链路 / 电量），只读，放最上面
+            // ① 状态（延迟 / 信号 / 吞吐 / AP / 电量）—— 只读
             for line in deviceStatusLines(d, s: s) {
                 sub.addItem(disabledItem(line.text, tooltip: line.tip))
             }
-            // ② 该设备的操作，平铺在一级
+            // ② 链路质量是「与这台手机通信」的质量，刷新入口挂在这台设备下
+            sub.addItem(refreshLinkItem(d, indent: ""))
+
+            // ③ 操作
             let acts = deviceActionItems(d, indent: "")
             if !acts.isEmpty {
-                if !sub.items.isEmpty { sub.addItem(.separator()) }
+                sub.addItem(.separator())
                 for it in acts { sub.addItem(it) }
             }
             item.submenu = sub
@@ -557,6 +581,71 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return out
     }
 
+    // MARK: - 链路分级
+    //
+    // 分级可视化：等级词 + 五格量表 + 分档界线。
+    // 只给"较差"这样的结论词，用户无法判断它是勉强越界还是差得离谱；
+    // 补上量表（██░░░）和完整分界线后，不看 tooltip 也能读懂。
+
+    /// 生成量表条：filled 个实心格 + (total-filled) 个空心格
+    func meter(filled: Int, total: Int = 5) -> String {
+        let n = max(0, min(filled, total))
+        return String(repeating: "█", count: n) + String(repeating: "░", count: total - n)
+    }
+
+    /// 延迟分级：越小越好。返回 (档位 1-3, 量表, 等级词 key)
+    func rttLevel(_ v: Double) -> (step: Int, label: String) {
+        // <20 优秀(3格) / 20–50 一般(2格) / >50 较差(1格)
+        if v < 20 { return (3, L.t("net.rtt.grade.good")) }
+        if v < 50 { return (2, L.t("net.rtt.grade.fair")) }
+        return (1, L.t("net.rtt.grade.poor"))
+    }
+
+    /// 信号分级：越大（越接近 0）越好，5 档
+    func signalLevel(_ v: Double) -> (step: Int, label: String) {
+        if v > -50 { return (5, L.t("net.signal.grade.excellent")) }
+        if v > -60 { return (4, L.t("net.signal.grade.good")) }
+        if v > -70 { return (3, L.t("net.signal.grade.ok")) }
+        if v > -80 { return (2, L.t("net.signal.grade.weak")) }
+        return (1, L.t("net.signal.grade.bad"))
+    }
+
+    /// 吞吐分级：按「峰值 ÷ 上限」的比例，3 档
+    func throughputLevel(_ usage: Double) -> (step: Int, label: String) {
+        if usage >= 30 { return (3, L.t("net.tp.grade.good")) }
+        if usage >= 10 { return (2, L.t("net.tp.grade.fair")) }
+        return (1, L.t("net.tp.grade.poor"))
+    }
+
+    /// 判断手机与这台 Mac 是否接在同一个 AP 下。
+    ///
+    /// 限制：macOS 不向普通应用提供 Mac 侧 BSSID（隐私限制），
+    /// 因此无法直接比对 BSSID，只能用 SSID + 信道间接推断：
+    ///   SSID 不同            → 明确不在同一网络
+    ///   SSID 同 + 信道不同   → 不同 AP（同一 SSID 下常有多台 AP 分不同信道）
+    ///   SSID 同 + 信道相同   → 大概率同一 AP（同信道也可能恰好是两台 AP，故不下断言）
+    enum SameAP { case same, maybe, different, unknown }
+
+    func sameAPStatus(_ d: DevEntry, s: Status) -> SameAP {
+        guard d.isWifi else { return .unknown }
+        guard let link = s.devLinks.first(where: { $0.serial == d.serial }) else { return .unknown }
+        guard !link.ssid.isEmpty, !s.macSSID.isEmpty else { return .unknown }
+        if link.ssid != s.macSSID { return .different }
+        guard !link.channel.isEmpty, !s.macChannel.isEmpty else { return .maybe }
+        return link.channel == s.macChannel ? .same : .different
+    }
+
+    /// 设备标题后的「同 AP」标记，直接跟在「无线 / USB」状态后面
+    func sameAPTag(_ d: DevEntry, s: Status) -> String {
+        guard d.isWifi else { return "" }
+        switch sameAPStatus(d, s: s) {
+        case .same:      return L.t("dev.ap.same")       // 同一 AP
+        case .maybe:     return L.t("dev.ap.maybe")      // 大概率同一 AP
+        case .different: return L.t("dev.ap.different")  // 不同 AP
+        case .unknown:   return ""
+        }
+    }
+
     /// 单台设备的状态行：每个指标都带单位、分级和 tooltip 释义。
     ///
     /// 数值来源（见 bin/adb-wifi.sh 的 net_dev_collect）：
@@ -571,21 +660,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if link.isWifi {
             // ---- RTT ----
             if let rtt = Double(link.rttAvg) {
-                let grade = rtt < 20 ? L.t("net.rtt.good")
-                    : (rtt < 50 ? L.t("net.rtt.fair") : L.t("net.rtt.poor"))
+                let lv = rttLevel(rtt)
                 var tip = L.t("net.rtt.tip")
                 if !link.rttMin.isEmpty && !link.rttMax.isEmpty {
                     tip += "\n\n" + L.t("net.rtt.range", link.rttMin, link.rttMax)
                 }
-                out.append(("    " + L.t("net.rtt.line", String(format: "%.1f", rtt), grade), tip))
+                out.append(("    " + L.t("net.rtt.line",
+                                         String(format: "%.1f", rtt),
+                                         meter(filled: lv.step, total: 3),
+                                         lv.label,
+                                         L.t("net.rtt.scale")), tip))
             }
             // ---- 信号 ----
             if let rssi = Double(link.rssi) {
-                let grade = rssi > -60 ? L.t("net.signal.strong")
-                    : (rssi > -70 ? L.t("net.signal.ok") : L.t("net.signal.weak"))
+                let lv = signalLevel(rssi)
                 var tip = L.t("net.signal.tip")
                 if !s.macRSSI.isEmpty { tip += "\n\n" + L.t("net.signal.mac", s.macRSSI) }
-                out.append(("    " + L.t("net.signal.line", link.rssi, grade), tip))
+                out.append(("    " + L.t("net.signal.line", link.rssi,
+                                         meter(filled: lv.step, total: 5),
+                                         lv.label,
+                                         L.t("net.signal.scale")), tip))
             }
             // ---- adb 吞吐量（用户最关心：现在能跑多快，以及跑得好不好）----
             // 三个数一起看：
@@ -607,24 +701,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if hasTraffic, mbps > 0 {
                     // 利用率：峰值占上限的百分比（上限已经是 60%，这里再取一次比例）
                     let usage = peakMBs / (mbps * 0.6) * 100
-                    let grade: String
-                    switch usage {
-                    case 30...:      grade = L.t("net.tp.good")
-                    case 10..<30:    grade = L.t("net.tp.fair")
-                    default:         grade = L.t("net.tp.poor")
-                    }
+                    let lv = throughputLevel(usage)
                     tip += "\n\n" + L.t("net.tp.tip.usage", String(format: "%.0f", usage))
                     out.append(("    " + L.t("net.tp.main", capText, avgText,
-                                             linkRateText(peakMBs), grade), tip))
+                                             linkRateText(peakMBs),
+                                             meter(filled: lv.step, total: 3),
+                                             lv.label,
+                                             String(format: "%.0f", usage)), tip))
                 } else {
-                    out.append(("    " + L.t("net.tp.idle", capText), tip))
+                    // 无流量时也要能看懂"健康标准是什么"，否则这行等于没信息
+                    out.append(("    " + L.t("net.tp.idle", capText,
+                                             L.t("net.tp.scale")), tip))
                 }
             }
             // ---- AP 信息 ----
             if !link.ssid.isEmpty {
                 let ch = link.channel.isEmpty ? "-" : link.channel
                 let freq = link.freq.isEmpty ? "-" : link.freq
-                out.append(("    " + L.t("net.ap.line", link.ssid, ch, freq),
+                // BSSID 是区分「同一 SSID 下的不同 AP」的唯一依据：
+                // 两台手机 BSSID 相同 = 接在同一个 AP 上，互传延迟最低；
+                // 不同则跨 AP 转发，RTT 会明显变高。
+                // 完整 12 位太长，显示末 5 位（形如 …8d:c7）足够区分且不挤占宽度。
+                let bssidShort: String
+                if link.bssid.isEmpty {
+                    bssidShort = "-"
+                } else {
+                    let parts = link.bssid.split(separator: ":")
+                    bssidShort = parts.count >= 2
+                        ? "…" + parts.suffix(2).joined(separator: ":")
+                        : link.bssid
+                }
+                out.append(("    " + L.t("net.ap.line", link.ssid, ch, freq, bssidShort),
                             L.t("net.ap.tip", link.bssid.isEmpty ? "-" : link.bssid,
                                 s.macChannel.isEmpty ? "-" : s.macChannel)))
             }
@@ -642,6 +749,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return out
     }
 
+    /// 「刷新这台设备的链路质量」菜单项。
+    /// tooltip 里带上数据采集时间，让用户知道点之前的数据有多旧。
+    func refreshLinkItem(_ d: DevEntry, indent: String) -> NSMenuItem {
+        let it = NSMenuItem(title: indent + L.t("net.refresh"),
+                            action: #selector(refreshLinkQuality(_:)), keyEquivalent: "")
+        it.target = self
+        it.representedObject = d.serial
+        // 采集时间是全局一份（NET_AT），单台刷新后仍是整体重采时间，
+        // 因此这里如实说明，不假装是"这台设备的采集时间"。
+        var tip = L.t("net.refresh.tip")
+        let ageText = netAgeText(status)
+        if !ageText.isEmpty {
+            tip += "\n" + L.t("net.age.line", ageText)
+        }
+        it.toolTip = tip
+        it.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
+        it.isEnabled = d.usable
+        return it
+    }
+
     /// 「复制设备地址」：仅无线端点有意义（USB 序列号拔线即失效，不提供复制）
     func copyItem(_ d: DevEntry, indent: String) -> NSMenuItem {
         let copy = NSMenuItem(title: indent + L.t("dev.copy"),
@@ -652,23 +779,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return copy
     }
 
-    /// 「全部设备」子菜单：多设备时唯一有意义的批量入口 —— 逐台重连。
-    /// 「全部打开设置页」「复制全部地址」使用价值低，已移除。
+    /// 「逐台重连」：跨设备的幂等动作，直接放在主菜单一级。
+    ///
+    /// 以前套了一层「全部设备 ▸」子菜单，但里面只有这一项 ——
+    /// 多一次点击却没多任何信息。现在直接平铺，⌘R 绑定在此。
     func addAllDevicesItems(to menu: NSMenu, s: Status) {
-        guard s.devEntries.count > 1 || s.endpoints.count > 1 else { return }
-        let count = max(s.devEntries.count, s.endpoints.count)
-        let item = NSMenuItem(title: L.t("dev.all.header", String(count)), action: nil,
-                              keyEquivalent: "")
-        item.image = NSImage(systemSymbolName: "square.stack.3d.up",
-                             accessibilityDescription: nil)
-        let sub = NSMenu()
-        let rec = NSMenuItem(title: L.t("dev.all.recover"),
-                             action: #selector(recoverAllDevices), keyEquivalent: "")
+        guard !s.devEntries.isEmpty || !s.endpoints.isEmpty else { return }
+        let count = max(s.devEntries.count, s.endpoints.count, 1)
+        // 文案必须和设备子菜单里的「重连这台设备」区分开：
+        //   子菜单里  = 定向重连（只查该设备自己的端点，不扫描）
+        //   主菜单这条 = 全量恢复（逐台校验 + 通过 USB 切换 TCP）
+        let title = count > 1 ? L.t("dev.all.recover", String(count))
+                              : L.t("dev.all.recoverOne")
+        let rec = NSMenuItem(title: "  " + title,
+                             action: #selector(recoverAllDevices), keyEquivalent: "r")
         rec.target = self
+        rec.image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath",
+                            accessibilityDescription: nil)
         rec.toolTip = L.t("dev.all.recover.tip")
-        sub.addItem(rec)
-        item.submenu = sub
-        menu.addItem(item)
+        menu.addItem(rec)
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -717,22 +846,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 守护开关、重连、打开设置页、日志、TUI —— 用户日常真正会点的动作
         menu.addItem(.separator())
 
-        if s.devEntries.count > 1 {
-            // 多设备时「重连」属于全量动作，放到「全部设备」子菜单里，
-            // 主菜单只保留守护开关，避免和逐台重连混淆。
-            let toggle = daemonToggleItem(s)
-            menu.addItem(toggle)
-        } else {
-            menu.addItem(daemonToggleItem(s))
-            // 单设备时保留快捷重连（⌘R），与旧版行为一致
-            let reconnect = NSMenuItem(
-                title: s.endpoints.isEmpty ? L.t("menu.recover") : L.t("menu.reconnect"),
-                action: #selector(recoverConnection), keyEquivalent: "r")
-            reconnect.target = self
-            reconnect.toolTip = s.endpoints.isEmpty
-                ? L.t("menu.recover.tip.none") : L.t("menu.recover.tip.has")
-            menu.addItem(reconnect)
-        }
+        // 守护开关：与设备数无关
+        menu.addItem(daemonToggleItem(s))
+        // 重连统一收敛在「设备」区的「全部设备 → 逐台重连」（带 ⌘R），
+        // 这里不再重复，避免同一个动作出现在两处。
 
         // 插着 USB 且尚未开启 TCP 模式时，提供一键触发（无需等守护的节流周期）
         if s.hasUSB && s.autoTcpip && !s.tcpipListen {
@@ -746,20 +863,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(tcp)
         }
 
-        // 单设备时保留设置页快捷入口；多设备时只在各设备子菜单里出现，避免歧义
-        if s.devEntries.count <= 1, let only = s.devEntries.first, only.usable {
+        // 设置页入口统一在「设备」区（每台设备自带「无线调试 / 开发者选项」），
+        // 这里不再重复。只有「有设备但设备区没用上 devEntries」（旧脚本兜底）时才补，
+        // 避免同一个动作在菜单里出现两次。
+        if s.devEntries.isEmpty, !s.allDevices.isEmpty {
             let openWireless = NSMenuItem(title: L.t("menu.phoneWireless"),
-                                          action: #selector(openWirelessForDevice(_:)),
+                                          action: #selector(openPhoneWirelessSettings),
                                           keyEquivalent: "w")
             openWireless.target = self
-            openWireless.representedObject = only.serial
             openWireless.toolTip = L.t("menu.phone.tip.connected")
             menu.addItem(openWireless)
 
             let openDev = NSMenuItem(title: L.t("menu.phoneDev"),
-                                     action: #selector(openDevForDevice(_:)), keyEquivalent: "")
+                                     action: #selector(openPhoneDevSettings), keyEquivalent: "")
             openDev.target = self
-            openDev.representedObject = only.serial
             openDev.toolTip = L.t("menu.phone.tip.dev")
             menu.addItem(openDev)
         }
@@ -914,11 +1031,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             out.append((L.t("status.note.tcpPending"), L.t("status.note.tcpPending.tip"),
                         nil))
         }
-        // mDNS 被屏蔽：已有连接时它只是"未来可能掉线"的隐患，值得提醒；
-        // 没连上设备时诊断行会直接报这条，这里不重复。
-        if !s.mdnsOK && s.devEntries.contains(where: { $0.usable }) {
-            out.append((L.t("status.note.mdnsBlocked"), L.t("status.note.mdnsBlocked.tip"),
-                        nil))
+        // mDNS 状态：正常和异常都展示。
+        // 用户需要知道"以后新设备能不能自动被发现"——这条信息在正常时同样有价值
+        // （看到「可用」就知道换机/换网后能自动连），异常时才需要额外解释原因。
+        // 已有连接时才有意义；完全没设备时诊断行会直接报，这里不重复。
+        if s.devEntries.contains(where: { $0.usable }) {
+            if s.mdnsOK {
+                out.append((L.t("status.note.mdnsOK"), L.t("status.note.mdnsOK.tip"), nil))
+            } else if s.mdnsState == "stalled" {
+                // adb server 的 mDNS 曾卡死，但已通过重启恢复 —— 与"网络屏蔽"完全不同的成因
+                out.append((L.t("status.note.mdnsStalled"),
+                            L.t("status.note.mdnsStalled.tip"), nil))
+            } else if (Int(s.mdnsEmptyTurns) ?? 0) < 3 {
+                // 刚失效不久，可能只是抖动，先不急着下"被屏蔽"的结论
+                out.append((L.t("status.note.mdnsFlaky"),
+                            L.t("status.note.mdnsFlaky.tip"), nil))
+            } else {
+                out.append((L.t("status.note.mdnsBlocked"),
+                            L.t("status.note.mdnsBlocked.tip"), nil))
+            }
         }
         return out
     }
@@ -954,8 +1085,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        // ---- adb devices ----
+        // ---- 链路数据采集时间 + adb devices ----
+        // 刷新入口已提到主菜单一级，这里只保留"数据有多新"这一读数。
         sub.addItem(.separator())
+        let age = netAgeText(s)
+        if !age.isEmpty {
+            sub.addItem(disabledItem(L.t("net.age.line", age)))
+        }
         let devs = NSMenuItem(title: L.t("menu.adbDevices"), action: #selector(openDevices),
                               keyEquivalent: "d")
         devs.target = self
@@ -1120,46 +1256,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// 恢复无线连接。
-    /// 不需要 USB：只要手机此前通过 USB 执行过 adb tcpip，adbd 会常驻监听 TCP 端口，
-    /// 之后直接 connect 即可恢复。恢复顺序（由脚本层实现）：
-    ///   已有连接 → 记忆端点 → 扫描本网段找回换了 IP 的手机
+    /// 恢复无线连接（「全部设备 → 逐台重连」，⌘R）。
+    ///
+    /// 统一走 `recover --all`：无论几台设备都按同一套流程——
+    /// 逐台校验已有端点 + 通过各自的 USB 通道尝试建立 TCP，
+    /// **不做整段网段扫描**（那会在多设备时把网络扫一遍，代价高且收益低）。
+    /// 以前单设备走 `recover`（含网段扫描）、多设备走 `--all`，行为不一致，
+    /// 现在合并为一条路径，结果也统一用列表呈现。
     @objc func recoverConnection() {
         guard !busy else { return }
         busy = true
-        // 多设备：逐台校验（脚本内串行），不做网段风暴式扫描
-        let multi = status.devEntries.count > 1 || status.endpoints.count > 1
-        let args = multi ? ["recover", "--all"] : ["recover"]
         DispatchQueue.global().async {
-            let r = runScript(args, timeout: multi ? 180 : 90, env: KV_ENV)
+            let r = runScript(["recover", "--all"], timeout: 180, env: KV_ENV)
             let kv = parseKV(r.out)
-            if multi {
-                DispatchQueue.main.async {
-                    self.busy = false
-                    self.handleRecoverAllResult(kv)
-                    self.refresh()
-                }
-                return
-            }
             DispatchQueue.main.async {
                 self.busy = false
-                let ep = kv["ENDPOINT"] ?? ""
-                switch kv["RESULT"] ?? "" {
-                case "already":
-                    self.flash(title: L.t("flash.recovered"),
-                               text: ep.isEmpty ? L.t("recover.result.alreadyNoEp")
-                                                : L.t("recover.result.already", ep))
-                case "recovered":
-                    self.flash(title: L.t("flash.recovered"),
-                               text: ep.isEmpty ? L.t("recover.result.recoveredNoEp")
-                                                : L.t("recover.result.recovered", ep))
-                default:
-                    // 失败：原因由脚本枚举（ERROR=no_usb|tcpip_failed），文案本地渲染
-                    let body = kv["ERROR"] == "tcpip_failed"
-                        ? L.t("recover.failed.tcpip")
-                        : L.t("recover.failed.body")
-                    self.showTextWindow(title: L.t("recover.failed.title"), content: body)
-                }
+                self.handleRecoverAllResult(kv)
                 self.refresh()
             }
         }
@@ -1189,6 +1301,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.refresh()
             }
         }
+    }
+
+    /// 手动刷新链路质量：绕过 60 秒缓存，立即同步采集一次。
+    /// 链路数据本来由守护异步刷新，但用户刚换网络/挪动手机时想立刻看新数据，
+    /// 不该被缓存卡住。
+    @objc func refreshLinkQuality(_ sender: NSMenuItem) {
+        guard !busy else { return }
+        let serial = (sender.representedObject as? String) ?? ""
+        busy = true
+        flash(title: L.t("net.refresh.flash"),
+              text: serial.isEmpty ? L.t("net.refresh.flash.tip")
+                                   : deviceLabel(serial))
+        // 指定了设备就只刷这一台，其余设备的缓存数据原样保留
+        var args = ["netinfo-refresh"]
+        if !serial.isEmpty { args.append(serial) }
+        DispatchQueue.global().async {
+            let r = runScript(args, timeout: 60, env: KV_ENV)
+            DispatchQueue.main.async {
+                self.busy = false
+                let ok = parseKV(r.out)["REFRESHED"] == "1"
+                self.flash(title: ok ? L.t("net.refresh.done")
+                                     : L.t("net.refresh.failed"),
+                           text: ok ? (serial.isEmpty ? L.t("net.refresh.done.tip")
+                                                      : self.deviceLabel(serial))
+                                    : L.t("net.refresh.failed.tip"))
+                self.refresh()
+            }
+        }
+    }
+
+    /// 数据采集距今多久（用于让用户判断看到的链路数据是否新鲜）
+    func netAgeText(_ s: Status) -> String {
+        guard let at = Double(s.netAt), at > 0 else { return "" }
+        let age = max(0, Int(Date().timeIntervalSince1970 - at))
+        if age < 60 { return L.t("net.age.sec", String(age)) }
+        return L.t("net.age.min", String(age / 60))
     }
 
     /// 「全部设备 → 逐台重连」：带明确意图的批量恢复（用户点了才知道会逐台尝试）
@@ -2019,9 +2167,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               sleep 0.1
             done
             mkdir -p "$(dirname "$APP")"
+            # 结束任何仍在运行的旧副本（同 bundle id 会让 LaunchServices 拒绝启动新版本）
+            pkill -f "$APP/Contents/MacOS/AdbWifiBar" 2>/dev/null || true
+            sleep 0.5
             rm -rf "$APP"
             /usr/bin/ditto "$NEW" "$APP"
             /usr/bin/xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+            # 清掉单实例锁：正常退出会自动释放，这里只防御异常退出的残留
+            rm -f "$HOME/Library/Application Support/adb-wifi-manager/menubar.lock"
+            # 让 LaunchServices 重新读取 bundle（否则可能仍指向刚被删除的旧路径）
+            /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+              -f "$APP" >/dev/null 2>&1 || true
             /usr/bin/open "$APP"
             rm -rf "$TMPDIR_UPD"
             """
@@ -2183,8 +2339,140 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+// MARK: - 单实例保护
+//
+// 三层防护，按可靠性从高到低：
+//   1) Info.plist 的 LSMultipleInstancesProhibited —— 拦 LaunchServices 启动（open -n）
+//   2) 本文件末尾的运行时互斥（flock 独占锁）—— 拦直接执行二进制文件等绕过 1 的情况
+//   3) 启动时清理「同一 App 的旧进程」—— 处理更新/重装后新旧副本共存
+//
+// 为什么用 flock 而不是分布式通知/NSRunningApplication：
+//   - NSRunningApplication 只知道「有没有同名 App 在跑」，无法区分路径，
+//     开发预览版（build/）和正式版（~/Applications/）会互相误判
+//   - flock 以「锁文件 + 独占」语义工作，进程退出（含崩溃）时内核自动释放，不会残留死锁
+
+/// 单实例守卫：拿不到锁说明已有实例在跑，直接退出当前进程。
+enum SingleInstance {
+    /// 锁文件放在用户级别目录，同一用户的开发版/正式版共享同一把锁
+    /// （两者操作的是同一份 adb 状态与菜单栏位置，本就不该同时存在）
+    static func lockPath() -> String {
+        let dir = NSHomeDirectory() + "/Library/Application Support/adb-wifi-manager"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        return dir + "/menubar.lock"
+    }
+
+    /// 尝试取得独占锁。成功返回 fd（需全程持有），失败返回 nil。
+    static func acquire() -> Int32? {
+        let path = lockPath()
+        let fd = open(path, O_CREAT | O_RDWR, 0o644)
+        guard fd >= 0 else { return nil }
+        // LOCK_NB：拿不到立即返回失败，不阻塞（避免第二个实例卡住）
+        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            close(fd)
+            return nil
+        }
+        // 写入当前 pid，便于排查「谁占着锁」
+        let pid = String(ProcessInfo.processInfo.processIdentifier)
+        ftruncate(fd, 0)
+        _ = pid.data(using: .utf8).map { write(fd, ($0 as NSData).bytes, $0.count) }
+        return fd
+    }
+
+    /// 激活已运行的实例：让它的菜单栏图标被看到（菜单栏项无法程序化高亮，
+    /// 这里只做一次轻量提示；用户点到图标即可看到当前状态）
+    static func notifyExisting() {
+        // 通过用户通知告知「已在运行」，避免用户以为没启动成功
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e",
+            "display notification \"菜单栏中已有一个实例在运行\" with title \"ADB WiFi\""]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+    }
+
+    /// 退出时清理锁文件内容（不删除文件本身，避免竞态）
+    static func release(_ fd: Int32) {
+        ftruncate(fd, 0)
+        flock(fd, LOCK_UN)
+        close(fd)
+    }
+}
+
+/// 清理「旧版本副本」：更新时新 App 覆盖到 ~/Applications，但旧进程可能仍在运行，
+/// 表现为菜单栏有图标、点开却是旧版本，且新旧两边状态不同步。
+///
+/// 判定条件（必须同时满足才杀）：
+///   1. 进程的可执行路径以 /Contents/MacOS/AdbWifiBar 结尾（是同一个 App 的可执行文件）
+///   2. 该路径与本进程路径**不同**（同一路径的是「正常重复启动」，交给 flock 处理，不能杀）
+///   3. 该路径对应的 .app 已经不存在，或就是本 App 会被替换的同一目标位置
+/// 这样既能清掉更新残留，又不会误杀用户正在使用的另一个正常副本。
+enum StaleInstance {
+    static func terminateStaleCopies() {
+        let me = ProcessInfo.processInfo.processIdentifier
+        let myExe = (Bundle.main.executableURL ?? URL(fileURLWithPath: "")).path
+        guard !myExe.isEmpty else { return }
+        let myApp = Bundle.main.bundleURL.path
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/ps")
+        p.arguments = ["-axo", "pid=,command="]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard let text = String(data: data, encoding: .utf8) else { return }
+
+        for line in text.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard let sp = trimmed.firstIndex(of: " ") else { continue }
+            let pidStr = String(trimmed[trimmed.startIndex..<sp])
+            let cmd = String(trimmed[trimmed.index(after: sp)...])
+                .trimmingCharacters(in: .whitespaces)
+            guard let pid = pid_t(pidStr), pid != me else { continue }
+            // 条件 1：是同一个 App 的可执行文件
+            guard cmd.hasSuffix("/Contents/MacOS/AdbWifiBar") else { continue }
+            // 条件 2：路径不同（同路径的是正常重复启动，交给 flock）
+            guard cmd != myExe else { continue }
+            // 条件 3：该旧副本依附的 .app 已不存在（更新时被替换/删除后残留的进程），
+            // 或指向的正是本 App 的位置（同一安装目标，说明是上一轮的旧进程）。
+            // 若旧副本位于另一个**仍然存在**的 .app 里（例如开发用的 build/ 副本），
+            // 那是一个独立的合法实例，不清理。
+            // AdbWifiBar → MacOS → Contents → Xxx.app
+            let oldAppPath = URL(fileURLWithPath: cmd)
+                .deletingLastPathComponent()   // Contents/MacOS
+                .deletingLastPathComponent()   // Contents
+                .deletingLastPathComponent()   // Xxx.app
+                .path
+            let gone = !FileManager.default.fileExists(atPath: oldAppPath)
+            guard gone || oldAppPath == myApp else { continue }
+            kill(pid, SIGTERM)
+        }
+    }
+}
+
+// ---- 单实例守卫（必须在 NSApplication 初始化前完成）----
+//
+// 顺序很关键：**先清理旧进程，再取锁**。
+// 反过来的话，新版本启动时旧版本仍持有锁，本进程会在 acquire() 处直接退出，
+// 永远走不到清理那一步 —— 表现为"更新后菜单栏还是旧版本"。
+//
+// 唯一安全的清理对象：**本进程所在 App 包之外的、同一 App 的旧副本**
+// （典型场景：更新时新 App 装到 ~/Applications，旧 App 进程还在跑）。
+// 绝不能杀掉「已有一个正常实例」的情况，否则用户双击图标就会把正在用的实例顶掉。
+StaleInstance.terminateStaleCopies()
+guard let instanceLock = SingleInstance.acquire() else {
+    // 走到这里说明：同一路径下已有健康实例在运行 —— 这是正常的重复启动，
+    // 提示用户后安静退出，不动那个实例。
+    SingleInstance.notifyExisting()
+    exit(0)
+}
+
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)   // 仅菜单栏，不占 Dock
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()
+SingleInstance.release(instanceLock)

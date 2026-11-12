@@ -79,6 +79,10 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
     <key>LSUIElement</key><true/>
+    <!-- 单实例：禁止 LaunchServices 启动第二个副本（open -n / 拖入第二个 App 均无效）。
+         注意：该键只约束 LaunchServices，直接执行可执行文件仍可绕过，
+         因此 main.swift 里还有运行时互斥作为第二道防线。 -->
+    <key>LSMultipleInstancesProhibited</key><true/>
     <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>

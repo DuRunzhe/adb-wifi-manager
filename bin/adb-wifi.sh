@@ -168,6 +168,28 @@ remember_endpoint() {
     grep -qxF "$ep" "$KNOWN_FILE" 2>/dev/null || echo "$ep" >> "$KNOWN_FILE"
 }
 
+# 把 adb 中**当前所有在线端点**补记进记忆文件。
+#
+# 为什么需要这一步：remember_endpoint 只记录"工具自己连上的"地址，
+# 以下来源的端点会被漏掉，导致换网段后找不回来：
+#   · 用户手动执行 adb connect
+#   · legacy `adb tcpip` 模式（service.adb.tcp.port），不广播 _adb._tcp mDNS
+#   · 其他工具（Android Studio、scrcpy）建立的连接
+# 这些都是"曾经连通过、之后还能连"的有效地址，理应参与自动恢复。
+sync_known_from_devices() {
+    local ep changed=0
+    touch "$KNOWN_FILE" 2>/dev/null || return 0
+    for ep in $(wifi_devices); do
+        case "$ep" in *:*) ;; *) continue ;; esac
+        if ! grep -qxF "$ep" "$KNOWN_FILE" 2>/dev/null; then
+            echo "$ep" >> "$KNOWN_FILE"
+            changed=1
+            info "记住新端点 $ep（来源：当前已连接设备）"
+        fi
+    done
+    return 0
+}
+
 # 当前 Mac 主网卡 IP 与 /24 网段的网段前缀
 lan_prefix() {
     local ip
@@ -588,6 +610,99 @@ restart_adb() {
     info "adb server 已重启"
 }
 
+# ------------------------------------------------- mDNS 状态判定与自愈
+#
+# 区分三种状态，避免把「adb 卡死」误报成「网络屏蔽」：
+#   mdns_ok       当前能发现 adb 服务 —— 正常
+#   mdns_stalled  adb server 的 mDNS 子系统卡死（重启 server 后能恢复）
+#   mdns_blocked  网络确实屏蔽组播重启也无用
+#
+# 判据：连续 N 轮 mDNS 为空后，主动重启一次 adb server 并复测：
+#   恢复 → stalled（并且已自愈）；仍为空 → blocked。
+# 状态写入 state/mdns_state，供 diag 展示与主循环节流。
+
+MDNS_EMPTY_FILE="$STATE_DIR/mdns_empty_count"   # 连续为空的轮数
+MDNS_STATE_FILE="$STATE_DIR/mdns_state"         # ok / stalled / blocked
+MDNS_RETRY_INTERVAL="${MDNS_RETRY_INTERVAL:-180}"  # 两次自愈尝试的最小间隔（秒）
+MDNS_RESTART_STAMP="$STATE_DIR/mdns_restart_at"   # 上次自愈尝试的时间戳
+
+# 记录一轮 mDNS 采样结果；count 为 0 时累加连续空轮数
+mdns_note_sample() {
+    local count="${1:-0}" n=0
+    [ -f "$MDNS_EMPTY_FILE" ] && read -r n < "$MDNS_EMPTY_FILE" 2>/dev/null
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    if [ "${count:-0}" -gt 0 ]; then
+        echo 0 > "$MDNS_EMPTY_FILE"
+    else
+        echo $((n + 1)) > "$MDNS_EMPTY_FILE"
+    fi
+}
+
+# 连续为空的轮数
+mdns_empty_turns() {
+    local n=0
+    [ -f "$MDNS_EMPTY_FILE" ] && read -r n < "$MDNS_EMPTY_FILE" 2>/dev/null
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    echo "$n"
+}
+
+# 读取已判定的状态（无记录时按当前是否为空推断）
+mdns_state() {
+    if [ -f "$MDNS_STATE_FILE" ]; then
+        cat "$MDNS_STATE_FILE" 2>/dev/null
+        return 0
+    fi
+    echo "unknown"
+}
+
+# 尝试自愈：mDNS 连续为空达到阈值时重启 adb server 并复测。
+# 返回 0 表示已恢复（并写入 stalled），1 表示仍未恢复（写入 blocked）。
+mdns_try_recover() {
+    local now last=0
+    now=$(date +%s)
+    [ -f "$MDNS_RESTART_STAMP" ] && read -r last < "$MDNS_RESTART_STAMP" 2>/dev/null
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    # 节流：避免频繁重启 adb server 打断正在进行的传输
+    [ $((now - last)) -lt "$MDNS_RETRY_INTERVAL" ] && return 2
+    echo "$now" > "$MDNS_RESTART_STAMP"
+
+    warn "mDNS 连续 $(mdns_empty_turns) 轮为空，重启 adb server 尝试恢复 ..."
+    restart_adb
+    # mDNS 重新注册需要时间：实测重启后 0–20 秒内陆续出现服务，
+    # 立即检查会误判成"网络屏蔽"。这里最多等 20 秒，每 2 秒探一次。
+    local after=0 i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        after=$(tmo 10 "$ADB_BIN" mdns services 2>/dev/null | grep -c "_adb")
+        case "$after" in ''|*[!0-9]*) after=0 ;; esac
+        [ "$after" -gt 0 ] && break
+        sleep 2
+    done
+    if [ "$after" -gt 0 ]; then
+        echo "stalled" > "$MDNS_STATE_FILE"
+        echo 0 > "$MDNS_EMPTY_FILE"
+        info "✓ adb server 的 mDNS 已恢复（此前是 server 卡死，非网络屏蔽）"
+        return 0
+    fi
+    echo "blocked" > "$MDNS_STATE_FILE"
+    warn "重启 adb server 后 mDNS 仍为空，判定为网络屏蔽组播"
+    return 1
+}
+
+# 每轮主循环调用：根据本轮 mDNS 结果更新状态并在需要时自愈
+mdns_update() {
+    local count="${1:-0}"
+    mdns_note_sample "$count"
+    if [ "${count:-0}" -gt 0 ]; then
+        echo "ok" > "$MDNS_STATE_FILE"
+        return 0
+    fi
+    # 阈值：连续 3 轮为空（默认 10s/轮 ≈ 30 秒）才尝试自愈，避免网络瞬时抖动误触发
+    if [ "$(mdns_empty_turns)" -ge "${MDNS_RECOVER_TURNS:-3}" ]; then
+        mdns_try_recover >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
 # --------------------------------------------------------------- 主循环
 # 写一个"状态版本号"文件，供 TUI / 菜单栏做变更检测（内容无关，只看 mtime）
 bump_state() {
@@ -666,19 +781,33 @@ main_loop() {
         # 0) 链路质量缓存（RTT/链路速率/信号/电量），过期则由后台异步刷新
         netinfo_maybe_refresh
 
-        # 1) Wi-Fi 网段变化 → 重启 adb，清空失效端点
+        # 1) Wi-Fi 网段变化 → 重启 adb server，但**保留记忆端点**
+        #
+        # 为什么不删记忆端点：换网段 ≠ 旧设备不可达。
+        # 典型场景是手机还连在原来的 Wi-Fi 上，只是 Mac 换了网络（或切到有线路由），
+        # 两者经路由互通时旧端点依然有效。曾因这里直接 rm -f 而丢失记录，
+        # 导致"手机明明连得上、工具却再也找不回来"。
+        # 真正失效的端点由 discover_known() 的失败计数机制处理（连续失败才清理），
+        # 这里只需重启 adb server 让旧连接状态归零，然后照常多路发现。
         prefix=$(lan_prefix)
         if [ -n "$prefix" ] && [ -n "$last_prefix" ] && [ "$prefix" != "$last_prefix" ]; then
-            warn "检测到网络变化 ($last_prefix.x -> $prefix.x)，重启 adb server"
+            warn "检测到网络变化 ($last_prefix.x -> $prefix.x)，重启 adb server（保留记忆端点）"
             restart_adb
-            [ -f "$KNOWN_FILE" ] && rm -f "$KNOWN_FILE"
         fi
         [ -n "$prefix" ] && last_prefix="$prefix"
 
         connected_eps=$(wifi_devices)
 
+        # 1.5) 把当前在线的端点补记进记忆文件（含手动 adb connect、legacy tcpip 模式等），
+        #      这样换网段/mDNS 不可用时仍能靠记忆端点恢复。
+        sync_known_from_devices
+
         # 2) 多路发现
         mdns_eps=$(discover_mdns)
+        # mDNS 状态判定与自愈：持续为空时重启 adb server，区分"卡死"与"被屏蔽"
+        _mdns_cnt=$(printf '%s\n' "$mdns_eps" | grep -c . || true)
+        case "$_mdns_cnt" in ''|*[!0-9]*) _mdns_cnt=0 ;; esac
+        mdns_update "$_mdns_cnt" >/dev/null 2>&1 || true
         usb_eps=$(discover_usb)
         known_eps=$(discover_known)
         # 插着 USB 且还没有可用无线连接时，自动切换 TCP 模式（免手动开无线调试）
@@ -1220,12 +1349,17 @@ cmd_recover() {
     parse_target_flags "$@"
     only="$OPEN_SERIAL"
 
-    # ---- 批量模式：对当前所有已连接设备做一次「保活校验 / 重连」----
-    # 只校验已有端点 + 通过 USB 设备切 TCP，不做网段扫描（多设备同时扫会拖慢网络）
+    # ---- 批量模式：对所有**已知**设备做一次「保活校验 / 重连」----
+    # 范围 = 当前在线的 + 记忆文件里记录过的（含已掉线的）。
+    # 只遍历在线设备是错的：掉线的那台正是需要恢复的对象，
+    # 若不把记忆端点算进来，"恢复全部"就永远救不回掉线的设备（曾实测复现）。
+    # 仍然不做网段扫描（多设备同时扫会拖慢网络）。
     if [ "$OPEN_ALL" = "1" ]; then
         local s i=0 ok=0 fail=0
         is_kv || echo "正在校验并恢复所有设备的无线连接 ..."
-        for s in $(all_serial); do
+        local targets
+        targets=$( { all_serial; [ -f "$KNOWN_FILE" ] && cat "$KNOWN_FILE"; } | awk 'NF' | sort -u )
+        for s in $targets; do
             i=$((i + 1))
             local r; r=$(recover_one "$s")
             local res; res=$(printf '%s\n' "$r" | sed -n 's/^RESULT=//p')
@@ -1257,7 +1391,28 @@ cmd_recover() {
     if [ -n "$only" ]; then
         is_kv || echo "正在恢复设备 $only 的无线连接 ..."
         local r; r=$(recover_one "$only")
-        if is_kv; then printf '%s\n' "$r"; fi
+        if is_kv; then
+            printf '%s\n' "$r"
+        else
+            # text 模式必须给出结论，否则调用方（TUI / 终端）只能看到一两行提示，
+            # 无法判断成功与否——早先这里漏了结果输出。
+            local _res _ep _via _err
+            _res=$(printf '%s\n' "$r" | sed -n 's/^RESULT=//p')
+            _ep=$(printf '%s\n' "$r"  | sed -n 's/^ENDPOINT=//p')
+            _via=$(printf '%s\n' "$r" | sed -n 's/^VIA=//p')
+            _err=$(printf '%s\n' "$r" | sed -n 's/^ERROR=//p')
+            case "$_res" in
+                already)   echo "✓ 当前已有可用连接: ${_ep:-$only}" ;;
+                recovered) echo "✓ 已恢复无线连接: ${_ep:-$only}" ;;
+                *)
+                    echo "✗ 未能恢复 $only 的无线连接"
+                    case "$_err" in
+                        tcpip_failed) echo "  已尝试通过 USB 切换 TCP 模式，但未能连上" ;;
+                        no_usb)       echo "  手机重启过会导致 tcpip 失效，插一次 USB 即可自动恢复" ;;
+                    esac
+                    ;;
+            esac
+        fi
         printf '%s\n' "$r" | grep -q '^RESULT=\(already\|recovered\)$'
         return $?
     fi
@@ -1567,7 +1722,7 @@ NETINFO_MAC_CACHE="$STATE_DIR/netinfo_mac.cache"
 NETINFO_MAC_TTL="${NETINFO_MAC_TTL:-300}"
 
 net_mac_link_collect() {
-    local age=999999 mtime sp mac_ch mac_rate mac_rssi
+    local age=999999 mtime sp mac_ch mac_rate mac_rssi mac_ssid
     if [ -f "$NETINFO_MAC_CACHE" ]; then
         mtime=$(stat -f %m "$NETINFO_MAC_CACHE" 2>/dev/null || echo 0)
         age=$(( $(date +%s) - mtime ))
@@ -1575,11 +1730,16 @@ net_mac_link_collect() {
     if [ "$age" -ge "$NETINFO_MAC_TTL" ]; then
         sp=$(system_profiler SPAirPortDataType 2>/dev/null \
             | sed -n '/Current Network Information/,/Other Local Wi-Fi Networks/p')
+        # Mac 侧 SSID：用于判断手机是否接在同一个 Wi-Fi / 同一个 AP 下。
+        # 取 "Current Network Information:" 之后那行的 SSID（形如 "            PiLink:"）。
+        # 注意 macOS 不提供 Mac 侧 BSSID（隐私限制），只能靠 SSID + 信道间接判断。
+        mac_ssid=$(printf '%s' "$sp" | sed -n 's/^ *\([^ ]*\):$/\1/p' | head -1)
         mac_ch=$(printf '%s' "$sp" | sed -n 's/.*Channel: \([0-9]*\).*/\1/p' | head -1)
         mac_rate=$(printf '%s' "$sp" | sed -n 's/.*Transmit Rate: \([0-9]*\).*/\1/p' | head -1)
         mac_rssi=$(printf '%s' "$sp" | sed -n 's/.*Signal \/ Noise: \(-\{0,1\}[0-9]*\).*/\1/p' | head -1)
         if [ -n "$mac_rate" ] || [ -n "$mac_ch" ]; then
             {
+                [ -n "$mac_ssid" ] && echo "NET_MAC_SSID=$mac_ssid"
                 echo "NET_MAC_CHANNEL=$mac_ch"
                 echo "NET_MAC_RATE=$mac_rate"
                 echo "NET_MAC_RSSI=$mac_rssi"
@@ -1760,6 +1920,9 @@ cmd_diag() {
         echo "TCPIP_PORT=$TCPIP_PORT"; echo "TCPIP_LISTEN=0"; echo "AUTO_TCPIP=$AUTO_TCPIP"
     fi
 
+    # 先补记当前在线端点，保证菜单栏/命令行走 diag 时也能收录
+    # 手动 adb connect 或 legacy tcpip 模式建立的连接。
+    sync_known_from_devices >/dev/null 2>&1
     known_eps=$(discover_known 2>/dev/null)
     echo "KNOWN_FOUND=$(echo $known_eps | tr '\n' ',')"
     echo "KNOWN_LIST=$( [ -f "$KNOWN_FILE" ] && tr '\n' ',' < "$KNOWN_FILE" )"
@@ -1849,6 +2012,16 @@ cmd_diag() {
     echo "DIAG_HINT=$hint"
     echo "DIAG_ACTION=$action"
     echo "MDNS_OK=$([ "${raw_mdns:-0}" -gt 0 ] && echo 1 || echo 0)"
+    # mDNS 细分状态：ok / stalled（adb server 卡死，重启可恢复）/ blocked（网络屏蔽）
+    # 为空时若没判定过，先按 blocked 展示但要给出连续空轮数，便于用户判断
+    _mstate=$(mdns_state)
+    if [ "${raw_mdns:-0}" -gt 0 ]; then
+        _mstate="ok"
+    elif [ "$_mstate" = "unknown" ]; then
+        _mstate="blocked"
+    fi
+    echo "MDNS_STATE=$_mstate"
+    echo "MDNS_EMPTY_TURNS=$(mdns_empty_turns)"
 }
 
 # ------------------------------------------------- 设备清单（多设备入口）
@@ -1914,6 +2087,143 @@ cmd_devices() {
     return 0
 }
 
+# ------------------------------------------------- 链路质量：刷新
+# 链路质量是**每台设备各自的属性**（与这台手机的 RTT / 信号 / 吞吐），
+# 所以入口按设备划分。两种刷新：
+#   cmd_netinfo_refresh          刷新全部设备（忽略 TTL，同步等待完成）
+#   cmd_netinfo_refresh_one S    只刷这一台，其余设备缓存原样保留
+#
+# 为什么要"合并"而不是整份重采：
+#   多设备时整份重采要逐台 dumpsys + ping，耗时叠加到十几秒；
+#   用户只是想看某一台的最新数据，没必要惊动其他设备。
+
+# 把单台设备的采集结果合并进缓存文件（替换该设备对应的 NET_DEV_<n>_* 段）
+# 用法：netinfo_merge_one <serial> < 采集输出
+netinfo_merge_one() {
+    local serial="$1" fresh match_idx="" tmp_new tmp_out
+    fresh=$(cat)                                  # 本次采集的 NET_DEV_1_* 块
+    [ -f "$NETINFO_CACHE" ] || { printf '%s\n' "$fresh" > "$NETINFO_CACHE"; return 0; }
+
+    # 找出该设备在缓存中的序号
+    match_idx=$(awk -F= -v s="$serial" '
+        $1 ~ /^NET_DEV_[0-9]+_SERIAL$/ && $2 == s { split($1,a,"_"); print a[3]; exit }
+    ' "$NETINFO_CACHE")
+
+    if [ -z "$match_idx" ]; then
+        # 缓存里没有这台设备 → 收录为新的一项（追加在末尾，序号顺延）
+        local cnt
+        cnt=$(grep -c '^NET_DEV_[0-9]*_SERIAL=' "$NETINFO_CACHE" 2>/dev/null || echo 0)
+        cnt=${cnt:-0}
+        tmp_new="$NETINFO_CACHE.tmp.$$"
+        cp "$NETINFO_CACHE" "$tmp_new"
+        # 重新编号后追加
+        local newidx=$((cnt + 1))
+        printf '%s\n' "$fresh" \
+            | sed "s/^NET_DEV_1_/NET_DEV_${newidx}_/" >> "$tmp_new"
+        awk -v n="$newidx" '
+            /^NET_DEV_COUNT=/ { print "NET_DEV_COUNT=" n; next } { print }
+        ' "$tmp_new" > "$tmp_new.2" && mv -f "$tmp_new.2" "$tmp_new"
+        grep -q '^NET_DEV_COUNT=' "$tmp_new" || echo "NET_DEV_COUNT=$newidx" >> "$tmp_new"
+        mv -f "$tmp_new" "$NETINFO_CACHE"
+        return 0
+    fi
+
+    # 有则替换：保留其他设备与 Mac 侧字段，只替换目标设备的整段
+    tmp_out="$NETINFO_CACHE.tmp.$$"
+    awk -F= -v s="$serial" -v idx="$match_idx" '
+        # 进入目标设备的块 → 跳过（后面用新数据补）
+        $1 ~ /^NET_DEV_/ {
+            split($1, a, "_")
+            if (a[3] == idx) next
+        }
+        { print }
+    ' "$NETINFO_CACHE" > "$tmp_out"
+    # 新数据按缓存里的原序号写回
+    printf '%s\n' "$fresh" | sed "s/^NET_DEV_1_/NET_DEV_${match_idx}_/" >> "$tmp_out"
+    mv -f "$tmp_out" "$NETINFO_CACHE"
+    return 0
+}
+
+# 等待守护的异步采集释放锁（避免两路 dumpsys 同时打手机）
+netinfo_wait_lock() {
+    local waited=0
+    [ -d "$NETINFO_LOCK" ] || return 0
+    while [ -d "$NETINFO_LOCK" ] && [ "$waited" -lt 40 ]; do
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    return 0
+}
+
+cmd_netinfo_refresh() {
+    netinfo_wait_lock
+    rm -rf "$NETINFO_LOCK" 2>/dev/null
+    if ! mkdir "$NETINFO_LOCK" 2>/dev/null; then
+        is_kv && echo "REFRESHED=0"
+        return 1
+    fi
+    local rc=0
+    trap 'rm -rf "$NETINFO_LOCK" 2>/dev/null' EXIT INT TERM
+    net_info_collect > "$NETINFO_CACHE.tmp.$$" 2>/dev/null \
+        && mv "$NETINFO_CACHE.tmp.$$" "$NETINFO_CACHE" \
+        || { rm -f "$NETINFO_CACHE.tmp.$$"; rc=1; }
+    rm -rf "$NETINFO_LOCK" 2>/dev/null
+    trap - EXIT INT TERM
+    if is_kv; then
+        echo "REFRESHED=$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+        [ "$rc" -eq 0 ] && cat "$NETINFO_CACHE"
+    else
+        if [ "$rc" -eq 0 ]; then
+            echo "✓ 链路质量已刷新"
+            cat "$NETINFO_CACHE"
+        else
+            echo "✗ 刷新失败（设备可能无响应）"
+        fi
+    fi
+    return $rc
+}
+
+# 只刷新指定设备：采集单台 → 合并进缓存，其他设备保持不变。
+cmd_netinfo_refresh_one() {
+    local serial="${1:-}"
+    if [ -z "$serial" ]; then
+        cmd_netinfo_refresh
+        return $?
+    fi
+
+    netinfo_wait_lock
+    rm -rf "$NETINFO_LOCK" 2>/dev/null
+    if ! mkdir "$NETINFO_LOCK" 2>/dev/null; then
+        is_kv && echo "REFRESHED=0"
+        return 1
+    fi
+    trap 'rm -rf "$NETINFO_LOCK" 2>/dev/null' EXIT INT TERM
+
+    local fresh rc=0
+    fresh=$(net_dev_collect "$serial" 1 2>/dev/null)
+    if [ -z "$fresh" ] || ! printf '%s' "$fresh" | grep -q '^NET_DEV_1_SERIAL='; then
+        rc=1
+    else
+        printf '%s\n' "$fresh" | netinfo_merge_one "$serial" || rc=1
+    fi
+
+    rm -rf "$NETINFO_LOCK" 2>/dev/null
+    trap - EXIT INT TERM
+
+    if is_kv; then
+        echo "REFRESHED=$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+        echo "SERIAL=$serial"
+    else
+        if [ "$rc" -eq 0 ]; then
+            echo "✓ 已刷新 $serial 的链路质量"
+        else
+            echo "✗ 刷新失败：$serial 可能无响应"
+        fi
+    fi
+    return $rc
+}
+
+
 case "${1:-}" in
     start)   cmd_start ;;
     stop)    cmd_stop ;;
@@ -1934,6 +2244,7 @@ case "${1:-}" in
     once)    cmd_once ;;
     diag)    cmd_diag ;;
     netinfo) net_info_collect ;;
+    netinfo-refresh) shift; cmd_netinfo_refresh_one "${1:-}" ;;
     open)    shift; cmd_open "$@" ;;
     recover) shift; cmd_recover "$@" ;;
     devices) cmd_devices ;;
@@ -1958,6 +2269,9 @@ adb-wifi-manager —— Android 无线调试自动连接守护
                               依次尝试：已有连接 → 记忆端点 → 扫描本网段
                               --serial 只恢复某台（不扫描网段）；--all 逐台校验
   adb-wifi.sh devices         列出当前设备（序列号 / 状态 / 通道 / 型号）
+  adb-wifi.sh netinfo-refresh [SERIAL]
+                              立即刷新链路质量（忽略 60 秒缓存）
+                              带 SERIAL 时只刷该设备，其余设备缓存不变
   adb-wifi.sh rate [间隔秒]   查看当前 adb 传输速率（默认采样 1 秒）
 USAGE
         ;;

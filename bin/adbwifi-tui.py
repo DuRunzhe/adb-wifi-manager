@@ -162,6 +162,7 @@ class State:
     def mac_link(self):
         """Mac 侧 Wi-Fi 链路与电量（全局一份）"""
         return {
+            "ssid": self.raw.get("NET_MAC_SSID", ""),
             "rate": self.raw.get("NET_MAC_RATE", ""),
             "channel": self.raw.get("NET_MAC_CHANNEL", ""),
             "rssi": self.raw.get("NET_MAC_RSSI", ""),
@@ -173,6 +174,26 @@ class State:
     def mdns_works(self):
         """mDNS 是否真的能发现 adb 服务"""
         return int(self.raw.get("MDNS_ADB_COUNT", "0") or 0) > 0
+
+    @property
+    def mdns_state(self):
+        """mDNS 细分状态，与菜单栏一致：ok / stalled / flaky / blocked。
+
+        adb 后台服务的 mDNS 模块会偶发卡死，与"网络屏蔽组播"是两回事——
+        前者重启 adb 可恢复且已自动处理，后者是环境限制，混淆会误导读数。
+        """
+        if self.mdns_works:
+            return "ok"
+        try:
+            empty = int(self.raw.get("MDNS_EMPTY_TURNS", "0") or 0)
+        except ValueError:
+            empty = 0
+        st = self.raw.get("MDNS_STATE", "")
+        if st == "stalled":
+            return "stalled"
+        if empty < 3:
+            return "flaky"
+        return "blocked"
 
     @property
     def mdns_found(self):
@@ -358,20 +379,26 @@ def _am_start(serial, args):
     return adb(*(cmd + ["am", "start"] + args))
 
 
-def open_settings_page_via_script(page="wireless"):
+def open_settings_page_via_script(page="wireless", serial=None):
     """调用 adb-wifi.sh open，复用脚本里统一的多 ROM 跳转策略。
 
     脚本会按可靠性依次尝试：
       ① SubSettings + WirelessDebuggingFragment（AOSP 通用，MIUI 实测有效，精确到无线调试页）
       ② Settings$WirelessDebuggingActivity（部分 ROM 的独立页面）
       ③ 开发者选项页（兜底）
+
+    serial 非空时只对该设备操作（与菜单栏"每台设备各自跳转"一致），
+    不传则由脚本自动挑一台。
     返回 (是否成功, 输出文本)
     """
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adb-wifi.sh")
     if not os.path.exists(script):
         return (False, "未找到 adb-wifi.sh")
+    cmd = ["/bin/bash", script, "open", page]
+    if serial:
+        cmd += ["--serial", serial]
     try:
-        r = subprocess.run(["/bin/bash", script, "open", page],
+        r = subprocess.run(cmd,
                            capture_output=True, text=True, timeout=60)
         out = (r.stdout or "") + (r.stderr or "")
         return (r.returncode == 0, out.strip())
@@ -385,7 +412,7 @@ def open_android_dev_settings(serial=None):
     if not serial:
         return ("需要先连接手机（USB 或无线均可）。\n"
                 "插好线后按 R 刷新，再点此按钮。")
-    ok, out = open_settings_page_via_script("dev")
+    ok, out = open_settings_page_via_script("dev", serial)
     if not ok:
         return "打开失败：" + out[:200]
     return ("已在手机上打开「开发者选项」页面。\n\n"
@@ -400,7 +427,7 @@ def open_android_wireless_debug(serial=None):
     if not serial:
         return ("需要先连接手机（USB 或无线均可）才能自动跳转页面。\n\n"
                 "也可以手动操作：设置 → 开发者选项 → 无线调试")
-    ok, out = open_settings_page_via_script("wireless")
+    ok, out = open_settings_page_via_script("wireless", serial)
     if not ok:
         return ("无法自动打开，请手动进入：设置 → 开发者选项 → 无线调试\n\n"
                 "错误信息：" + out[:200])
@@ -482,26 +509,42 @@ MOUSE_WHEEL_DOWN = _btn("BUTTON5_PRESSED", 0x8000000)
 
 # ---------------- 显示宽度工具（中文占 2 列，必须按列而非字符计算） ----------------
 
-def rtt_grade(v):
-    """延迟等级（与菜单栏 net.rtt.good/fair/poor 文案一致）"""
+def meter(filled, total):
+    """量表条：filled 个实心格 + 剩余空心格（与菜单栏符号一致）"""
+    n = max(0, min(filled, total))
+    return "█" * n + "░" * (total - n)
+
+
+def rtt_level(v):
+    """延迟分档（3 档）：返回 (档位, 等级词, 量表)"""
     if v < 20:
-        return "优秀 <20 ms"
+        return 3, "优秀", meter(3, 3)
     if v < 50:
-        return "一般 20–50 ms"
-    return "较差 >50 ms"
+        return 2, "一般", meter(2, 3)
+    return 1, "较差", meter(1, 3)
+
+
+def signal_level(v):
+    """信号分档（5 档）：返回 (档位, 等级词, 量表)"""
+    if v > -50:
+        return 5, "极佳", meter(5, 5)
+    if v > -60:
+        return 4, "优秀", meter(4, 5)
+    if v > -70:
+        return 3, "良好", meter(3, 5)
+    if v > -80:
+        return 2, "偏弱", meter(2, 5)
+    return 1, "很差", meter(1, 5)
+
+
+def rtt_grade(v):
+    """兼容旧调用：只返回等级词"""
+    return rtt_level(v)[1]
 
 
 def signal_grade(v):
-    """信号等级（与菜单栏 net.signal.* 文案一致）"""
-    if v > -50:
-        return "极佳 >-50 dBm"
-    if v > -60:
-        return "优秀 >-60 dBm"
-    if v > -70:
-        return "良好 -60~-70 dBm"
-    if v > -80:
-        return "偏弱 <-70 dBm"
-    return "很差 <-80 dBm"
+    """兼容旧调用：只返回等级词"""
+    return signal_level(v)[1]
 
 
 def throughput_grade(peak_mbps, ceiling_mbps):
@@ -519,10 +562,34 @@ def throughput_grade(peak_mbps, ceiling_mbps):
         return None, None
     usage = peak / ceil * 100.0
     if usage >= 30:
-        return usage, "良好 ≥30%"
+        return usage, "良好" + meter(3, 3)
     if usage >= 10:
-        return usage, "一般 10–30%"
-    return usage, "偏低 <10%"
+        return usage, "一般" + meter(2, 3)
+    return usage, "偏低" + meter(1, 3)
+
+
+def same_ap_tag(dev, mac):
+    """手机与这台电脑是否同一 AP 的符号标识（与菜单栏同一套判据和符号）。
+
+    限制：macOS 不提供 Mac 侧 BSSID，只能用 SSID + 信道间接推断。
+      SSID 不同           → ⚠（不同 AP）
+      SSID 同 + 信道同    → 🔗（同一 AP）
+      SSID 同 + 信道不同  → ⚠（不同 AP）
+      缺数据 / USB 设备    → ""（不显示）
+    """
+    if dev.get("transport") != "wifi":
+        return ""
+    d_ssid = dev.get("ssid", "")
+    m_ssid = mac.get("ssid", "")
+    if not d_ssid or not m_ssid:
+        return ""
+    if d_ssid != m_ssid:
+        return "⚠"
+    d_ch = dev.get("channel", "")
+    m_ch = mac.get("channel", "")
+    if not d_ch or not m_ch:
+        return "🔗"
+    return "🔗" if d_ch == m_ch else "⚠"
 
 
 def link_rate_text(mbps):
@@ -811,8 +878,16 @@ class App:
         y += 1
 
         # 发现方式
-        mdns = "mDNS: 可用" if st.mdns_works else "mDNS: 被屏蔽 ✗"
-        mdns_attr = curses.color_pair(C_OK) if st.mdns_works else curses.color_pair(C_ERR)
+        # 四态显示，与菜单栏措辞一致（避免把"adb 卡死"误报成"网络屏蔽"）
+        _ms = st.mdns_state
+        if _ms == "ok":
+            mdns, mdns_attr = "mDNS: 可用", curses.color_pair(C_OK)
+        elif _ms == "stalled":
+            mdns, mdns_attr = "mDNS: 曾卡死已恢复", curses.color_pair(C_WARN)
+        elif _ms == "flaky":
+            mdns, mdns_attr = "mDNS: 无响应重试中", curses.color_pair(C_WARN)
+        else:
+            mdns, mdns_attr = "mDNS: 被屏蔽 ✗", curses.color_pair(C_ERR)
         self.addstr(y, 2, mdns, mdns_attr)
         how = []
         if st.usb_found:
@@ -860,8 +935,8 @@ class App:
         #   3) 单位：表头统一声明，行内不重复 mm/dBm/MB/s，省出宽度给评级
         links = st.dev_links
         if links:
-            self.addstr(y, 1, "链路质量", curses.color_pair(C_TITLE) | curses.A_BOLD)
-            unit_txt = "延迟 ms · 信号 dBm · 吞吐 MB/s"
+            self.addstr(y, 1, "网络速度", curses.color_pair(C_TITLE) | curses.A_BOLD)
+            unit_txt = "延迟 ms · 信号 dBm · 速度 MB/s"
             if dwidth(unit_txt) + 12 < w:
                 self.addstr(y, 11, unit_txt, curses.color_pair(C_DIM))
             # 设备聚焦提示：聚焦时显示「只看 2/3」，否则在设备多时提示可以按数字
@@ -906,8 +981,15 @@ class App:
                 # 1) 设备名 + 电量（一行搞定，不额外占行）
                 # 序号前缀：与数字键一一对应，用户才知道该按几
                 idx = links.index(d) + 1
+                # 设备名后紧跟「同 AP」标识，与菜单栏口径一致：
+                #   🔗 同一 AP   ⚠ 不同 AP   无符号 = 无法判断
+                ap_tag = same_ap_tag(d, st.mac_link)
                 label = "[%d] " % idx + d["serial"] + (
                     (" · " + d["model"]) if d["model"] else "")
+                if d["transport"] != "wifi":
+                    label += " · USB"
+                elif ap_tag:
+                    label += " · " + ap_tag
                 if d["battery"]:
                     label += "  %s%%%s" % (
                         d["battery"], "⚡" if d["charging"] == "1" else "")
@@ -926,21 +1008,23 @@ class App:
                     y += 1
                     continue
 
-                # 2) 延迟 + 信号 合并一行：窄终端只给数值，宽终端追加评级
+                # 2) 延迟 + 信号 合并一行：窄终端只给数值，宽终端追加「量表 + 等级词」
                 segs, rtt_val = [], None
                 if d["rtt"]:
                     try:
                         rtt_val = float(d["rtt"])
                         segs.append("延迟 %.1f" % rtt_val)
                         if w >= 96:
-                            segs[-1] += "（%s）" % rtt_grade(rtt_val)
+                            _, lbl, mtr = rtt_level(rtt_val)
+                            segs[-1] += " %s %s" % (mtr, lbl)
                     except ValueError:
                         pass
                 if d["rssi"]:
                     segs.append("信号 %s" % d["rssi"])
                     try:
                         if w >= 96:
-                            segs[-1] += "（%s）" % signal_grade(float(d["rssi"]))
+                            _, lbl, mtr = signal_level(float(d["rssi"]))
+                            segs[-1] += " %s %s" % (mtr, lbl)
                     except ValueError:
                         pass
                 attr2 = curses.color_pair(C_WARN if (rtt_val and rtt_val > 50) else C_DIM)
@@ -965,7 +1049,7 @@ class App:
                         peak_v = 0.0
 
                     if avg_v <= 0 and peak_v <= 0:
-                        line3 = "吞吐 上限 %s · 暂无传输数据" % ceiling
+                        line3 = "速度 上限 %s MB/s · 暂无传输（健康 ≥30%%上限）" % ceiling
                         attr3 = curses.color_pair(C_DIM)
                         usage = None
                     else:
@@ -974,14 +1058,16 @@ class App:
                         usage, grade = throughput_grade(peak_v, ceiling_mbps)
                         # 宽度不足时省略均值（它变化最慢、参考价值最低）
                         if w >= 96:
-                            line3 = "吞吐 上限 %s · 平均 %s · 最大 %s" % (
+                            line3 = "速度 上限 %s MB/s · 平均 %s · 最大 %s" % (
                                 ceiling, avg_txt, peak_txt)
                         elif w >= 78:
-                            line3 = "吞吐 上限 %s · 最大 %s" % (ceiling, peak_txt)
+                            line3 = "速度 上限 %s MB/s · 最大 %s" % (ceiling, peak_txt)
                         else:
-                            line3 = "吞吐 %s / %s" % (ceiling, peak_txt)
+                            line3 = "速度 上限 %s MB/s · 峰值 %s" % (ceiling, peak_txt)
                         if grade and w >= 78:
-                            line3 += "（%s）" % grade
+                            # 明确的"占上限"而不是裸百分数
+                            line3 += "（%s，占上限 %.0f%%）" % (
+                                grade, usage if usage is not None else 0)
                         # 偏低时高亮：提醒瓶颈在延迟而非带宽
                         attr3 = curses.color_pair(
                             C_WARN if (usage is not None and usage < 10) else C_DIM)
@@ -989,10 +1075,22 @@ class App:
                     y += 1
 
                     # 窄终端放不下 AP 行时不显示，避免挤占诊断区
-                    if d["ssid"] and w >= 78 and y < h - 7:
-                        self.addstr(y, 4, "AP %s · 信道 %s · %s MHz" % (
-                            d["ssid"], d["channel"] or "-", d["freq"] or "-"),
-                            curses.color_pair(C_DIM))
+                    # BSSID 末段用于判断两台设备是否接在同一 AP（与菜单栏一致）
+                    if d["ssid"] and w >= 78 and y < h - 8:
+                        bssid_short = "-"
+                        if d.get("bssid"):
+                            parts = d["bssid"].split(":")
+                            bssid_short = ("…" + ":".join(parts[-2:])
+                                           if len(parts) >= 2 else d["bssid"])
+                        line_ap = "AP %s · 信道 %s · %s MHz · BSSID %s" % (
+                            d["ssid"], d["channel"] or "-", d["freq"] or "-", bssid_short)
+                        self.addstr(y, 4, line_ap, curses.color_pair(C_DIM))
+                        y += 1
+                    # 该设备的操作：与菜单栏设备子菜单一一对应。
+                    # 聚焦状态下才展开（否则每台都列会撑爆屏幕），提示按键即可。
+                    if focusing and y < h - 7:
+                        acts = "F 刷新 · S 重连 · W 无线调试 · V 开发者选项"
+                        self.addstr(y, 4, acts, curses.color_pair(C_INFO))
                         y += 1
 
             # 设备多到放不下时明确告知，而不是静默丢弃。
@@ -1012,7 +1110,7 @@ class App:
                         ml["rate"], link_rate_text(float(ml["rate"])))
                 except ValueError:
                     mac_rate = ml["rate"]
-                mac = "Mac  协商速率 %s · 信号 %s · 信道 %s" % (
+                mac = "Mac  最高速度 %s · 信号 %s · 信道 %s" % (
                     mac_rate, ml["rssi"] or "-", ml["channel"] or "-")
                 if ml["battery"]:
                     pw = {"charging": "充电中", "charged": "已充满",
@@ -1350,6 +1448,74 @@ class App:
         code, out = adb("devices", "-l")
         self.show_text("adb devices -l", out)
 
+    def refresh_link_quality(self, serial=None):
+        """刷新链路质量：跳过 60 秒缓存立即采集。
+
+        与菜单栏一致——链路质量是「与这台设备通信」的质量，所以支持按设备刷新：
+        传 serial 只刷这一台（其余设备缓存原样保留），不传则刷新全部。
+        """
+        who = "全部设备" if not serial else (serial or "")
+        self.status_msg = "正在刷新链路质量（%s）…" % who
+        self.busy = True
+        try:
+            self.scr.erase()
+            self.scr.refresh()
+            args = ["netinfo-refresh"]
+            if serial:
+                args.append(serial)
+            # 不带 kv：脚本返回中文文案，直接看是否带成功标记
+            code, out = script(*args, timeout=60)
+            ok = code == 0 and ("链路质量已刷新" in (out or ""))
+            self.status_msg = ("已刷新 %s 的链路质量" % who) if ok else (
+                "刷新失败（%s 可能无响应）" % who)
+        except Exception:
+            self.status_msg = "刷新失败"
+        finally:
+            self.busy = False
+        self.refresh_async()
+
+    def open_settings_focused(self, page):
+        """W / V 键：聚焦某台时只对这台跳转设置页，否则交给脚本自动挑一台。"""
+        links = self.state.dev_links
+        serial = None
+        if self.dev_focus and 1 <= self.dev_focus <= len(links):
+            serial = links[self.dev_focus - 1]["serial"]
+        if page == "wireless":
+            self.show_text("在手机上打开无线调试", open_android_wireless_debug(serial))
+        else:
+            self.show_text("在手机上打开开发者选项", open_android_dev_settings(serial))
+
+    def refresh_focused_or_all(self):
+        """F 键：聚焦某台时只刷这台，否则刷新全部。
+        与菜单栏「每台设备各自带刷新入口」是同一语义。"""
+        links = self.state.dev_links
+        if self.dev_focus and 1 <= self.dev_focus <= len(links):
+            self.refresh_link_quality(links[self.dev_focus - 1]["serial"])
+        else:
+            self.refresh_link_quality()
+
+    def reconnect_focused_or_all(self):
+        """S 键：聚焦某台时只重连这台，否则逐台重连全部。
+        对应菜单栏的「重连这台设备」与「全部设备 → 逐台重连」。"""
+        links = self.state.dev_links
+        if self.dev_focus and 1 <= self.dev_focus <= len(links):
+            serial = links[self.dev_focus - 1]["serial"]
+            self.status_msg = "正在重连 %s…" % serial
+            self.busy = True
+            try:
+                # 不带 kv：脚本 text 模式输出以 ✓ / ✗ 开头，据此判定
+                code, out = script("recover", "--serial", serial, timeout=90)
+                ok = code == 0 and ("✓" in (out or ""))
+                self.status_msg = ("已重连 %s" % serial) if ok else (
+                    "重连失败：%s 可能不在线" % serial)
+            except Exception:
+                self.status_msg = "重连失败"
+            finally:
+                self.busy = False
+            self.refresh_async()
+        else:
+            self.force_reconnect()
+
     def show_log(self):
         lines = read_log_tail(300)
         self.show_text("守护日志（最近 300 行）", "".join(lines) or "（暂无日志）")
@@ -1394,12 +1560,15 @@ class App:
   ↑ ↓      在诊断项之间移动
   Enter    执行当前诊断项给出的解决方案
   A        启动 / 停止后台守护（开机自启）
-  S        立即重新连接
   C        手动输入 IP:端口 连接
   P        配对设备（Android 11+ 首次连接需要）
   D        查看设备列表
   1-9      只看第 N 台设备的链路指标（多手机时用）
   0        取消聚焦，显示全部设备
+  F        刷新链路质量（聚焦时只刷该台，否则全部）
+  S        重连（聚焦时只重连该台，否则逐台重连）
+  W        在手机上打开「无线调试」（聚焦时只作用于该台）
+  V        在手机上打开「开发者选项」（聚焦时只作用于该台）
   L        查看守护日志
   R        重新诊断
   Q        退出界面（守护进程继续在后台工作）
@@ -1586,7 +1755,7 @@ def main_loop(stdscr):
         elif ch in (ord('a'), ord('A')):
             app.toggle_daemon()
         elif ch in (ord('s'), ord('S')):
-            app.force_reconnect()
+            app.reconnect_focused_or_all()
         elif ch in (ord('c'), ord('C')):
             app.do_connect_dialog()
         elif ch in (ord('p'), ord('P')):
@@ -1599,6 +1768,12 @@ def main_loop(stdscr):
             last_draw = 0              # 立即重绘，否则要等下一次定时刷新才生效
         elif ch in (ord('l'), ord('L')):
             app.show_log()
+        elif ch in (ord('f'), ord('F')):
+            app.refresh_focused_or_all()
+        elif ch in (ord('w'), ord('W')):
+            app.open_settings_focused("wireless")
+        elif ch in (ord('v'), ord('V')):
+            app.open_settings_focused("dev")
         elif ch == ord('?'):
             app.show_help()
         last_draw = 0
@@ -1611,15 +1786,23 @@ def cli_fallback():
     issues = diagnose(st)
     print("守护进程:", "运行中" if st.daemon_running else "已停止")
     print("无线设备:", ", ".join(st.wifi_devices) or "无")
-    print("mDNS:", "可用" if st.mdns_works else "被屏蔽")
+    _ms = st.mdns_state
+    print("mDNS:", {"ok": "可用", "stalled": "曾卡死已恢复",
+                    "flaky": "无响应重试中", "blocked": "被屏蔽"}.get(_ms, "未知"))
     # 链路质量摘要：与交互界面同一份数据、同一套评级，纯文本下给一行精简版
     links = st.dev_links
     if links:
         avg, peak = st.rate_stats
         print()
-        print("链路质量:")
+        print("网络速度:")
         for d in links:
             head = "  " + d["serial"] + ((" · " + d["model"]) if d["model"] else "")
+            if d["transport"] != "wifi":
+                head += " · USB"
+            else:
+                _tag = same_ap_tag(d, st.mac_link)
+                if _tag:
+                    head += " · " + _tag
             if d["battery"]:
                 head += "  电量 %s%%%s" % (
                     d["battery"], "（充电中）" if d["charging"] == "1" else "")
@@ -1631,13 +1814,14 @@ def cli_fallback():
             try:
                 if d["rtt"]:
                     v = float(d["rtt"])
-                    segs.append("延迟 %.1f ms（%s）" % (v, rtt_grade(v)))
+                    _, lbl, mtr = rtt_level(v)
+                    segs.append("延迟 %.1f ms %s %s" % (v, mtr, lbl))
             except ValueError:
                 pass
             try:
                 if d["rssi"]:
-                    segs.append("信号 %s dBm（%s）" % (d["rssi"],
-                                                      signal_grade(float(d["rssi"]))))
+                    _, lbl, mtr = signal_level(float(d["rssi"]))
+                    segs.append("信号 %s dBm %s %s" % (d["rssi"], mtr, lbl))
             except ValueError:
                 pass
             if segs:
@@ -1657,15 +1841,22 @@ def cli_fallback():
                 except ValueError:
                     peak_v = 0.0
                 if avg_v <= 0 and peak_v <= 0:
-                    print("    吞吐 上限 %s MB/s · 暂无传输数据" % ceil_txt)
+                    print("    速度 上限 %s MB/s · 暂无传输（≥30%% / 10-30%% / <10%% 分档）"
+                          % ceil_txt)
                 else:
                     avg_txt = "<0.1" if avg_v < 0.8 else link_rate_text(avg_v)
-                    _, grade = throughput_grade(peak_v, ceil)
-                    print("    吞吐 上限 %s MB/s · 平均 %s MB/s · 最大 %s MB/s（%s）" % (
-                        ceil_txt, avg_txt, link_rate_text(peak_v), grade or "-"))
+                    usage_v, grade = throughput_grade(peak_v, ceil)
+                    print("    速度 上限 %s MB/s · 平均 %s MB/s · 最大 %s MB/s（%s %.0f%%）" % (
+                        ceil_txt, avg_txt, link_rate_text(peak_v),
+                        grade or "-", usage_v or 0))
             if d["ssid"]:
-                print("    AP %s · 信道 %s · %s MHz" % (
-                    d["ssid"], d["channel"] or "-", d["freq"] or "-"))
+                bssid_short = "-"
+                if d.get("bssid"):
+                    bparts = d["bssid"].split(":")
+                    bssid_short = ("…" + ":".join(bparts[-2:])
+                                   if len(bparts) >= 2 else d["bssid"])
+                print("    AP %s · 信道 %s · %s MHz · BSSID %s" % (
+                    d["ssid"], d["channel"] or "-", d["freq"] or "-", bssid_short))
 
     print()
     for iss in issues:

@@ -66,10 +66,34 @@ else
     echo "⚠ 未找到 swiftc（需安装 Xcode Command Line Tools），且无预编译 App，跳过菜单栏 App"
 fi
 
+# 替换 App 前先结束正在运行的旧实例：
+# LaunchServices 对同一 bundle id 已有实例时会拒绝启动新副本，
+# 若不先结束旧进程，安装后用户点开的仍是旧版本（菜单栏图标也不会变）。
+stop_menubar_app() {
+    local app="$HOME/Applications/AdbWifiBar.app"
+    local exe="$app/Contents/MacOS/AdbWifiBar"
+    [ -x "$exe" ] || return 0
+    pgrep -f "^${exe}$" >/dev/null 2>&1 || return 0
+    echo "结束正在运行的菜单栏 App ..."
+    pkill -f "^${exe}$" 2>/dev/null || true
+    # 给它 2 秒正常退出（会释放单实例锁），再强杀
+    local i
+    for i in 1 2 3 4; do
+        pgrep -f "^${exe}$" >/dev/null 2>&1 || return 0
+        sleep 0.5
+    done
+    pkill -9 -f "^${exe}$" 2>/dev/null || true
+    sleep 0.5
+    return 0
+}
+
 if [ -n "$APP_SRC" ] && [ -d "$APP_SRC" ]; then
+    stop_menubar_app
     mkdir -p "$HOME/Applications"
     rm -rf "$HOME/Applications/AdbWifiBar.app"
     cp -R "$APP_SRC" "$HOME/Applications/"
+    # 清掉可能残留的单实例锁（进程已退出时锁会自动释放，这里只防御异常情况）
+    rm -f "$HOME/Library/Application Support/adb-wifi-manager/menubar.lock"
     echo "✓ 菜单栏 App 已安装到 ~/Applications/AdbWifiBar.app"
     echo "  可直接在访达中双击打开，或加入「登录项」"
 fi
