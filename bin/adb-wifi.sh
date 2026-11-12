@@ -1727,6 +1727,15 @@ net_mac_link_collect() {
         mtime=$(stat -f %m "$NETINFO_MAC_CACHE" 2>/dev/null || echo 0)
         age=$(( $(date +%s) - mtime ))
     fi
+    # 缓存只有"过期"一个刷新条件还不够：新增字段后，旧缓存缺该字段会让
+    # 新功能看起来失效（例如 NET_MAC_SSID 是后加的，旧缓存里没有，
+    # 导致"同 AP"判定一直返回 unknown）。缺关键字段时视为失效，强制重采。
+    if [ -f "$NETINFO_MAC_CACHE" ] && [ "$age" -lt "$NETINFO_MAC_TTL" ]; then
+        case "$(grep -c '^NET_MAC_SSID=' "$NETINFO_MAC_CACHE" 2>/dev/null)" in
+            1) ;;
+            *) age=$NETINFO_MAC_TTL ;;
+        esac
+    fi
     if [ "$age" -ge "$NETINFO_MAC_TTL" ]; then
         sp=$(system_profiler SPAirPortDataType 2>/dev/null \
             | sed -n '/Current Network Information/,/Other Local Wi-Fi Networks/p')
