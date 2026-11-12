@@ -576,6 +576,10 @@ so many devices cannot trigger a network storm.
 | | `NET_DEV_<n>_BATTERY` / `_CHARGING` | Battery level / charging flag |
 | | `NET_MAC_RATE` / `NET_MAC_CHANNEL` / `NET_MAC_RSSI` | Mac-side Wi-Fi link (global) |
 | | `NET_MAC_BATTERY` / `NET_MAC_POWER` | Mac battery (omitted when absent) and power state |
+| | `NET_MAC_SSID` | Mac-side SSID (used for the same-AP check) |
+| | `NET_CHANNEL_APS` / `NET_CHANNEL_CROWD` | Same-channel AP count / congestion `low`·`medium`·`high` |
+| | `NET_CHANNEL_STRONGEST` | Strongest same-channel interferer: `name\|signal dBm` |
+| | `NET_CHANNEL_BEST` | Suggested channel: `channel\|AP count on it` |
 | | `NET_RATE_AVG_MBPS` / `NET_RATE_MAX_MBPS` | Average / peak throughput while transferring |
 
 `netinfo` takes 2–4 s, so it is **never called from `diag`**. Its output is cached in

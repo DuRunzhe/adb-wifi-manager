@@ -1721,6 +1721,109 @@ net_dev_collect() {
 NETINFO_MAC_CACHE="$STATE_DIR/netinfo_mac.cache"
 NETINFO_MAC_TTL="${NETINFO_MAC_TTL:-300}"
 
+# ------------------------------------------------- 信道拥塞检测
+#
+# 排查「Wi-Fi 信号很好但延迟抖动大」的场景：同信道 AP 争用会导致 airtime
+# 抢占，表现为延迟剧烈抖动（标准差几十 ms），进而拖慢 adb 传输。
+# macOS 不提供 BSSID，但 system_profiler 能列出周边所有 AP 的信道与信号，
+# 足够统计「当前信道上有几个 AP 在争、最强的是谁」。
+#
+# 结果写入 Mac 侧缓存（与 NET_MAC_* 共用 300 秒 TTL），字段：
+#   NET_CHANNEL_APS       当前信道上的 AP 总数（含自己）
+#   NET_CHANNEL_CROWD     竞争强度等级：low / medium / high
+#   NET_CHANNEL_STRONGEST 同信道最强的其他 AP 名称与信号
+#   NET_CHANNEL_BEST      附近相对空闲的信道建议
+
+net_channel_scan() {
+    local sp cur_ch cur_bw cur_ssid rows
+    sp=$(system_profiler SPAirPortDataType 2>/dev/null)
+    [ -z "$sp" ] && return 0
+
+    local cur_section
+    cur_section=$(printf '%s\n' "$sp" | sed -n '/Current Network Information/,/Other Local/p')
+    cur_ch=$(printf '%s\n' "$cur_section" | sed -n 's/.*Channel: \([0-9]*\).*/\1/p' | head -1)
+    [ -z "$cur_ch" ] && return 0
+    cur_bw=$(printf '%s\n' "$cur_section" \
+        | sed -n 's/.*Channel: [0-9]* (5GHz, \([0-9]*\)MHz).*/\1/p' | head -1)
+    cur_ssid=$(printf '%s\n' "$cur_section" | sed -n 's/^ *\([^ ]*\):$/\1/p' | head -1)
+
+    # 输出周边 AP 每行："信道|频段|带宽|信号|名称"
+    rows=$(printf '%s\n' "$sp" | sed -n '/Other Local Wi-Fi Networks/,$p' | awk '
+        /^ {12}[^ ].*:$/ {
+            name = $0; sub(/^ +/, "", name); sub(/:$/, "", name); next
+        }
+        /Channel:/ {
+            ch = ""; band = ""; bw = ""
+            if (match($0, /Channel: [0-9]+/)) ch = substr($0, RSTART+9, RLENGTH-9)
+            if ($0 ~ /5GHz/) band = "5"; else if ($0 ~ /2GHz/) band = "2"
+            if (match($0, /[0-9]+MHz/)) bw = substr($0, RSTART, RLENGTH-3)
+            next
+        }
+        /Signal \/ Noise:/ {
+            sig = ""
+            if (match($0, /-?[0-9]+ dBm/)) sig = substr($0, RSTART, RLENGTH-4)
+            if (ch != "" && name != "") print ch "|" band "|" bw "|" sig "|" name
+            next
+        }
+    ')
+
+    # 一次 awk 算出：同信道其他 AP 数、最强干扰、建议信道
+    local out
+    out=$(printf '%s\n' "$rows" | awk -F'|' \
+        -v c="$cur_ch" -v bw="${cur_bw:-20}" -v self="$cur_ssid" '
+        # 80MHz/40MHz 覆盖范围按 20MHz 信道号偏移估算
+        function covered(ch,   d) {
+            d = ch - c
+            if (bw >= 80) return (d >= -6 && d <= 6)
+            if (bw >= 40) return (d >= -2 && d <= 2)
+            return (ch == c)
+        }
+        {
+            ch = $1 + 0
+            if ($5 == self) next                 # 排除自己
+            # 信号弱于 -80 dBm 的 AP 距离远、实际干扰很小，不计入（否则统计噪音大）
+            raw = $4 + 0
+            if (raw <= -80) next
+            cnt5[ch]++                           # 各信道 AP 数（用于建议）
+            if (!covered(ch)) next
+            n++
+            # 信号是负数（-40 比 -60 强），取绝对值比较大小
+            sig = -($4 + 0)
+            if (sig > best) { best = sig; nm = $5 }
+        }
+        END {
+            print "APS=" n+0
+            # best 存的是绝对值，输出时还原成 dBm
+            if (nm != "") print "STRONG=" nm "|-" best
+            # 建议信道：候选里 AP 最少的
+            split("36 40 44 48 60 64 149 153 157 161 165", cand, " ")
+            bc = ""; bn = -1
+            for (i in cand) {
+                k = cand[i] + 0
+                v = cnt5[k] + 0
+                if (bn < 0 || v < bn) { bn = v; bc = cand[i] }
+            }
+            if (bc != "") print "BEST=" bc "|" bn
+        }')
+
+    local aps crowd
+    aps=$(printf '%s\n' "$out" | sed -n 's/^APS=//p')
+    aps=${aps:-0}
+    if [ "$aps" -le 1 ]; then crowd=low
+    elif [ "$aps" -le 4 ]; then crowd=medium
+    else crowd=high
+    fi
+
+    echo "NET_CHANNEL_APS=$aps"
+    echo "NET_CHANNEL_CROWD=$crowd"
+    local strong best
+    strong=$(printf '%s\n' "$out" | sed -n 's/^STRONG=//p')
+    best=$(printf '%s\n' "$out"   | sed -n 's/^BEST=//p')
+    [ -n "$strong" ] && echo "NET_CHANNEL_STRONGEST=$strong"
+    [ -n "$best" ]   && echo "NET_CHANNEL_BEST=$best"
+    return 0
+}
+
 net_mac_link_collect() {
     local age=999999 mtime sp mac_ch mac_rate mac_rssi mac_ssid
     if [ -f "$NETINFO_MAC_CACHE" ]; then
@@ -1747,11 +1850,15 @@ net_mac_link_collect() {
         mac_rate=$(printf '%s' "$sp" | sed -n 's/.*Transmit Rate: \([0-9]*\).*/\1/p' | head -1)
         mac_rssi=$(printf '%s' "$sp" | sed -n 's/.*Signal \/ Noise: \(-\{0,1\}[0-9]*\).*/\1/p' | head -1)
         if [ -n "$mac_rate" ] || [ -n "$mac_ch" ]; then
+            # 信道拥塞检测：复用同一次 system_profiler 结果，额外做一次扫描
+            local chan_scan
+            chan_scan=$(net_channel_scan 2>/dev/null)
             {
                 [ -n "$mac_ssid" ] && echo "NET_MAC_SSID=$mac_ssid"
                 echo "NET_MAC_CHANNEL=$mac_ch"
                 echo "NET_MAC_RATE=$mac_rate"
                 echo "NET_MAC_RSSI=$mac_rssi"
+                [ -n "$chan_scan" ] && printf '%s\n' "$chan_scan"
             } > "$NETINFO_MAC_CACHE.tmp.$$" 2>/dev/null \
                 && mv -f "$NETINFO_MAC_CACHE.tmp.$$" "$NETINFO_MAC_CACHE" 2>/dev/null
         fi

@@ -410,6 +410,11 @@ final class L {
         "dev.ap.same.tip": "🔗 表示手机和这台电脑接在同一个 AP 下，互传不经过其他节点，延迟最低。",
         "dev.ap.maybe.tip": "🔗 表示信道相同，大概率接在同一个 AP 下。",
         "dev.ap.different.tip": "⚠ 表示手机和这台电脑不在同一个 AP 下，流量要经路由器转发，延迟会明显变高。",
+        "chan.line": "信道 %@ 拥挤度 %@ 个 AP（%@）",
+        "chan.crowd.low": "空闲",
+        "chan.crowd.medium": "一般",
+        "chan.crowd.high": "拥挤",
+        "chan.tip": "Wi-Fi 信号正常但延迟抖动大、速度上不去时，通常是同信道 AP 争抢信道。\n\n同信道最强干扰：%@ dBm\n建议换到信道：%@\n\n判断标准：同信道 AP 越少越好。信号强于 -80 dBm 的 AP 才计入（更远的实际干扰很小）。",
     ]
 
     private static let zhHant: [String: String] = [
@@ -746,6 +751,11 @@ final class L {
         "dev.ap.same.tip": "🔗 表示手機和這臺電腦接在同一個 AP 下，互傳不經過其他節點，延遲最低。",
         "dev.ap.maybe.tip": "🔗 表示頻道相同，大概率接在同一個 AP 下。",
         "dev.ap.different.tip": "⚠ 表示手機和這臺電腦不在同一個 AP 下，流量要經路由器轉發，延遲會明顯變高。",
+        "chan.line": "頻道 %@ 擁擠度 %@ 個 AP（%@）",
+        "chan.crowd.low": "空閒",
+        "chan.crowd.medium": "一般",
+        "chan.crowd.high": "擁擠",
+        "chan.tip": "Wi-Fi 訊號正常但延遲抖動大、速度上不去時，通常是同頻道 AP 爭搶頻道。\n\n同頻道最強干擾：%@ dBm\n建議換到頻道：%@\n\n判斷標準：同頻道 AP 越少越好。訊號強於 -80 dBm 的 AP 才計入。",
     ]
 
     private static let en: [String: String] = [
@@ -1084,5 +1094,10 @@ final class L {
         "dev.ap.same.tip": "🔗 means the phone and this Mac are on the same AP — direct path, lowest latency.",
         "dev.ap.maybe.tip": "🔗 means same channel — most likely the same AP.",
         "dev.ap.different.tip": "⚠ means the phone and this Mac are on different APs — traffic is forwarded by the router, raising latency.",
+        "chan.line": "Channel %@ congestion: %@ APs (%@)",
+        "chan.crowd.low": "clear",
+        "chan.crowd.medium": "moderate",
+        "chan.crowd.high": "crowded",
+        "chan.tip": "When the Wi-Fi signal is fine but latency jitters and speed stalls, the usual cause is neighbouring APs sharing the same channel.\n\nStrongest same-channel interferer: %@ dBm\nSuggested channel: %@\n\nOnly APs stronger than -80 dBm are counted; distant ones add little interference.",
     ]
 }

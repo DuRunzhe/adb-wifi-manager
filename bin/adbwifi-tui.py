@@ -159,6 +159,31 @@ class State:
                 self.raw.get("NET_RATE_MAX_MBPS", ""))
 
     @property
+    def channel_crowd(self):
+        """当前信道的拥塞情况，与菜单栏同口径。
+
+        返回 (AP 数, 等级, 最强干扰, 建议信道)；无数据时返回 None。
+        信号好但延迟抖动大时，通常是同信道 AP 争用所致。
+        """
+        raw = self.raw
+        try:
+            aps = int(raw.get("NET_CHANNEL_APS", "0") or 0)
+        except ValueError:
+            return None
+        if aps <= 0:
+            return None
+        crowd = raw.get("NET_CHANNEL_CROWD", "")
+        if not crowd:
+            crowd = "low" if aps <= 1 else ("medium" if aps <= 4 else "high")
+        return {
+            "aps": aps,
+            "crowd": crowd,
+            "channel": raw.get("NET_MAC_CHANNEL", ""),
+            "strongest": raw.get("NET_CHANNEL_STRONGEST", ""),
+            "best": raw.get("NET_CHANNEL_BEST", ""),
+        }
+
+    @property
     def mac_link(self):
         """Mac 侧 Wi-Fi 链路与电量（全局一份）"""
         return {
@@ -911,6 +936,23 @@ class App:
             self.addstr(y, 2, net_txt + note,
                         curses.color_pair(C_WARN) if note else curses.color_pair(C_DIM))
             y += 1
+
+            # 信道拥塞：信号好但速度慢时的头号嫌疑
+            cc = st.channel_crowd
+            if cc:
+                _lbl = {"low": "空闲", "medium": "一般", "high": "拥挤"}.get(cc["crowd"], "?")
+                _txt = "信道: %s  拥挤度: %d 个 AP（%s）" % (cc["channel"] or "-", cc["aps"], _lbl)
+                _attr = (curses.color_pair(C_WARN) if cc["crowd"] == "high"
+                         else curses.color_pair(C_DIM))
+                self.addstr(y, 2, _txt, _attr)
+                if cc["crowd"] == "high" and y < h - 8:
+                    # 拥挤时补一行建议，直接告诉用户该换到哪个信道
+                    _st = cc["strongest"].replace("|", " ")
+                    _bs = cc["best"].replace("|", "（空闲 ", 1) + " 个 AP）"
+                    self.addstr(y + 1, 2, "  最强干扰 %s dBm · 建议换到信道 %s" % (
+                        _st, _bs) if _st else "  建议换到更空闲的信道", curses.color_pair(C_DIM))
+                    y += 1
+                y += 1
 
         # adb 传输速率（仅在有设备连接时显示）
         if st.all_devices and st.rate_down:
@@ -1789,6 +1831,17 @@ def cli_fallback():
     _ms = st.mdns_state
     print("mDNS:", {"ok": "可用", "stalled": "曾卡死已恢复",
                     "flaky": "无响应重试中", "blocked": "被屏蔽"}.get(_ms, "未知"))
+    # 信道拥塞：信号好但延迟抖动大时，最常见的根因
+    cc = st.channel_crowd
+    if cc:
+        _lbl = {"low": "空闲", "medium": "一般", "high": "拥挤"}.get(cc["crowd"], "?")
+        print("信道: %s  拥挤度: %d 个 AP（%s）" % (
+            cc["channel"] or "-", cc["aps"], _lbl))
+        if cc["crowd"] == "high":
+            _st = cc["strongest"].replace("|", " ")
+            _bs = cc["best"].replace("|", "（空闲 ")
+            print("      最强干扰 %s dBm · 建议换到信道 %s 个 AP）" % (_st, _bs)
+                  if _st else "      建议换到更空闲的信道")
     # 链路质量摘要：与交互界面同一份数据、同一套评级，纯文本下给一行精简版
     links = st.dev_links
     if links:

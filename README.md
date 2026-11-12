@@ -567,6 +567,10 @@ VIA=known
 | | `NET_DEV_<n>_BATTERY` / `_CHARGING` | 电量 / 是否充电中 |
 | | `NET_MAC_RATE` / `NET_MAC_CHANNEL` / `NET_MAC_RSSI` | Mac 侧 Wi-Fi 链路（全局） |
 | | `NET_MAC_BATTERY` / `NET_MAC_POWER` | Mac 电量（无电池则不输出）与供电状态 |
+| | `NET_MAC_SSID` | Mac 侧 SSID（用于判断手机是否同一 AP） |
+| | `NET_CHANNEL_APS` / `NET_CHANNEL_CROWD` | 同信道其他 AP 数 / 竞争等级 `low`·`medium`·`high` |
+| | `NET_CHANNEL_STRONGEST` | 同信道最强干扰 AP：`名称\|信号dBm` |
+| | `NET_CHANNEL_BEST` | 建议信道：`信道\|该信道AP数` |
 | | `NET_RATE_AVG_MBPS` / `NET_RATE_MAX_MBPS` | 传输时的平均 / 峰值吞吐 |
 
 `netinfo` 采集一次约 2–4 秒，因此**不直接进 `diag`**：结果写入

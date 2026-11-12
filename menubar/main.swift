@@ -206,6 +206,8 @@ struct Status {
     var mdnsEmptyTurns = ""
     /// Mac 侧当前 Wi-Fi 的 SSID（用于判断手机与电脑是否在同一 AP 下）
     var macSSID = ""
+    /// 信道拥塞：同信道 AP 数 / 竞争等级 / 最强干扰 / 建议信道
+    var channelAPS = "", channelCrowd = "", channelStrongest = "", channelBest = ""
     // 结构化诊断结论（由脚本层统一给出，与 TUI 完全同源）
     var diagLevel = ""
     var diagCode = ""
@@ -301,6 +303,10 @@ func loadStatus() -> Status {
     s.mdnsState = kv["MDNS_STATE"] ?? ""
     s.mdnsEmptyTurns = kv["MDNS_EMPTY_TURNS"] ?? ""
     s.macSSID = kv["NET_MAC_SSID"] ?? ""
+    s.channelAPS = kv["NET_CHANNEL_APS"] ?? ""
+    s.channelCrowd = kv["NET_CHANNEL_CROWD"] ?? ""
+    s.channelStrongest = kv["NET_CHANNEL_STRONGEST"] ?? ""
+    s.channelBest = kv["NET_CHANNEL_BEST"] ?? ""
 
     let devCount = Int(kv["NET_DEV_COUNT"] ?? "0") ?? 0
     if devCount > 0 {
@@ -1083,6 +1089,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 sub.addItem(disabledItem(L.t("env.rate.total", s.rateTotalDown,
                                              s.rateTotalUp)))
             }
+        }
+
+        // ---- 信道拥塞（Wi-Fi 信号好但速度慢时，通常是同信道 AP 争用）----
+        if let aps = Int(s.channelAPS), aps > 0 {
+            let crowdText: String
+            switch s.channelCrowd {
+            case "high":   crowdText = L.t("chan.crowd.high")
+            case "medium": crowdText = L.t("chan.crowd.medium")
+            default:       crowdText = L.t("chan.crowd.low")
+            }
+            let line = L.t("chan.line", s.macChannel.isEmpty ? "-" : s.macChannel,
+                           String(aps), crowdText)
+            sub.addItem(disabledItem(line, tooltip: L.t("chan.tip", s.channelStrongest,
+                                                       s.channelBest)))
         }
 
         // ---- 链路数据采集时间 + adb devices ----
