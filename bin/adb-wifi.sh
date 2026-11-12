@@ -84,6 +84,7 @@ LOG_DIR="$APP_SUPPORT/logs"
 LOG_FILE="$LOG_DIR/adb-wifi.log"
 PID_FILE="$APP_SUPPORT/adb-wifi.pid"
 KNOWN_FILE="$STATE_DIR/known_endpoints.txt"   # 历史连接成功过的 IP:PORT（跨重启保留）
+DEVICE_FILE="$STATE_DIR/known_devices.txt"    # serialno|型号|最后端点（跨重启保留）
 SCAN_STAMP="$STATE_DIR/last_scan_attempt"     # 上次网段扫描时间，用于节流
 MAX_LOG_BYTES=1048576
 
@@ -166,6 +167,8 @@ remember_endpoint() {
     local ep="$1"
     touch "$KNOWN_FILE"
     grep -qxF "$ep" "$KNOWN_FILE" 2>/dev/null || echo "$ep" >> "$KNOWN_FILE"
+    # 连上了说明这个端点有效，清掉历史失败计数
+    clear_known_fail "$ep" 2>/dev/null || true
 }
 
 # 把 adb 中**当前所有在线端点**补记进记忆文件。
@@ -177,17 +180,48 @@ remember_endpoint() {
 #   · 其他工具（Android Studio、scrcpy）建立的连接
 # 这些都是"曾经连通过、之后还能连"的有效地址，理应参与自动恢复。
 sync_known_from_devices() {
-    local ep changed=0
+    local ep sn model
     touch "$KNOWN_FILE" 2>/dev/null || return 0
+    touch "$DEVICE_FILE" 2>/dev/null || true
     for ep in $(wifi_devices); do
         case "$ep" in *:*) ;; *) continue ;; esac
         if ! grep -qxF "$ep" "$KNOWN_FILE" 2>/dev/null; then
             echo "$ep" >> "$KNOWN_FILE"
-            changed=1
             info "记住新端点 $ep（来源：当前已连接设备）"
+        fi
+        # 记录设备身份：serialno 不会随 IP 变化，用来识别"是同一台手机回来了"，
+        # 而不是只看 IP。端点了丢的时候，靠它能知道还有哪台设备没连上。
+        sn=$(tmo 5 "$ADB_BIN" -s "$ep" shell getprop ro.serialno 2>/dev/null | tr -d '\r')
+        [ -z "$sn" ] && continue
+        model=$(tmo 5 "$ADB_BIN" -s "$ep" shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+        if grep -q "^${sn}|" "$DEVICE_FILE" 2>/dev/null; then
+            grep -v "^${sn}|" "$DEVICE_FILE" > "$DEVICE_FILE.tmp" 2>/dev/null \
+                && { printf '%s|%s|%s\n' "$sn" "$model" "$ep" >> "$DEVICE_FILE.tmp"; \
+                     mv -f "$DEVICE_FILE.tmp" "$DEVICE_FILE"; }
+        else
+            printf '%s|%s|%s\n' "$sn" "$model" "$ep" >> "$DEVICE_FILE"
+            info "记录设备身份 $model（$sn）"
         fi
     done
     return 0
+}
+
+# 统计：身份档案里有、但当前没连上的设备数
+missing_device_count() {
+    local connected sn line
+    connected=$(wifi_devices)
+    [ -f "$DEVICE_FILE" ] || { echo 0; return 0; }
+    local n=0
+    while IFS='|' read -r sn model ep; do
+        [ -z "$sn" ] && continue
+        # 该身份最后已知的端点是否在线
+        if ! printf '%s\n' "$connected" | grep -qxF "$ep"; then
+            # 端口可达说明只是没连上，算一台待恢复的设备
+            local ip="${ep%%:*}" port="${ep##*:}"
+            nc -z -G 1 -w 1 "$ip" "$port" 2>/dev/null && n=$((n + 1))
+        fi
+    done < "$DEVICE_FILE"
+    echo "$n"
 }
 
 # 当前 Mac 主网卡 IP 与 /24 网段的网段前缀
@@ -586,12 +620,46 @@ try_connect() {
     return 1
 }
 
-# 失效端点从已知列表移除（设备重启后端口会变化）
+# 端点失败计数文件：<state>/known_fails/<hash>
+# 用 "一次失败就删除" 太激进：网络抖动、手机短暂休眠、Wi-Fi 漫游都会让
+# connect 超时，但设备本身仍是好的（实测过：被删掉的端点 5555 端口还开着）。
+# 改为连续失败 KNOWN_FAIL_LIMIT 次才删除，且删除后仍保留一份历史，
+# 网段扫描兜底时还能再找回来。
+KNOWN_FAIL_DIR="$STATE_DIR/known_fails"
+KNOWN_FAIL_LIMIT="${KNOWN_FAIL_LIMIT:-5}"
+
+_known_fail_file() {
+    # 把 IP:PORT 变成安全的文件名
+    echo "$KNOWN_FAIL_DIR/$(printf '%s' "$1" | tr ':' '_').cnt"
+}
+
+# 记录一次连接失败；达到阈值才从记忆列表移除
 forget_endpoint() {
-    local ep="$1"
+    local ep="$1" f n=0
     [ -f "$KNOWN_FILE" ] || return 0
-    grep -vxF "$ep" "$KNOWN_FILE" > "$KNOWN_FILE.tmp" 2>/dev/null && mv -f "$KNOWN_FILE.tmp" "$KNOWN_FILE"
-    info "移除失效端点 $ep"
+    grep -qxF "$ep" "$KNOWN_FILE" 2>/dev/null || return 0
+    mkdir -p "$KNOWN_FAIL_DIR" 2>/dev/null || true
+    f=$(_known_fail_file "$ep")
+    [ -f "$f" ] && read -r n < "$f" 2>/dev/null
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    n=$((n + 1))
+    echo "$n" > "$f" 2>/dev/null
+    if [ "$n" -ge "$KNOWN_FAIL_LIMIT" ]; then
+        grep -vxF "$ep" "$KNOWN_FILE" > "$KNOWN_FILE.tmp" 2>/dev/null \
+            && mv -f "$KNOWN_FILE.tmp" "$KNOWN_FILE"
+        info "端点 $ep 连续失败 $n 次，移出记忆列表（网段扫描仍可找回）"
+    else
+        info "端点 $ep 连接失败（$n/$KNOWN_FAIL_LIMIT），暂不移除"
+    fi
+    return 0
+}
+
+# 连接成功时清掉失败计数
+clear_known_fail() {
+    local f
+    f=$(_known_fail_file "$1")
+    rm -f "$f" 2>/dev/null
+    return 0
 }
 
 # macOS 通知（失败不影响主流程）
@@ -816,16 +884,37 @@ main_loop() {
             tcpip_eps=$(ensure_tcpip)
         fi
 
-        # 都没有着落时扫描本网段，找回换了 IP 的手机（无需 USB）。
-        # 节流：每 SCAN_INTERVAL 秒最多扫一次，避免持续占满网络。
+        # 扫描本网段，找回换了 IP 的手机（无需 USB）。实测整段扫描约 0.9 秒。
+        #
+        # 触发条件有两条，任一满足即可：
+        #  A. 什么都没有（原来唯一的条件）
+        #  B. 记忆里有端点当前没连上 —— 说明有设备掉了。
+        #     旧逻辑只在 A 时扫描，于是"一台连着、另一台掉了"永远轮不到扫描，
+        #     掉线的设备就再也找不回来（实测踩到过）。
         scan_eps=""
-        if [ -z "$connected_eps" ] && [ -z "$mdns_eps" ] && [ -z "$usb_eps" ] \
-           && [ -z "$known_eps" ] && [ -z "$tcpip_eps" ] && [ "$AUTO_SCAN" = "1" ]; then
+        _lost=0
+        # 判据一：记忆里的端点当前没连上
+        for _ep in $known_eps; do
+            printf '%s\n' "$connected_eps" | grep -qxF "$_ep" || { _lost=1; break; }
+        done
+        # 判据二：身份档案里有设备没连上（IP 可能已经变了，记忆端点看不出来）
+        if [ "$_lost" = "0" ] && [ -f "$DEVICE_FILE" ] && [ -n "$connected_eps" ]; then
+            _known_ep_count=$(awk -F'|' 'NF>=3' "$DEVICE_FILE" 2>/dev/null | wc -l | tr -d ' ')
+            _now_ep_count=$(printf '%s\n' "$connected_eps" | awk 'NF' | wc -l | tr -d ' ')
+            [ "${_known_ep_count:-0}" -gt "${_now_ep_count:-0}" ] && _lost=1
+        fi
+        if [ "$AUTO_SCAN" = "1" ] && { \
+             { [ -z "$connected_eps" ] && [ -z "$mdns_eps" ] && [ -z "$usb_eps" ] \
+               && [ -z "$known_eps" ] && [ -z "$tcpip_eps" ]; } || [ "$_lost" = "1" ]; }; then
             _now=$(date +%s)
             _last=0
             [ -f "$SCAN_STAMP" ] && read -r _last < "$SCAN_STAMP" 2>/dev/null
             case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
-            if [ $((_now - _last)) -ge "$SCAN_INTERVAL" ]; then
+            # 因掉线触发的扫描用较短间隔（设备刚掉线，尽快找回）；
+            # "什么都没有"的场景沿用 SCAN_INTERVAL，避免空网段反复扫。
+            _interval="$SCAN_INTERVAL"
+            [ "$_lost" = "1" ] && _interval="${SCAN_INTERVAL_LOST:-60}"
+            if [ $((_now - _last)) -ge "$_interval" ]; then
                 echo "$_now" > "$SCAN_STAMP"
                 scan_eps=$(scan_lan_for_port "$TCPIP_PORT")
                 [ -n "$scan_eps" ] && info "网段扫描发现: $(echo $scan_eps | tr '\n' ' ')"
