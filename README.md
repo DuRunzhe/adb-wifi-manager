@@ -569,9 +569,9 @@ VIA=known
 | | `NET_DEV_<n>_BATTERY` / `_CHARGING` | 电量 / 是否充电中 |
 | | `NET_MAC_RATE` / `NET_MAC_CHANNEL` / `NET_MAC_RSSI` | Mac 侧 Wi-Fi 链路（全局） |
 | | `NET_MAC_BATTERY` / `NET_MAC_POWER` | Mac 电量（无电池则不输出）与供电状态 |
-| | `NET_MAC_SSID` | Mac 侧 SSID（用于判断手机是否同一 AP） |
+| | `NET_MAC_SSID` | Mac 侧 SSID（用于判断手机是否同一 AP）；macOS 15+ 系统打码时为**空值** |
 | | `NET_CHANNEL_APS` / `NET_CHANNEL_CROWD` | 同信道其他 AP 数 / 竞争等级 `low`·`medium`·`high` |
-| | `NET_CHANNEL_STRONGEST` | 同信道最强干扰 AP：`名称\|信号dBm` |
+| | `NET_CHANNEL_STRONGEST` | 同信道最强干扰：`名称\|信号dBm`；名称打码时只给 `信号dBm`，无则整行不输出 |
 | | `NET_CHANNEL_BEST` | 建议信道：`信道\|该信道AP数` |
 | | `NET_MAC_PHY` / `NET_MAC_BW` / `NET_MAC_MCS` | Wi-Fi 模式 / 信道带宽(MHz) / MCS 索引 |
 | | `NET_MAC_NOISE` / `NET_MAC_SNR` | 噪声底(dBm) / 信噪比(dB)，SNR = RSSI − NOISE |
@@ -586,6 +586,9 @@ VIA=known
 `netinfo` 采集一次约 2–4 秒，因此**不直接进 `diag`**：结果写入
 `state/netinfo.cache`（TTL 60 秒），`diag` 会在末尾附带读取该缓存的内容。
 `NET_AT` 是采集时间戳（epoch 秒），用于判断缓存新鲜度。
+Mac 侧字段（`NET_MAC_*` / `NET_CHANNEL_*` / `NET_WIFI_*`）另存
+`state/netinfo_mac.cache`（TTL 300 秒）；**`netinfo-refresh` 会忽略这两个 TTL
+强制重采**，保证菜单里点「刷新」看到的确实是刚采的数据。
 显示层统一把 Mbps 换算成 MB/s（字节基准）。
 
 `diag` 同时保留 `DIAG_TITLE` / `DIAG_HINT` 中文文案（终端与 TUI 用）。App 优先用

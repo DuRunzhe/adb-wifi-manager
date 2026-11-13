@@ -2081,7 +2081,7 @@ net_wifi_quality() {
 }
 
 net_channel_scan() {
-    local sp cur_ch cur_bw cur_ssid rows
+    local sp cur_ch cur_bw cur_band cur_ssid rows
     # 接受调用方传入的 system_profiler 输出，避免同一轮重复采集（单次约 2 秒）
     sp="${1:-}"
     [ -z "$sp" ] && sp=$(system_profiler SPAirPortDataType 2>/dev/null)
@@ -2093,11 +2093,22 @@ net_channel_scan() {
     [ -z "$cur_ch" ] && return 0
     cur_bw=$(printf '%s\n' "$cur_section" \
         | sed -n 's/.*Channel: [0-9]* (5GHz, \([0-9]*\)MHz).*/\1/p' | head -1)
+    cur_band=$(printf '%s\n' "$cur_section" \
+        | sed -n 's/.*Channel: [0-9]* (\([0-9]\)GHz.*/\1/p' | head -1)
     cur_ssid=$(printf '%s\n' "$cur_section" | sed -n 's/^ *\([^ ]*\):$/\1/p' | head -1)
 
     # 输出周边 AP 每行："信道|频段|带宽|信号|名称"
+    # 注意：macOS 15 起 system_profiler 有两个变化，旧实现因此总数 0：
+    #   ① SSID 全部打码成 "<redacted>"，按名字排除自己会把所有 AP 都排除掉；
+    #   ② 部分 AP 没有 "Signal / Noise" 行，只写 Channel，按行触发就会漏计。
+    # 因此改为「遇到下一个 AP 名 / 结尾时」输出，信号缺失就留空。
     rows=$(printf '%s\n' "$sp" | sed -n '/Other Local Wi-Fi Networks/,$p' | awk '
+        function flush() {
+            if (ch != "") print ch "|" band "|" bw "|" sig "|" name
+            ch = ""; band = ""; bw = ""; sig = ""
+        }
         /^ {12}[^ ].*:$/ {
+            flush()
             name = $0; sub(/^ +/, "", name); sub(/:$/, "", name); next
         }
         /Channel:/ {
@@ -2110,15 +2121,21 @@ net_channel_scan() {
         /Signal \/ Noise:/ {
             sig = ""
             if (match($0, /-?[0-9]+ dBm/)) sig = substr($0, RSTART, RLENGTH-4)
-            if (ch != "" && name != "") print ch "|" band "|" bw "|" sig "|" name
             next
         }
+        END { flush() }
     ')
+
+    # 打码模式下（macOS 15+）当前网络会同时出现在 Others 列表里，
+    # 又无法按名字区分，只能按「频道 + 频段 + 带宽」排掉唯一一条自己。
+    local redacted=0
+    [ "$cur_ssid" = "<redacted>" ] && redacted=1
 
     # 一次 awk 算出：同信道其他 AP 数、最强干扰、建议信道
     local out
     out=$(printf '%s\n' "$rows" | awk -F'|' \
-        -v c="$cur_ch" -v bw="${cur_bw:-20}" -v self="$cur_ssid" '
+        -v c="$cur_ch" -v bw="${cur_bw:-20}" -v self="$cur_ssid" \
+        -v curband="$cur_band" -v redacted="$redacted" '
         # 80MHz/40MHz 覆盖范围按 20MHz 信道号偏移估算
         function covered(ch,   d) {
             d = ch - c
@@ -2128,21 +2145,30 @@ net_channel_scan() {
         }
         {
             ch = $1 + 0
-            if ($5 == self) next                 # 排除自己
-            # 信号弱于 -80 dBm 的 AP 距离远、实际干扰很小，不计入（否则统计噪音大）
-            raw = $4 + 0
-            if (raw <= -80) next
+            # 排除自己：当前网络本不在 "Other Local Wi-Fi Networks" 里，
+            # 只有 SSID 可读时保留这层保险（打码时谁都叫 <redacted>，不能按名字排）。
+            if (self != "" && self != "<redacted>" && $5 == self) next
+            # 打码模式：按频道+频段+带宽排掉自己（只跳过一次，避免把邻居也吃掉）
+            if (redacted == 1 && !selfSkipped && ch == c && $2 == curband \
+                && ($3 + 0) == (bw + 0)) { selfSkipped = 1; next }
+            # 信号弱于 -80 dBm 的 AP 距离远、实际干扰很小，不计入（否则统计噪音大）。
+            # 没上报 Signal / Noise 的行信号未知，仍按「同信道有 AP」计入。
+            known = ($4 ~ /^-?[0-9]+$/)
+            if (known && $4 + 0 <= -80) next
             cnt5[ch]++                           # 各信道 AP 数（用于建议）
             if (!covered(ch)) next
             n++
-            # 信号是负数（-40 比 -60 强），取绝对值比较大小
-            sig = -($4 + 0)
-            if (sig > best) { best = sig; nm = $5 }
+            if (known) {
+                # 信号是负数（-40 比 -60 强），取绝对值比较大小
+                sig = -($4 + 0)
+                # 打码后的名字没有信息量，只保留信号强度
+                if (sig > best) { best = sig; nm = ($5 == "<redacted>" ? "" : $5) }
+            }
         }
         END {
             print "APS=" n+0
-            # best 存的是绝对值，输出时还原成 dBm
-            if (nm != "") print "STRONG=" nm "|-" best
+            # best 存的是绝对值，输出时还原成 dBm；nm 为空则只给信号
+            if (best != "") print "STRONG=" (nm == "" ? "-" : nm "|-") best
             # 建议信道：候选里 AP 最少的
             split("36 40 44 48 60 64 149 153 157 161 165", cand, " ")
             bc = ""; bn = -1
@@ -2173,11 +2199,16 @@ net_channel_scan() {
 }
 
 net_mac_link_collect() {
-    local age=999999 mtime sp mac_ch mac_rate mac_rssi mac_ssid
+    local age=999999 mtime sp sp_full mac_ch mac_rate mac_rssi mac_ssid
     if [ -f "$NETINFO_MAC_CACHE" ]; then
         mtime=$(stat -f %m "$NETINFO_MAC_CACHE" 2>/dev/null || echo 0)
         age=$(( $(date +%s) - mtime ))
     fi
+    # 显式刷新（netinfo-refresh）必须真的重采 Mac 侧：
+    # 信道 / 协商速率 / 信噪比 / 丢包 / 拥塞正是「更多信息」里展示的内容，
+    # 但以前这里只看 300 秒 TTL —— 用户点刷新会 0.1 秒就返回「已刷新」，
+    # 屏幕上却还是几分钟前的旧数字（看起来像刷新没生效）。
+    [ "${NETINFO_FORCE:-0}" = "1" ] && age=$NETINFO_MAC_TTL
     # 缓存只有"过期"一个刷新条件还不够：新增字段后，旧缓存缺该字段会让
     # 新功能看起来失效（例如 NET_MAC_SSID 是后加的，旧缓存里没有，
     # 导致"同 AP"判定一直返回 unknown）。缺关键字段时视为失效，强制重采。
@@ -2186,25 +2217,37 @@ net_mac_link_collect() {
             1) ;;
             *) age=$NETINFO_MAC_TTL ;;
         esac
+        # 旧版本把 macOS 打码后的 "<redacted>" 当成真 SSID 存了下来，同样算失效
+        grep -q '^NET_MAC_SSID=<redacted>$' "$NETINFO_MAC_CACHE" 2>/dev/null \
+            && age=$NETINFO_MAC_TTL
     fi
     if [ "$age" -ge "$NETINFO_MAC_TTL" ]; then
-        sp=$(system_profiler SPAirPortDataType 2>/dev/null \
+        # sp_full 保留完整输出（含 Other Local Wi-Fi Networks）：
+        # 信道拥塞统计必须看周边 AP 列表，而 sp 只截到当前网络。
+        # 以前把截断后的 sp 传给 net_channel_scan，导致周边列表永远是空的，
+        # NET_CHANNEL_APS 恒为 0、菜单里的信道拥塞行永远不出现。
+        sp_full=$(system_profiler SPAirPortDataType 2>/dev/null)
+        sp=$(printf '%s\n' "$sp_full" \
             | sed -n '/Current Network Information/,/Other Local Wi-Fi Networks/p')
         # Mac 侧 SSID：用于判断手机是否接在同一个 Wi-Fi / 同一个 AP 下。
         # 取 "Current Network Information:" 之后那行的 SSID（形如 "            PiLink:"）。
         # 注意 macOS 不提供 Mac 侧 BSSID（隐私限制），只能靠 SSID + 信道间接判断。
         mac_ssid=$(printf '%s' "$sp" | sed -n 's/^ *\([^ ]*\):$/\1/p' | head -1)
+        # macOS 15 起 system_profiler 把 SSID 打了码，输出 "<redacted>"。
+        # 它不是真名字：写进缓存会让「同 AP」判定永远误判成"不同网络"。
+        [ "$mac_ssid" = "<redacted>" ] && mac_ssid=""
         mac_ch=$(printf '%s' "$sp" | sed -n 's/.*Channel: \([0-9]*\).*/\1/p' | head -1)
         mac_rate=$(printf '%s' "$sp" | sed -n 's/.*Transmit Rate: \([0-9]*\).*/\1/p' | head -1)
         mac_rssi=$(printf '%s' "$sp" | sed -n 's/.*Signal \/ Noise: \(-\{0,1\}[0-9]*\).*/\1/p' | head -1)
         if [ -n "$mac_rate" ] || [ -n "$mac_ch" ]; then
             # 信道拥塞检测：复用同一次 system_profiler 结果，额外做一次扫描
             local chan_scan wifi_q
-            chan_scan=$(net_channel_scan "$sp" 2>/dev/null)
+            chan_scan=$(net_channel_scan "$sp_full" 2>/dev/null)
             # 纯 Wi-Fi 质量（含到网关的实测延迟），与 adb 链路无关
-            wifi_q=$(net_wifi_quality "$sp" "${mac_rate:-}" 2>/dev/null)
+            wifi_q=$(net_wifi_quality "$sp_full" "${mac_rate:-}" 2>/dev/null)
             {
-                [ -n "$mac_ssid" ] && echo "NET_MAC_SSID=$mac_ssid"
+                # 恒输出该字段（可能为空）：TTL 校验靠 grep 这个 KEY 判断旧缓存是否缺字段
+                echo "NET_MAC_SSID=$mac_ssid"
                 echo "NET_MAC_CHANNEL=$mac_ch"
                 echo "NET_MAC_RATE=$mac_rate"
                 echo "NET_MAC_RSSI=$mac_rssi"
@@ -2631,7 +2674,9 @@ cmd_netinfo_refresh() {
     fi
     local rc=0
     trap 'rm -rf "$NETINFO_LOCK" 2>/dev/null' EXIT INT TERM
-    net_info_collect > "$NETINFO_CACHE.tmp.$$" 2>/dev/null \
+    # 用户显式点的刷新：连 Mac 侧（Wi-Fi 质量 / 信道拥塞，300 秒 TTL）一起重采。
+    # 只有这种全量刷新才强制；守护的定时刷新仍然尊重 TTL，不白烧 system_profiler。
+    NETINFO_FORCE=1 net_info_collect > "$NETINFO_CACHE.tmp.$$" 2>/dev/null \
         && mv "$NETINFO_CACHE.tmp.$$" "$NETINFO_CACHE" \
         || { rm -f "$NETINFO_CACHE.tmp.$$"; rc=1; }
     rm -rf "$NETINFO_LOCK" 2>/dev/null

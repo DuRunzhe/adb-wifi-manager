@@ -1247,15 +1247,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // ---- 纯 Wi-Fi 链路质量（Mac ↔ AP，不含手机与 adb）----
         let wifiQ = wifiQualityLines(s)
+        sub.addItem(disabledItem(L.t("wifi.quality.header"), tooltip: L.t("wifi.quality.header.tip")))
         if !wifiQ.isEmpty {
-            sub.addItem(disabledItem(L.t("wifi.quality.header"), tooltip: L.t("wifi.quality.header.tip")))
             for (text, tip) in wifiQ {
                 sub.addItem(disabledItem("  " + text, tooltip: tip))
             }
+        } else {
+            // 没数据也要留一行说明，否则这一段直接消失，看起来像「刷新没生效」
+            sub.addItem(disabledItem("  " + L.t("wifi.quality.none")))
         }
 
         // ---- 信道拥塞（Wi-Fi 信号好但速度慢时，通常是同信道 AP 争用）----
-        if let aps = Int(s.channelAPS), aps > 0 {
+        // APS=0 也要显示：0 个同信道 AP 是「好消息」，藏起来反而像没采到数据
+        if !s.channelAPS.isEmpty {
+            let aps = Int(s.channelAPS) ?? 0
             let crowdText: String
             switch s.channelCrowd {
             case "high":   crowdText = L.t("chan.crowd.high")
@@ -1264,8 +1269,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             let line = L.t("chan.line", s.macChannel.isEmpty ? "-" : s.macChannel,
                            String(aps), crowdText)
-            sub.addItem(disabledItem(line, tooltip: L.t("chan.tip", s.channelStrongest,
-                                                       s.channelBest)))
+            // 协议里 STRONGEST / BEST 形如 "名称|-54" / "40|0"，直接塞进文案会把
+            // 竖线也显示给用户，只取需要的那一段。
+            // macOS 15+ 不再上报周边 AP 信号，此时没有「最强干扰」可列。
+            let strongest = s.channelStrongest.split(separator: "|").last.map(String.init) ?? ""
+            let best = s.channelBest.split(separator: "|").first.map(String.init) ?? s.channelBest
+            let tip = strongest.isEmpty
+                ? L.t("chan.tip.bare", best)
+                : L.t("chan.tip", strongest, best)
+            sub.addItem(disabledItem(line, tooltip: tip))
         }
 
         // ---- 数据时间 + 刷新入口（合并成一行，点击即重新采集）----

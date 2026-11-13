@@ -415,6 +415,7 @@ final class L {
         "chan.crowd.medium": "一般",
         "chan.crowd.high": "拥挤",
         "chan.tip": "Wi-Fi 信号正常但延迟抖动大、速度上不去时，通常是同信道 AP 争抢信道。\n\n同信道最强干扰：%@ dBm\n建议换到信道：%@\n\n判断标准：同信道 AP 越少越好。信号强于 -80 dBm 的 AP 才计入（更远的实际干扰很小）。",
+        "chan.tip.bare": "Wi-Fi 信号正常但延迟抖动大、速度上不去时，通常是同信道 AP 争抢信道。\n\n建议换到信道：%@\n\n判断标准：同信道 AP 越少越好。macOS 15 起系统不再上报周边 AP 的信号强度，因此这里只统计个数、不列最强干扰。",
         "wifi.quality.header": "Wi-Fi 质量（电脑 ↔ 路由器，不含手机）",
         "wifi.quality.header.tip": "这一段只看这台电脑连 Wi-Fi 的质量，和 adb、手机都无关。\n\n如果这里的数字很差，那所有无线设备都会慢，问题在 Wi-Fi 本身。",
         "wifi.snr.line": "信噪比 %@ %@ %@ dB（%@）",
@@ -433,6 +434,9 @@ final class L {
         "wifi.rtt.grade.excellent": "优秀",
         "wifi.rtt.grade.ok": "一般",
         "wifi.rtt.grade.bad": "较差",
+        "wifi.rtt.lost": "Wi-Fi 延迟 网关没有回应（丢包 %@%%）",
+        "wifi.rtt.lost.tip": "ping 网关 8 个包全部丢失，所以没有延迟数字可显示。\n\n常见原因：路由器禁了 ICMP / 开启了 AP 隔离；少数情况下是 Wi-Fi 真的断了。\n\n这一段只影响延迟与抖动两项，其他数字（协商速率、信噪比、拥挤度）仍可参考。",
+        "wifi.quality.none": "读不到这台电脑的 Wi-Fi 信息（未连 Wi-Fi 或系统未提供）",
         "jitter.grade.excellent": "平稳",
         "jitter.grade.ok": "可接受",
         "jitter.grade.bad": "抖动大",
@@ -452,7 +456,7 @@ final class L {
         "menu.loading": "正在读取最新状态 …",
         "net.ageRefresh": "数据是 %@前的 · 点此刷新",
         "net.age.unknown": "未知",
-        "net.ageRefresh.tip": "点击重新采集所有设备的链路数据（约 8 秒）。\n\n只刷某一台请用它自己子菜单里的「重新测一次速度」。",
+        "net.ageRefresh.tip": "点击立即重采这一段的数据：电脑侧（带宽/信噪比/延迟/拥挤）会同步刷新，有设备时一并重采各手机链路（约 8 秒）。\n\n只刷某一台手机请用它自己子菜单里的刷新。",
     ]
 
     private static let zhHant: [String: String] = [
@@ -794,6 +798,7 @@ final class L {
         "chan.crowd.medium": "一般",
         "chan.crowd.high": "擁擠",
         "chan.tip": "Wi-Fi 訊號正常但延遲抖動大、速度上不去時，通常是同頻道 AP 爭搶頻道。\n\n同頻道最強干擾：%@ dBm\n建議換到頻道：%@\n\n判斷標準：同頻道 AP 越少越好。訊號強於 -80 dBm 的 AP 才計入。",
+        "chan.tip.bare": "Wi-Fi 訊號正常但延遲抖動大、速度上不去時，通常是同頻道 AP 爭搶頻道。\n\n建議換到頻道：%@\n\n判斷標準：同頻道 AP 越少越好。macOS 15 起系統不再上報周邊 AP 的訊號強度，因此這裡只統計個數、不列最強干擾。",
         "wifi.quality.header": "Wi-Fi 品質（電腦 ↔ 路由器，不含手機）",
         "wifi.quality.header.tip": "這一段只看這臺電腦連 Wi-Fi 的品質，和 adb、手機都無關。\n\n如果這裡的數字很差，那所有無線裝置都會慢，問題在 Wi-Fi 本身。",
         "wifi.snr.line": "訊噪比 %@ %@ %@ dB（%@）",
@@ -812,6 +817,9 @@ final class L {
         "wifi.rtt.grade.excellent": "優秀",
         "wifi.rtt.grade.ok": "一般",
         "wifi.rtt.grade.bad": "較差",
+        "wifi.rtt.lost": "Wi-Fi 延遲 閘道沒有回應（丢包 %@%%）",
+        "wifi.rtt.lost.tip": "ping 閘道 8 個封包全部遗失，所以沒有延遲數字可顯示。\n\n常見原因：路由器禁了 ICMP / 開啟了 AP 隔離；少數情況下是 Wi-Fi 真的斷了。\n\n這一段只影響延遲與抖動兩項，其他數字（協商速率、訊噪比、擁擠度）仍可參考。",
+        "wifi.quality.none": "讀不到這臺電腦的 Wi-Fi 資訊（未連 Wi-Fi 或系統未提供）",
         "jitter.grade.excellent": "平穩",
         "jitter.grade.ok": "可接受",
         "jitter.grade.bad": "抖動大",
@@ -831,7 +839,7 @@ final class L {
         "menu.loading": "正在讀取最新狀態 …",
         "net.ageRefresh": "資料是 %@前的 · 點此重新整理",
         "net.age.unknown": "未知",
-        "net.ageRefresh.tip": "點擊重新採集所有裝置的鏈路資料（約 8 秒）。\n\n只刷某一臺請用它自己子選單裡的「重新測一次速度」。",
+        "net.ageRefresh.tip": "點擊立即重採這一段的資料：電腦側（頻寬/訊噪比/延遲/擁擠）會同步重新整理，有裝置時一併重採各手機鏈路（約 8 秒）。\n\n只刷某一臺手機請用它自己子選單裡的重新整理。",
     ]
 
     private static let en: [String: String] = [
@@ -1175,6 +1183,7 @@ final class L {
         "chan.crowd.medium": "moderate",
         "chan.crowd.high": "crowded",
         "chan.tip": "When the Wi-Fi signal is fine but latency jitters and speed stalls, the usual cause is neighbouring APs sharing the same channel.\n\nStrongest same-channel interferer: %@ dBm\nSuggested channel: %@\n\nOnly APs stronger than -80 dBm are counted; distant ones add little interference.",
+        "chan.tip.bare": "When the Wi-Fi signal is fine but latency jitters and speed stalls, the usual cause is neighbouring APs sharing the same channel.\n\nSuggested channel: %@\n\nFewer same-channel APs is better. Since macOS 15 the system no longer reports neighbours' signal strength, so only the count is shown.",
         "wifi.quality.header": "Wi-Fi quality (Mac ↔ router, phone not involved)",
         "wifi.quality.header.tip": "This section covers only this Mac's Wi-Fi link — no adb, no phone.\n\nIf these numbers are poor, every wireless device will be slow and the problem is Wi-Fi itself.",
         "wifi.snr.line": "SNR %@ %@ %@ dB (%@)",
@@ -1193,6 +1202,9 @@ final class L {
         "wifi.rtt.grade.excellent": "excellent",
         "wifi.rtt.grade.ok": "fair",
         "wifi.rtt.grade.bad": "poor",
+        "wifi.rtt.lost": "Wi-Fi latency — gateway gave no reply (%@%% loss)",
+        "wifi.rtt.lost.tip": "All 8 pings to the gateway were lost, so there is no latency figure to show.\n\nUsual causes: the router blocks ICMP or uses AP isolation; occasionally Wi-Fi really is down.\n\nThis only affects latency and jitter — the other numbers (negotiated rate, SNR, congestion) stay meaningful.",
+        "wifi.quality.none": "Cannot read this Mac's Wi-Fi info (not on Wi-Fi, or not provided by the system)",
         "jitter.grade.excellent": "steady",
         "jitter.grade.ok": "acceptable",
         "jitter.grade.bad": "jittery",
@@ -1212,6 +1224,6 @@ final class L {
         "menu.loading": "Loading latest status …",
         "net.ageRefresh": "Data from %@ ago · click to refresh",
         "net.age.unknown": "unknown",
-        "net.ageRefresh.tip": "Click to re-sample link data for all devices (about 8s).\n\nTo refresh a single device use \"Measure speed again\" in its submenu.",
+        "net.ageRefresh.tip": "Refreshes what this section shows: the Mac side (bandwidth, SNR, latency, congestion) is re-sampled, plus every phone link when devices are connected (about 8s).\n\nTo refresh a single phone use the refresh entry in its own submenu.",
     ]
 }

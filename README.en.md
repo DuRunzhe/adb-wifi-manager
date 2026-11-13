@@ -578,9 +578,9 @@ so many devices cannot trigger a network storm.
 | | `NET_DEV_<n>_BATTERY` / `_CHARGING` | Battery level / charging flag |
 | | `NET_MAC_RATE` / `NET_MAC_CHANNEL` / `NET_MAC_RSSI` | Mac-side Wi-Fi link (global) |
 | | `NET_MAC_BATTERY` / `NET_MAC_POWER` | Mac battery (omitted when absent) and power state |
-| | `NET_MAC_SSID` | Mac-side SSID (used for the same-AP check) |
+| | `NET_MAC_SSID` | Mac-side SSID (same-AP check); **empty** when macOS 15+ redacts it |
 | | `NET_CHANNEL_APS` / `NET_CHANNEL_CROWD` | Same-channel AP count / congestion `low`·`medium`·`high` |
-| | `NET_CHANNEL_STRONGEST` | Strongest same-channel interferer: `name\|signal dBm` |
+| | `NET_CHANNEL_STRONGEST` | Strongest same-channel interferer: `name\|signal dBm`; signal only when the name is redacted; line omitted when unknown |
 | | `NET_CHANNEL_BEST` | Suggested channel: `channel\|AP count on it` |
 | | `NET_MAC_PHY` / `NET_MAC_BW` / `NET_MAC_MCS` | Wi-Fi mode / channel width (MHz) / MCS index |
 | | `NET_MAC_NOISE` / `NET_MAC_SNR` | Noise floor (dBm) / SNR (dB) = RSSI − NOISE |
@@ -595,6 +595,9 @@ so many devices cannot trigger a network storm.
 `netinfo` takes 2–4 s, so it is **never called from `diag`**. Its output is cached in
 `state/netinfo.cache` (60 s TTL) and `diag` appends the cached lines at the end.
 `NET_AT` is the sample timestamp (epoch seconds), used to judge cache freshness.
+Mac-side fields (`NET_MAC_*` / `NET_CHANNEL_*` / `NET_WIFI_*`) live in
+`state/netinfo_mac.cache` (300 s TTL); **`netinfo-refresh` ignores both TTLs** and
+re-samples everything, so the menu's refresh always shows freshly measured data.
 The UI layer converts Mbps to MB/s (byte units).
 
 `diag` still emits the Chinese `DIAG_TITLE` / `DIAG_HINT` for the terminal and TUI.
