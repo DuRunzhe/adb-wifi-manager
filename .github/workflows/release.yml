@@ -172,20 +172,33 @@ jobs:
             --wait
 
           echo "装订公证票据 ..."
+          # staple 把票据写进 App 包内，是离线可用的关键步骤
           xcrun stapler staple "$APP"
-          # stapler validate 读本地票据，是装订是否成功的权威判据
-          xcrun stapler validate "$APP"
-          # spctl 会联网向 Apple 查询一次票据，偶发 NSURLErrorDomain -1005
-          # （网络连接中断）。此时本地票据已经装订成功、用户打开也不受影响，
-          # 不该因此让整次发布失败 —— 只记录结果，失败时重试一次并降级为警告。
-          echo "spctl 校验（会联网，失败不影响发布）..."
-          if ! spctl -a -t exec -vv "$APP" 2>&1; then
-            echo "首次 spctl 校验失败，5 秒后重试 ..."
-            sleep 5
-            if ! spctl -a -t exec -vv "$APP" 2>&1; then
-              echo "::warning::spctl 在线校验失败（Apple 网络抖动），本地票据已装订，发布继续"
+
+          # 下面两个校验都会联网访问 api.apple-cloudkit.com，偶发
+          # NSURLErrorDomain -1005「网络连接中断」（实测已遇到两次，
+          # stapler validate 和 spctl 都会中招）。
+          # 此时票据已经成功装订进 App，用户双击打开完全不受影响，
+          # 不该因此让整次发布失败、产物不上传。降级为重试一次 + 警告。
+          # 注意 set -e：函数内命令失败会直接终止脚本，必须用 if 包住（if 的条件不受 set -e 影响）
+          _verify() {
+            local name="$1"; shift
+            echo "$name 校验（会联网，失败不阻断发布）..."
+            if "$@" 2>&1; then
+              echo "$name 校验通过"
+              return 0
             fi
-          fi
+            echo "首次 $name 校验失败，5 秒后重试 ..."
+            sleep 5
+            if "$@" 2>&1; then
+              echo "$name 校验通过（重试成功）"
+              return 0
+            fi
+            echo "::warning::$name 在线校验失败（Apple 网络抖动），本地票据已装订，发布继续"
+            return 0
+          }
+          _verify "stapler validate" xcrun stapler validate "$APP"
+          _verify "spctl" spctl -a -t exec -vv "$APP"
           rm -f "$KEY" "$ZIP"
 
       - name: 打包
