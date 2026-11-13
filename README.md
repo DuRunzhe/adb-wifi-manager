@@ -571,6 +571,14 @@ VIA=known
 | | `NET_CHANNEL_APS` / `NET_CHANNEL_CROWD` | 同信道其他 AP 数 / 竞争等级 `low`·`medium`·`high` |
 | | `NET_CHANNEL_STRONGEST` | 同信道最强干扰 AP：`名称\|信号dBm` |
 | | `NET_CHANNEL_BEST` | 建议信道：`信道\|该信道AP数` |
+| | `NET_MAC_PHY` / `NET_MAC_BW` / `NET_MAC_MCS` | Wi-Fi 模式 / 信道带宽(MHz) / MCS 索引 |
+| | `NET_MAC_NOISE` / `NET_MAC_SNR` | 噪声底(dBm) / 信噪比(dB)，SNR = RSSI − NOISE |
+| | `NET_WIFI_RTT_AVG/_MIN/_MAX` | 到网关的实测延迟(ms)，纯 Wi-Fi 段 |
+| | `NET_WIFI_JITTER` / `NET_WIFI_LOSS` | 抖动(ms，max−min) / 丢包率(%) |
+| | `NET_WIFI_GW` / `NET_WIFI_AT` | 探测网关地址 / 采样时间戳 |
+| | `NET_MAC_THEO` | 理论峰值(Mbps)，按 PHY+带宽查表（单流 MCS9）|
+| | `NET_WIFI_RATE_NOW` / `_USABLE` | 当前协商速率 / 实际可用(协商×60%)，Mbps |
+| | `NET_WIFI_RATE_RATIO` | 协商达成率(%) = 协商 ÷ 理论 |
 | | `NET_RATE_AVG_MBPS` / `NET_RATE_MAX_MBPS` | 传输时的平均 / 峰值吞吐 |
 
 `netinfo` 采集一次约 2–4 秒，因此**不直接进 `diag`**：结果写入

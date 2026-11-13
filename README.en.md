@@ -580,6 +580,14 @@ so many devices cannot trigger a network storm.
 | | `NET_CHANNEL_APS` / `NET_CHANNEL_CROWD` | Same-channel AP count / congestion `low`·`medium`·`high` |
 | | `NET_CHANNEL_STRONGEST` | Strongest same-channel interferer: `name\|signal dBm` |
 | | `NET_CHANNEL_BEST` | Suggested channel: `channel\|AP count on it` |
+| | `NET_MAC_PHY` / `NET_MAC_BW` / `NET_MAC_MCS` | Wi-Fi mode / channel width (MHz) / MCS index |
+| | `NET_MAC_NOISE` / `NET_MAC_SNR` | Noise floor (dBm) / SNR (dB) = RSSI − NOISE |
+| | `NET_WIFI_RTT_AVG/_MIN/_MAX` | Measured latency to the gateway (ms) — pure Wi-Fi hop |
+| | `NET_WIFI_JITTER` / `NET_WIFI_LOSS` | Jitter (ms, max−min) / packet loss (%) |
+| | `NET_WIFI_GW` / `NET_WIFI_AT` | Probed gateway / sample timestamp |
+| | `NET_MAC_THEO` | Theoretical peak (Mbps) from PHY+bandwidth table (1 SS, top MCS) |
+| | `NET_WIFI_RATE_NOW` / `_USABLE` | Negotiated rate / usable (negotiated × 60%), Mbps |
+| | `NET_WIFI_RATE_RATIO` | Negotiated ÷ theoretical (%) |
 | | `NET_RATE_AVG_MBPS` / `NET_RATE_MAX_MBPS` | Average / peak throughput while transferring |
 
 `netinfo` takes 2–4 s, so it is **never called from `diag`**. Its output is cached in

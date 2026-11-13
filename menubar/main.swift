@@ -208,6 +208,11 @@ struct Status {
     var macSSID = ""
     /// 信道拥塞：同信道 AP 数 / 竞争等级 / 最强干扰 / 建议信道
     var channelAPS = "", channelCrowd = "", channelStrongest = "", channelBest = ""
+    /// 纯 Wi-Fi 链路质量（Mac ↔ AP，与 adb 无关）
+    var macPHY = "", macBW = "", macMCS = "", macSNR = "", macNoise = ""
+    /// 带宽三口径：理论峰值 / 当前协商 / 实际可用（均 Mbps）
+    var macTheo = "", wifiRateNow = "", wifiRateUsable = "", wifiRateRatio = ""
+    var wifiRTT = "", wifiRTTMin = "", wifiRTTMax = "", wifiJitter = "", wifiLoss = ""
     // 结构化诊断结论（由脚本层统一给出，与 TUI 完全同源）
     var diagLevel = ""
     var diagCode = ""
@@ -295,6 +300,10 @@ func loadStatus() -> Status {
     s.macChannel = kv["NET_MAC_CHANNEL"] ?? ""
     s.macRate = kv["NET_MAC_RATE"] ?? ""
     s.macRSSI = kv["NET_MAC_RSSI"] ?? ""
+    s.macTheo = kv["NET_MAC_THEO"] ?? ""
+    s.wifiRateNow = kv["NET_WIFI_RATE_NOW"] ?? ""
+    s.wifiRateUsable = kv["NET_WIFI_RATE_USABLE"] ?? ""
+    s.wifiRateRatio = kv["NET_WIFI_RATE_RATIO"] ?? ""
     s.macBattery = kv["NET_MAC_BATTERY"] ?? ""
     s.macPower = kv["NET_MAC_POWER"] ?? ""
     s.rateAvgMbps = kv["NET_RATE_AVG_MBPS"] ?? ""
@@ -307,6 +316,16 @@ func loadStatus() -> Status {
     s.channelCrowd = kv["NET_CHANNEL_CROWD"] ?? ""
     s.channelStrongest = kv["NET_CHANNEL_STRONGEST"] ?? ""
     s.channelBest = kv["NET_CHANNEL_BEST"] ?? ""
+    s.macPHY = kv["NET_MAC_PHY"] ?? ""
+    s.macBW = kv["NET_MAC_BW"] ?? ""
+    s.macMCS = kv["NET_MAC_MCS"] ?? ""
+    s.macSNR = kv["NET_MAC_SNR"] ?? ""
+    s.macNoise = kv["NET_MAC_NOISE"] ?? ""
+    s.wifiRTT = kv["NET_WIFI_RTT_AVG"] ?? ""
+    s.wifiRTTMin = kv["NET_WIFI_RTT_MIN"] ?? ""
+    s.wifiRTTMax = kv["NET_WIFI_RTT_MAX"] ?? ""
+    s.wifiJitter = kv["NET_WIFI_JITTER"] ?? ""
+    s.wifiLoss = kv["NET_WIFI_LOSS"] ?? ""
 
     let devCount = Int(kv["NET_DEV_COUNT"] ?? "0") ?? 0
     if devCount > 0 {
@@ -617,6 +636,85 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// 吞吐分级：按「峰值 ÷ 上限」的比例，3 档
+    /// 信噪比分级（dB）。SNR 比单纯信号强度更能反映链路质量。
+    func snrLevel(_ db: Double) -> (step: Int, label: String) {
+        if db >= 40 { return (5, L.t("snr.grade.excellent")) }
+        if db >= 30 { return (4, L.t("snr.grade.good")) }
+        if db >= 20 { return (3, L.t("snr.grade.ok")) }
+        if db >= 10 { return (2, L.t("snr.grade.weak")) }
+        return (1, L.t("snr.grade.bad"))
+    }
+
+    /// Wi-Fi 延迟分级（ms）：只看 Mac↔AP 这一段
+    func wifiRTTLevel(_ ms: Double) -> (step: Int, label: String) {
+        if ms < 10 { return (3, L.t("wifi.rtt.grade.excellent")) }
+        if ms < 30 { return (2, L.t("wifi.rtt.grade.ok")) }
+        return (1, L.t("wifi.rtt.grade.bad"))
+    }
+
+    /// 抖动分级（ms）：体感上比平均值更关键
+    func jitterLevel(_ ms: Double) -> (step: Int, label: String) {
+        if ms < 10 { return (3, L.t("jitter.grade.excellent")) }
+        if ms < 50 { return (2, L.t("jitter.grade.ok")) }
+        return (1, L.t("jitter.grade.bad"))
+    }
+
+    /// 纯 Wi-Fi 质量区（Mac ↔ AP），与下方 adb 链路质量刻意分开
+    func wifiQualityLines(_ s: Status) -> [(String, String?)] {
+        var out: [(String, String?)] = []
+        guard !s.macPHY.isEmpty || !s.wifiRTT.isEmpty else { return out }
+
+        // ⓪ 带宽三口径：理论峰值 / 当前协商 / 实际可用
+        if let theo = Double(s.macTheo), theo > 0 {
+            let nowMB = (Double(s.wifiRateNow) ?? 0) / 8
+            let usableMB = (Double(s.wifiRateUsable) ?? 0) / 8
+            let ratio = Int(s.wifiRateRatio) ?? 0
+            // 协商速率 / 理论峰值 的比重，反映链路降级程度
+            let lv: (step: Int, label: String)
+            if ratio >= 80 { lv = (3, L.t("rate.ratio.good")) }
+            else if ratio >= 50 { lv = (2, L.t("rate.ratio.ok")) }
+            else { lv = (1, L.t("rate.ratio.bad")) }
+            out.append((L.t("wifi.bw.line", meter(filled: lv.step, total: 3),
+                            String(format: "%.0f", theo / 8),
+                            String(format: "%.1f", nowMB),
+                            String(format: "%.0f", usableMB),
+                            String(format: "%d", ratio)),
+                        L.t("wifi.bw.tip", s.macPHY, s.macBW, s.macMCS)))
+        }
+
+        // ① 链路能力：协商速率即当前 PHY 实际可用带宽，MCS 反映信道条件
+        if !s.macNoise.isEmpty || !s.macPHY.isEmpty {
+            if let snr = Double(s.macSNR), let sig = Double(s.macRSSI) {
+                let lv = snrLevel(snr)
+                out.append((L.t("wifi.snr.line", meter(filled: lv.step, total: 5), lv.label,
+                                String(format: "%.0f", snr), L.t("snr.scale")),
+                            L.t("wifi.snr.tip", String(format: "%.0f", sig), s.macNoise)))
+            } else if let snr = Double(s.macSNR) {
+                let lv = snrLevel(snr)
+                out.append((L.t("wifi.snr.line.bare", meter(filled: lv.step, total: 5), lv.label,
+                                String(format: "%.0f", snr), L.t("snr.scale")),
+                            L.t("wifi.snr.tip.bare", s.macNoise)))
+            }
+        }
+
+        // ② 实测延迟与抖动：到网关这一段就是纯 Wi-Fi
+        if let rtt = Double(s.wifiRTT) {
+            let lv = wifiRTTLevel(rtt)
+            var line = L.t("wifi.rtt.line", meter(filled: lv.step, total: 3), lv.label,
+                           String(format: "%.1f", rtt), L.t("wifi.rtt.scale"))
+            if let j = Double(s.wifiJitter), let mn = Double(s.wifiRTTMin),
+               let mx = Double(s.wifiRTTMax) {
+                let jl = jitterLevel(j)
+                line = L.t("wifi.rtt.line.full", String(format: "%.1f", rtt),
+                           meter(filled: lv.step, total: 3), lv.label,
+                           String(format: "%.1f", mn), String(format: "%.1f", mx),
+                           String(format: "%.1f", j), jl.label)
+            }
+            out.append((line, L.t("wifi.rtt.tip", s.wifiLoss.isEmpty ? "-" : s.wifiLoss)))
+        }
+        return out
+    }
+
     func throughputLevel(_ usage: Double) -> (step: Int, label: String) {
         if usage >= 30 { return (3, L.t("net.tp.grade.good")) }
         if usage >= 10 { return (2, L.t("net.tp.grade.fair")) }
@@ -1088,6 +1186,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !s.rateTotalDown.isEmpty {
                 sub.addItem(disabledItem(L.t("env.rate.total", s.rateTotalDown,
                                              s.rateTotalUp)))
+            }
+        }
+
+        // ---- 纯 Wi-Fi 链路质量（Mac ↔ AP，不含手机与 adb）----
+        let wifiQ = wifiQualityLines(s)
+        if !wifiQ.isEmpty {
+            sub.addItem(disabledItem(L.t("wifi.quality.header"), tooltip: L.t("wifi.quality.header.tip")))
+            for (text, tip) in wifiQ {
+                sub.addItem(disabledItem("  " + text, tooltip: tip))
             }
         }
 

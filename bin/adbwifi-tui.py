@@ -159,6 +159,37 @@ class State:
                 self.raw.get("NET_RATE_MAX_MBPS", ""))
 
     @property
+    def wifi_quality(self):
+        """纯 Wi-Fi 链路质量（Mac ↔ AP），与 adb 无关。
+
+        与 dev_links 的 adb 链路质量刻意分开：这里反映的是这台 Mac
+        连 Wi-Fi 本身好不好，所有无线设备都受它影响。
+        """
+        r = self.raw
+        snr = r.get("NET_MAC_SNR", "")
+        rtt = r.get("NET_WIFI_RTT_AVG", "")
+        if not snr and not rtt:
+            return None
+        return {
+            "phy": r.get("NET_MAC_PHY", ""),
+            "bw": r.get("NET_MAC_BW", ""),
+            "mcs": r.get("NET_MAC_MCS", ""),
+            "rssi": r.get("NET_MAC_RSSI", ""),
+            "noise": r.get("NET_MAC_NOISE", ""),
+            "snr": snr,
+            "rtt": rtt,
+            "rtt_min": r.get("NET_WIFI_RTT_MIN", ""),
+            "rtt_max": r.get("NET_WIFI_RTT_MAX", ""),
+            "jitter": r.get("NET_WIFI_JITTER", ""),
+            "loss": r.get("NET_WIFI_LOSS", ""),
+            "rate": r.get("NET_MAC_RATE", ""),
+            "theo": r.get("NET_MAC_THEO", ""),
+            "rate_now": r.get("NET_WIFI_RATE_NOW", ""),
+            "rate_usable": r.get("NET_WIFI_RATE_USABLE", ""),
+            "rate_ratio": r.get("NET_WIFI_RATE_RATIO", ""),
+        }
+
+    @property
     def channel_crowd(self):
         """当前信道的拥塞情况，与菜单栏同口径。
 
@@ -593,6 +624,36 @@ def throughput_grade(peak_mbps, ceiling_mbps):
     return usage, "偏低" + meter(1, 3)
 
 
+def snr_grade(db):
+    """信噪比分级（dB），与菜单栏 wifi.snr 同一套档位。"""
+    if db >= 40:
+        return 5, "极佳"
+    if db >= 30:
+        return 4, "良好"
+    if db >= 20:
+        return 3, "一般"
+    if db >= 10:
+        return 2, "偏弱"
+    return 1, "很差"
+
+
+def wifi_rtt_grade(ms):
+    """Wi-Fi 延迟分级（ms）：只看 Mac↔AP 这一段。"""
+    if ms < 10:
+        return 3, "优秀"
+    if ms < 30:
+        return 2, "一般"
+    return 1, "较差"
+
+
+def jitter_grade(ms):
+    if ms < 10:
+        return "平稳"
+    if ms < 50:
+        return "可接受"
+    return "抖动大"
+
+
 def same_ap_tag(dev, mac):
     """手机与这台电脑是否同一 AP 的符号标识（与菜单栏同一套判据和符号）。
 
@@ -936,6 +997,47 @@ class App:
             self.addstr(y, 2, net_txt + note,
                         curses.color_pair(C_WARN) if note else curses.color_pair(C_DIM))
             y += 1
+
+            # 纯 Wi-Fi 质量（Mac ↔ AP）：与 adb 链路分开，所有无线设备都受它影响
+            wq = st.wifi_quality
+            if wq:
+                # 带宽三口径：理论峰值 / 当前协商 / 实际可用
+                try:
+                    _theo = float(wq["theo"])
+                    _now = float(wq["rate_now"])
+                    _us = float(wq["rate_usable"])
+                    _ra = int(float(wq["rate_ratio"]))
+                    _rl = "接近满速" if _ra >= 80 else ("部分降级" if _ra >= 50 else "严重降级")
+                    _rs = 3 if _ra >= 80 else (2 if _ra >= 50 else 1)
+                    self.addstr(y, 2, "带宽 %s 理论 %.0f MB/s · 当前协商 %.1f · 实际可用 %.0f MB/s（达成率 %d%% %s）" % (
+                        meter(_rs, 3), _theo / 8, _now / 8, _us / 8, _ra, _rl),
+                        curses.color_pair(C_INFO))
+                    y += 1
+                except ValueError:
+                    pass
+            if wq and wq["snr"]:
+                try:
+                    _snr = float(wq["snr"])
+                    _sstep, _slbl = snr_grade(_snr)
+                    self.addstr(y, 2, "Wi-Fi %s %s · 信噪比 %.0f dB %s" % (
+                        wq["phy"] or "", ("%s MHz" % wq["bw"]) if wq["bw"] else "",
+                        _snr, meter(_sstep, 5)), curses.color_pair(C_INFO))
+                    y += 1
+                    if wq["rtt"]:
+                        _r = float(wq["rtt"])
+                        _rs, _rl = wifi_rtt_grade(_r)
+                        _jd = ""
+                        if wq["jitter"]:
+                            try:
+                                _jd = " · 抖动 %.1f ms %s" % (
+                                    float(wq["jitter"]), jitter_grade(float(wq["jitter"])))
+                            except ValueError:
+                                pass
+                        self.addstr(y, 2, "  Wi-Fi 延迟 %.1f ms %s%s" % (
+                            _r, meter(_rs, 3), _jd), curses.color_pair(C_DIM))
+                        y += 1
+                except ValueError:
+                    pass
 
             # 信道拥塞：信号好但速度慢时的头号嫌疑
             cc = st.channel_crowd
@@ -1831,6 +1933,35 @@ def cli_fallback():
     _ms = st.mdns_state
     print("mDNS:", {"ok": "可用", "stalled": "曾卡死已恢复",
                     "flaky": "无响应重试中", "blocked": "被屏蔽"}.get(_ms, "未知"))
+    # 纯 Wi-Fi 质量（Mac ↔ AP）
+    wq = st.wifi_quality
+    if wq and wq["theo"]:
+        try:
+            _t = float(wq["theo"]); _n = float(wq["rate_now"])
+            _u = float(wq["rate_usable"]); _r = int(float(wq["rate_ratio"]))
+            _lb = "接近满速" if _r >= 80 else ("部分降级" if _r >= 50 else "严重降级")
+            _s = 3 if _r >= 80 else (2 if _r >= 50 else 1)
+            print("带宽: %s 理论 %.0f MB/s · 当前协商 %.1f · 实际可用 %.0f MB/s（达成率 %d%% %s）" % (
+                meter(_s, 3), _t / 8, _n / 8, _u / 8, _r, _lb))
+        except ValueError:
+            pass
+    if wq and wq["snr"]:
+        try:
+            _snr = float(wq["snr"])
+            _ss, _sl = snr_grade(_snr)
+            print("Wi-Fi: %s %s · 信噪比 %.0f dB %s %s" % (
+                wq["phy"] or "", ("%s MHz" % wq["bw"]) if wq["bw"] else "",
+                _snr, meter(_ss, 5), _sl))
+            if wq["rtt"]:
+                _r = float(wq["rtt"])
+                _rs, _rl = wifi_rtt_grade(_r)
+                _extra = ""
+                if wq["jitter"]:
+                    _extra = " · 抖动 %s ms %s" % (
+                        wq["jitter"], jitter_grade(float(wq["jitter"])))
+                print("      延迟 %.1f ms %s %s%s" % (_r, meter(_rs, 3), _rl, _extra))
+        except ValueError:
+            pass
     # 信道拥塞：信号好但延迟抖动大时，最常见的根因
     cc = st.channel_crowd
     if cc:

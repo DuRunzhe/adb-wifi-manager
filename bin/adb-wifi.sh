@@ -1823,9 +1823,129 @@ NETINFO_MAC_TTL="${NETINFO_MAC_TTL:-300}"
 #   NET_CHANNEL_STRONGEST 同信道最强的其他 AP 名称与信号
 #   NET_CHANNEL_BEST      附近相对空闲的信道建议
 
+# ------------------------------------------------- 纯 Wi-Fi 链路质量
+#
+# 与「adb 链路质量」区分开：这里只看这台 Mac 与其所连 AP 之间的 PHY 层质量，
+# 不经过手机、不含 adb 开销。数据全部来自 system_profiler（无需 root），
+# 延迟则用 ICMP ping 网关实测（网关就是 AP 的下一跳，最能代表 Wi-Fi 段）。
+#
+# 输出字段：
+#   NET_MAC_PHY        802.11 模式（如 802.11ac）
+#   NET_MAC_BW         信道带宽（MHz）
+#   NET_MAC_MCS        MCS 索引（-1 表示未上报）
+#   NET_MAC_SNR        信噪比（dB）= Signal - Noise
+#   NET_MAC_NOISE      噪声底（dBm）
+#   NET_WIFI_RTT_AVG   到网关的平均往返时延（ms）
+#   NET_WIFI_RTT_MIN/_MAX  最小 / 最大
+#   NET_WIFI_JITTER    抖动（ms，最大-最小，比标准差更贴近体感）
+#   NET_WIFI_LOSS      丢包率（%）
+#   NET_WIFI_GW        探测用的网关地址
+#   NET_WIFI_AT        采样时间戳
+
+# Wi-Fi 理论峰值查表（Mbps，单流 MCS9，即 system_profiler 报的 Transmit Rate 上限）
+#
+# 802.11 各标准在「单空间流 + 最高 MCS」下的理论 PHY 速率。
+# macOS 不报告空间流数，所以只能按单流给保守理论值；实测协商速率通常低于它。
+# 键：<PHY模式前缀>_<带宽MHz>
+wifi_theoretical_mbps() {
+    local phy="$1" bw="$2"
+    case "$phy" in
+        802.11be*)
+            case "$bw" in
+                320) echo 1721 ;; 160) echo 864 ;; 80) echo 413 ;; 40) echo 172 ;; 20) echo 86 ;; *) echo "" ;;
+            esac ;;
+        802.11ax*)
+            case "$bw" in
+                160) echo 600 ;; 80) echo 433 ;; 40) echo 172 ;; 20) echo 86 ;; *) echo "" ;;
+            esac ;;
+        802.11ac*)
+            case "$bw" in
+                80) echo 433 ;; 40) echo 200 ;; 20) echo 87 ;; *) echo "" ;;
+            esac ;;
+        802.11n*)
+            case "$bw" in
+                40) echo 150 ;; 20) echo 72 ;; *) echo "" ;;
+            esac ;;
+        *) echo "" ;;
+    esac
+}
+
+net_wifi_quality() {
+    local sp sec phy bw mcs sig noise gw tmo_ms=3 count=8 cur_rate
+    sp="${1:-}"
+    cur_rate="${2:-}"
+    [ -z "$sp" ] && sp=$(system_profiler SPAirPortDataType 2>/dev/null)
+    sec=$(printf '%s\n' "$sp" | sed -n '/Current Network Information/,/Other Local/p')
+    [ -z "$sec" ] && return 0
+
+    phy=$(printf '%s\n' "$sec" | sed -n 's/.*PHY Mode: *\(.*\)$/\1/p' | head -1)
+    bw=$(printf '%s\n' "$sec" | sed -n 's/.*Channel: [0-9]* ([^)]*, \([0-9]*\)MHz).*/\1/p' | head -1)
+    mcs=$(printf '%s\n' "$sec" | sed -n 's/.*MCS Index: *\([0-9-]*\).*/\1/p' | head -1)
+    # "Signal / Noise: -51 dBm / -86 dBm"
+    sig=$(printf '%s\n' "$sec" | sed -n 's/.*Signal \/ Noise: *\(-\{0,1\}[0-9]*\) dBm.*/\1/p' | head -1)
+    noise=$(printf '%s\n' "$sec" | sed -n 's/.*Signal \/ Noise: *-\{0,1\}[0-9]* dBm \/ \(-\{0,1\}[0-9]*\) dBm.*/\1/p' | head -1)
+
+    [ -n "$phy" ]   && echo "NET_MAC_PHY=$phy"
+    [ -n "$bw" ]    && echo "NET_MAC_BW=$bw"
+    # 理论峰值（该 PHY + 带宽下的单流上限），与实测协商速率对照
+    local theo
+    theo=$(wifi_theoretical_mbps "$phy" "$bw")
+    [ -n "$theo" ] && echo "NET_MAC_THEO=$theo"
+    [ -n "$mcs" ]   && echo "NET_MAC_MCS=$mcs"
+    # RSSI 由 net_mac_link_collect 统一输出，这里只补它拿不到的信噪比
+    [ -n "$noise" ] && echo "NET_MAC_NOISE=$noise"
+    if [ -n "$sig" ] && [ -n "$noise" ]; then
+        echo "NET_MAC_SNR=$((sig - noise))"
+    fi
+
+    # ---- 带宽三个口径 ----
+    # ① 理论峰值：由 PHY + 带宽查表，是这一档配置的物理上限
+    # ② 当前协商：网卡此刻实际谈到的速率（随 MCS 动态变化）
+    # ③ 实际可用：协商速率 × 60%，扣除协议开销后的真实吞吐上限
+    if [ -n "$cur_rate" ]; then
+        echo "NET_WIFI_RATE_NOW=$cur_rate"
+        echo "NET_WIFI_RATE_USABLE=$(awk -v r="$cur_rate" 'BEGIN{printf "%.1f", r*0.6}')"
+        if [ -n "$theo" ] && [ "$theo" -gt 0 ] 2>/dev/null; then
+            echo "NET_WIFI_RATE_RATIO=$(awk -v r="$cur_rate" -v t="$theo" \
+                'BEGIN{printf "%.0f", r*100/t}')"
+        fi
+    fi
+
+    # ---- 到网关的实测延迟与抖动 ----
+    # 网关是 AP 的下一跳，这一段就是纯 Wi-Fi（不含路由器上游）。
+    gw=$(netstat -rn 2>/dev/null | awk '$1=="default" && $2 ~ /^[0-9.]+$/ {print $2; exit}')
+    [ -z "$gw" ] && return 0
+    local out sent recv avg min max loss jitter
+    out=$(ping -c "$count" -i 0.15 -t "$tmo_ms" "$gw" 2>/dev/null)
+    [ -z "$out" ] && return 0
+    echo "NET_WIFI_GW=$gw"
+    # 汇总行形如 "10 packets transmitted, 10 packets received, 0.0% packet loss"（行首无缩进）
+    sent=$(printf '%s\n' "$out" | sed -n 's/^\([0-9]\{1,\}\) packets transmitted.*/\1/p' | head -1)
+    recv=$(printf '%s\n' "$out" | sed -n 's/.*, \([0-9]\{1,\}\) packets received.*/\1/p' | head -1)
+    if [ -n "$sent" ] && [ "$sent" -gt 0 ] 2>/dev/null; then
+        echo "NET_WIFI_LOSS=$(awk -v s="$sent" -v r="${recv:-0}" 'BEGIN{printf "%.0f", (s-r)*100/s}')"
+    fi
+    # macOS 的汇总行：round-trip min/avg/max/stddev = a/b/c/d ms
+    min=$(printf '%s\n' "$out" | sed -n 's#.*round-trip min/avg/max/[a-z]* = \([0-9.]*\)/.*#\1#p' | head -1)
+    avg=$(printf '%s\n' "$out" | sed -n 's#.*round-trip min/avg/max/[a-z]* = [0-9.]*/\([0-9.]*\)/.*#\1#p' | head -1)
+    max=$(printf '%s\n' "$out" | sed -n 's#.*round-trip min/avg/max/[a-z]* = [0-9.]*/[0-9.]*/\([0-9.]*\)/.*#\1#p' | head -1)
+    if [ -n "$avg" ]; then
+        echo "NET_WIFI_RTT_AVG=$avg"
+        echo "NET_WIFI_RTT_MIN=$min"
+        echo "NET_WIFI_RTT_MAX=$max"
+        # 抖动用 max-min：比标准差更贴近"卡不卡"的体感
+        [ -n "$min" ] && [ -n "$max" ] && \
+            echo "NET_WIFI_JITTER=$(awk -v a="$min" -v b="$max" 'BEGIN{printf "%.1f", b-a}')"
+    fi
+    echo "NET_WIFI_AT=$(date +%s)"
+    return 0
+}
+
 net_channel_scan() {
     local sp cur_ch cur_bw cur_ssid rows
-    sp=$(system_profiler SPAirPortDataType 2>/dev/null)
+    # 接受调用方传入的 system_profiler 输出，避免同一轮重复采集（单次约 2 秒）
+    sp="${1:-}"
+    [ -z "$sp" ] && sp=$(system_profiler SPAirPortDataType 2>/dev/null)
     [ -z "$sp" ] && return 0
 
     local cur_section
@@ -1940,14 +2060,17 @@ net_mac_link_collect() {
         mac_rssi=$(printf '%s' "$sp" | sed -n 's/.*Signal \/ Noise: \(-\{0,1\}[0-9]*\).*/\1/p' | head -1)
         if [ -n "$mac_rate" ] || [ -n "$mac_ch" ]; then
             # 信道拥塞检测：复用同一次 system_profiler 结果，额外做一次扫描
-            local chan_scan
-            chan_scan=$(net_channel_scan 2>/dev/null)
+            local chan_scan wifi_q
+            chan_scan=$(net_channel_scan "$sp" 2>/dev/null)
+            # 纯 Wi-Fi 质量（含到网关的实测延迟），与 adb 链路无关
+            wifi_q=$(net_wifi_quality "$sp" "${mac_rate:-}" 2>/dev/null)
             {
                 [ -n "$mac_ssid" ] && echo "NET_MAC_SSID=$mac_ssid"
                 echo "NET_MAC_CHANNEL=$mac_ch"
                 echo "NET_MAC_RATE=$mac_rate"
                 echo "NET_MAC_RSSI=$mac_rssi"
                 [ -n "$chan_scan" ] && printf '%s\n' "$chan_scan"
+                [ -n "$wifi_q" ] && printf '%s\n' "$wifi_q"
             } > "$NETINFO_MAC_CACHE.tmp.$$" 2>/dev/null \
                 && mv -f "$NETINFO_MAC_CACHE.tmp.$$" "$NETINFO_MAC_CACHE" 2>/dev/null
         fi
