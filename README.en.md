@@ -334,6 +334,7 @@ After that the endpoint is remembered and automatic reconnection takes over.
 | `./bin/adb-wifi.sh open dev --all` | Open that page on **every** connected device |
 | `./bin/adb-wifi.sh recover` | Actively restore the wireless connection (**no USB needed**) |
 | `./bin/adb-wifi.sh recover --all` | Check / restore every connected device in turn |
+| `./bin/adb-wifi.sh disconnect --serial S` | Disconnect one device (the phone itself is unaffected) |
 | `./bin/adb-wifi.sh devices` | List devices (serial / state / transport / model) |
 | `./bin/adb-wifi.sh rate [secs]` | Show current adb transfer rate (default 1 s sample) |
 
@@ -545,6 +546,7 @@ VIA=known
 | | `DEV_<n>_STATE` | `device` / `offline` / `unauthorized` |
 | | `DEV_<n>_MODEL` | Phone model (`_` turned back into spaces) |
 | `recover [--serial S] [--all]` | `RESULT` | `already` / `recovered` / `failed` |
+| `disconnect [--serial S]` | `RESULT` | `disconnected` / `not_connected` / `failed` (with `SERIAL`, `ERROR`) |
 | | `ENDPOINT` | `IP:PORT` (on success) |
 | | `VIA` | `existing` / `known` / `scan` / `usb` |
 | | `ERROR` | `no_usb` / `tcpip_failed` (failures only) |

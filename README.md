@@ -337,6 +337,7 @@ Mac  链路 22 MB/s（-55 dBm）· 信道 40 · 电量 100%（已充满）
 | `./bin/adb-wifi.sh open dev --all` | 在**所有**已连接设备上打开该页面（`--serial S` 指定单台） |
 | `./bin/adb-wifi.sh recover` | 主动恢复无线连接（**无需 USB**） |
 | `./bin/adb-wifi.sh recover --all` | 逐台校验 / 恢复所有已连接设备 |
+| `./bin/adb-wifi.sh disconnect --serial S` | 断开单台设备的 adb 连接（不影响手机本身）|
 | `./bin/adb-wifi.sh devices` | 列出设备（序列号 / 状态 / 通道 / 型号） |
 | `./bin/adb-wifi.sh rate [秒]` | 查看当前 adb 传输速率（默认采样 1 秒） |
 
@@ -537,6 +538,7 @@ VIA=known
 | | `DEV_<n>_STATE` | `device` / `offline` / `unauthorized` |
 | | `DEV_<n>_MODEL` | 机型（空格替换为 `_` 后还原） |
 | `recover [--serial S] [--all]` | `RESULT` | `already` / `recovered` / `failed` |
+| `disconnect [--serial S]` | `RESULT` | `disconnected` / `not_connected` / `failed`（附 `SERIAL`、`ERROR`）|
 | | `ENDPOINT` | `IP:PORT`（成功时） |
 | | `VIA` | `existing` / `known` / `scan` / `usb` |
 | | `ERROR` | `no_usb` / `tcpip_failed`（仅失败时） |

@@ -1233,7 +1233,7 @@ class App:
                     # 该设备的操作：与菜单栏设备子菜单一一对应。
                     # 聚焦状态下才展开（否则每台都列会撑爆屏幕），提示按键即可。
                     if focusing and y < h - 7:
-                        acts = "F 刷新 · S 重连 · W 无线调试 · V 开发者选项"
+                        acts = "F 刷新 · S 重连 · X 断开 · W 无线调试 · V 开发者选项"
                         self.addstr(y, 4, acts, curses.color_pair(C_INFO))
                         y += 1
 
@@ -1363,6 +1363,7 @@ class App:
                          "", self.toggle_daemon))
         if st.daemon_running:
             menu.append(Menu("S", "重新连接", "", self.force_reconnect))
+        menu.append(Menu("X", "断开连接", "(聚焦的单台，未聚焦则全部)", self.disconnect_devices))
         menu.append(Menu("c", "手动连接", "", self.do_connect_dialog))
         menu.append(Menu("p", "配对设备", "", self.do_pair_dialog))
         menu.append(Menu("d", "设备列表", "", self.show_devices))
@@ -1519,6 +1520,38 @@ class App:
         self.busy = False
         self.refresh_async()
         self.flash(out.strip().split("\n")[-1][:60] if out.strip() else "完成")
+
+    def disconnect_devices(self):
+        """断开 adb 连接：聚焦时只断该台，未聚焦则断开全部。
+
+        与 S（重连）对称。断开只是踢掉 adb 连接，手机本身不受影响；
+        守护仍会按记忆端点把它连回来（提示里说明）。
+        """
+        if self.busy:
+            return
+        targets = []
+        # dev_focus: 0 = 显示全部，1–N = 聚焦第 N 台（1-based）
+        focus = getattr(self, "dev_focus", 0)
+        if focus:
+            links = self.state.dev_links
+            if 0 < focus <= len(links):
+                targets = [links[focus - 1]["serial"]]
+        if not targets:
+            targets = [d for d in self.state.wifi_devices]
+        if not targets:
+            self.flash("当前没有可断开的设备")
+            return
+        self.busy = True
+        self.draw()
+        ok = 0
+        for ep in targets:
+            if adb("disconnect", ep) is not None:
+                ok += 1
+        time.sleep(1)
+        self.busy = False
+        self.refresh_async()
+        scope = "这台" if focus else "全部 %d 台" % len(targets)
+        self.flash("已断开 %s（守护仍在运行，可能自动连回）" % scope)
 
     def force_reconnect(self):
         if self.busy:

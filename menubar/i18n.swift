@@ -442,6 +442,17 @@ final class L {
         "rate.ratio.ok": "部分降级",
         "rate.ratio.bad": "严重降级",
         "wifi.rtt.scale": "<10 优秀 / 10-30 一般 / >30 较差",
+        "dev.disconnect": "断开连接",
+        "dev.disconnect.tip": "只断开这一台，手机本身不受影响，其他设备照常。\n\n注意：守护会按「上次连过的地址」再次把它连上；想彻底断开请先停止守护服务。",
+        "dev.disconnect.flash": "正在断开 …",
+        "dev.disconnect.notConnected": "该设备当前没有连接",
+        "dev.disconnect.failed.title": "断开失败",
+        "dev.disconnect.failed.body": "无法断开 %@。\n\n可能原因：\n  1) 设备已自行断开\n  2) adb server 状态异常\n\n可以试试点「只重连这台」重新建立连接。",
+        "flash.disconnected": "已断开连接",
+        "menu.loading": "正在读取最新状态 …",
+        "net.ageRefresh": "数据是 %@前的 · 点此刷新",
+        "net.age.unknown": "未知",
+        "net.ageRefresh.tip": "点击重新采集所有设备的链路数据（约 8 秒）。\n\n只刷某一台请用它自己子菜单里的「重新测一次速度」。",
     ]
 
     private static let zhHant: [String: String] = [
@@ -810,6 +821,17 @@ final class L {
         "rate.ratio.ok": "部分降級",
         "rate.ratio.bad": "嚴重降級",
         "wifi.rtt.scale": "<10 優秀 / 10-30 一般 / >30 較差",
+        "dev.disconnect": "斷開連線",
+        "dev.disconnect.tip": "只斷開這一臺，手機本身不受影響，其他裝置照常。\n\n注意：守護會按「上次連過的位址」再次把它連上；想徹底斷開請先停止守護服務。",
+        "dev.disconnect.flash": "正在斷開 …",
+        "dev.disconnect.notConnected": "該裝置目前沒有連線",
+        "dev.disconnect.failed.title": "斷開失敗",
+        "dev.disconnect.failed.body": "無法斷開 %@。\n\n可能原因：\n  1) 裝置已自行斷開\n  2) adb server 狀態異常\n\n可以試試點「只重連這臺」重新建立連線。",
+        "flash.disconnected": "已斷開連線",
+        "menu.loading": "正在讀取最新狀態 …",
+        "net.ageRefresh": "資料是 %@前的 · 點此重新整理",
+        "net.age.unknown": "未知",
+        "net.ageRefresh.tip": "點擊重新採集所有裝置的鏈路資料（約 8 秒）。\n\n只刷某一臺請用它自己子選單裡的「重新測一次速度」。",
     ]
 
     private static let en: [String: String] = [
@@ -1180,5 +1202,16 @@ final class L {
         "rate.ratio.ok": "partly degraded",
         "rate.ratio.bad": "heavily degraded",
         "wifi.rtt.scale": "<10 excellent / 10-30 fair / >30 poor",
+        "dev.disconnect": "Disconnect",
+        "dev.disconnect.tip": "Disconnects only this device — the phone is unaffected and other devices keep working.\n\nNote: the daemon will reconnect it from the remembered address; stop the daemon to keep it disconnected.",
+        "dev.disconnect.flash": "Disconnecting …",
+        "dev.disconnect.notConnected": "This device is not connected",
+        "dev.disconnect.failed.title": "Disconnect failed",
+        "dev.disconnect.failed.body": "Could not disconnect %@.\n\nPossible causes:\n  1) The device already disconnected\n  2) adb server is in a bad state\n\nTry \"Reconnect just this one\" to re-establish the link.",
+        "flash.disconnected": "Disconnected",
+        "menu.loading": "Loading latest status …",
+        "net.ageRefresh": "Data from %@ ago · click to refresh",
+        "net.age.unknown": "unknown",
+        "net.ageRefresh.tip": "Click to re-sample link data for all devices (about 8s).\n\nTo refresh a single device use \"Measure speed again\" in its submenu.",
     ]
 }

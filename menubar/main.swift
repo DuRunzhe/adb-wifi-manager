@@ -436,6 +436,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 「立即开启 TCP 模式」待处理的 USB 序列号（菜单重建时写入，动作触发时读取）
     var pendingTcpipSerials: [String] = []
     var lastLoadedAt = Date.distantPast
+    /// 是否有后台采集在跑（菜单顶部显示 loading 提示用）
+    var loadingStatus = false
+    /// 是否至少成功加载过一次状态（决定首次是否需要同步等待）
+    var hasLoadedOnce = false
+    /// 后台采集进行中时，等待回填的菜单引用（避免重复构建）
+    weak var pendingMenu: NSMenu?
 
     var refreshing = false
     var lastRefreshAt = Date.distantPast
@@ -589,6 +595,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         reconnect.isEnabled = d.usable
         reconnect.toolTip = d.usable ? L.t("dev.reconnect.tip") : L.t("dev.phone.tip.unusable")
         out.append(reconnect)
+
+        // 断开连接：只影响这一台，断开后守护仍可能自动重连（提示里说明）
+        let disc = NSMenuItem(title: indent + L.t("dev.disconnect"),
+                              action: #selector(disconnectDevice(_:)), keyEquivalent: "")
+        disc.target = self
+        disc.representedObject = d.serial
+        disc.isEnabled = d.usable
+        disc.toolTip = d.usable ? L.t("dev.disconnect.tip") : L.t("dev.phone.tip.unusable")
+        out.append(disc)
 
         let entries: [(String, Selector)] = [
             ("dev.phone.wireless", #selector(openWirelessForDevice(_:))),
@@ -905,12 +920,49 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        // 每次展开菜单都实时重新采集，保证与 TUI 展示一致
-        _ = menu
-        let s = loadStatus()
-        status = s
-        lastLoadedAt = Date()
-        updateIcon(s)
+        // 必须立即返回，否则菜单点开后要卡住一整轮采集（实测 ~1 秒）。
+        // 先用现有快照把菜单画出来，同时后台拉新数据；回来后原地重绘一次。
+        // 首次没有快照时才同步等待一次（否则菜单是空的）。
+        if status.pid.isEmpty && status.endpoints.isEmpty && !hasLoadedOnce {
+            status = loadStatus()
+            lastLoadedAt = Date()
+            hasLoadedOnce = true
+        }
+        updateIcon(status)
+        buildMenu(menu, status)
+
+        // 快照超过 2 秒就后台补一次新数据，避免看到陈旧状态
+        if Date().timeIntervalSince(lastLoadedAt) > 2 || !hasLoadedOnce {
+            self.pendingMenu = menu
+            loadStatusAsync { [weak self] fresh in
+                guard let self else { return }
+                self.status = fresh
+                self.lastLoadedAt = Date()
+                self.hasLoadedOnce = true
+                self.updateIcon(fresh)
+                // 菜单还开着就原地刷新；已关闭则留给下次打开
+                if let m = self.pendingMenu, m == menu, m.highlightedItem == nil {
+                    self.buildMenu(menu, fresh)
+                }
+                self.pendingMenu = nil
+            }
+        }
+    }
+
+    /// 后台采集一份状态，完成后回主线程回调
+    func loadStatusAsync(_ done: @escaping (Status) -> Void) {
+        if loadingStatus { return }
+        loadingStatus = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let s = loadStatus()
+            DispatchQueue.main.async {
+                self.loadingStatus = false
+                done(s)
+            }
+        }
+    }
+
+    func buildMenu(_ menu: NSMenu, _ s: Status) {
         menu.removeAllItems()
 
         // ---- 守护状态 ----
@@ -924,6 +976,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if !s.loadError.isEmpty {
             menu.addItem(disabledItem("  ⚠ \(s.loadError)"))
+        }
+        // 后台仍在采集时给个提示，避免用户以为菜单是最终状态
+        if loadingStatus {
+            menu.addItem(disabledItem("  " + L.t("menu.loading")))
         }
 
         // ================= 分区一：状态 + 设备 =================
@@ -1212,13 +1268,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                                        s.channelBest)))
         }
 
-        // ---- 链路数据采集时间 + adb devices ----
-        // 刷新入口已提到主菜单一级，这里只保留"数据有多新"这一读数。
+        // ---- 数据时间 + 刷新入口（合并成一行，点击即重新采集）----
+        // 之前这里只有一行只读的"数据是 N 秒前的"，想刷新还得回到设备子菜单。
+        // 合成可点击的一行：前面是数据新鲜度，后面是刷新动作，所见即所得。
         sub.addItem(.separator())
         let age = netAgeText(s)
-        if !age.isEmpty {
-            sub.addItem(disabledItem(L.t("net.age.line", age)))
-        }
+        let refreshItem = NSMenuItem(title: L.t("net.ageRefresh",
+                                                age.isEmpty ? L.t("net.age.unknown") : age),
+                                     action: #selector(refreshLinkQuality(_:)), keyEquivalent: "")
+        refreshItem.target = self
+        refreshItem.representedObject = ""     // 空表示刷新全部设备
+        refreshItem.isEnabled = !busy
+        refreshItem.image = NSImage(systemSymbolName: "arrow.clockwise",
+                                    accessibilityDescription: nil)
+        refreshItem.toolTip = L.t("net.ageRefresh.tip")
+        sub.addItem(refreshItem)
+
         let devs = NSMenuItem(title: L.t("menu.adbDevices"), action: #selector(openDevices),
                               keyEquivalent: "d")
         devs.target = self
@@ -1406,6 +1471,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 单台设备重连：只针对这台，只在它的记忆端点 / 自己的 USB 通道上找，
     /// 不做整段网段扫描（多设备时那样会拖慢网络）。
+        /// 断开单台设备的 adb 连接（不影响手机本身，也不动其他设备）
+    @objc func disconnectDevice(_ sender: NSMenuItem) {
+        guard let serial = sender.representedObject as? String, !serial.isEmpty else { return }
+        guard !busy else { return }
+        busy = true
+        flash(title: L.t("dev.disconnect.flash"), text: deviceLabel(serial))
+        DispatchQueue.global().async {
+            let r = runScript(["disconnect", "--serial", serial], timeout: 20, env: KV_ENV)
+            let kv = parseKV(r.out)
+            let result = kv["RESULT"] ?? "failed"
+            DispatchQueue.main.async {
+                self.busy = false
+                switch result {
+                case "disconnected":
+                    self.flash(title: L.t("flash.disconnected"), text: self.deviceLabel(serial))
+                case "not_connected":
+                    self.flash(title: L.t("dev.disconnect.notConnected"),
+                               text: self.deviceLabel(serial))
+                default:
+                    self.showTextWindow(title: L.t("dev.disconnect.failed.title"),
+                                        content: L.t("dev.disconnect.failed.body",
+                                                     self.deviceLabel(serial)))
+                }
+                self.refresh()
+            }
+        }
+    }
+
     @objc func reconnectDevice(_ sender: NSMenuItem) {
         guard let serial = sender.representedObject as? String, !serial.isEmpty else { return }
         guard !busy else { return }

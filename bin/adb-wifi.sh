@@ -85,6 +85,7 @@ LOG_FILE="$LOG_DIR/adb-wifi.log"
 PID_FILE="$APP_SUPPORT/adb-wifi.pid"
 KNOWN_FILE="$STATE_DIR/known_endpoints.txt"   # 历史连接成功过的 IP:PORT（跨重启保留）
 DEVICE_FILE="$STATE_DIR/known_devices.txt"    # serialno|型号|最后端点（跨重启保留）
+EXCLUDE_FILE="$STATE_DIR/disconnected.txt"    # 用户手动断开的端点，守护不再自动连（跨重启保留）
 SCAN_STAMP="$STATE_DIR/last_scan_attempt"     # 上次网段扫描时间，用于节流
 MAX_LOG_BYTES=1048576
 
@@ -195,15 +196,67 @@ sync_known_from_devices() {
         [ -z "$sn" ] && continue
         model=$(tmo 5 "$ADB_BIN" -s "$ep" shell getprop ro.product.model 2>/dev/null | tr -d '\r')
         if grep -q "^${sn}|" "$DEVICE_FILE" 2>/dev/null; then
-            grep -v "^${sn}|" "$DEVICE_FILE" > "$DEVICE_FILE.tmp" 2>/dev/null \
-                && { printf '%s|%s|%s\n' "$sn" "$model" "$ep" >> "$DEVICE_FILE.tmp"; \
-                     mv -f "$DEVICE_FILE.tmp" "$DEVICE_FILE"; }
+            # 同上：删掉旧记录再追加，最后一行场景不能用 && 串
+            local _dtmp="$DEVICE_FILE.upd.$$"
+            grep -v "^${sn}|" "$DEVICE_FILE" > "$_dtmp" 2>/dev/null || true
+            printf '%s|%s|%s\n' "$sn" "$model" "$ep" >> "$_dtmp"
+            mv -f "$_dtmp" "$DEVICE_FILE"
         else
             printf '%s|%s|%s\n' "$sn" "$model" "$ep" >> "$DEVICE_FILE"
             info "记录设备身份 $model（$sn）"
         fi
     done
     return 0
+}
+
+# 从文件里删掉匹配的行并写回。
+#
+# 不能写成 `grep -vxF "$x" f > f.tmp && mv f.tmp f`：
+# 当删的是**最后一行**时 grep 没有任何输出，退出码为 1，`&&` 短路导致
+# mv 不执行 —— 文件根本没被改。这个坑实测踩到过（排除名单清不掉）。
+# 用临时文件 + 无条件 mv 再判断，避免依赖 grep 的退出码语义。
+remove_line_from_file() {
+    local file="$1" pattern="$2" tmp
+    [ -f "$file" ] || return 0
+    tmp="$file.rm.$$"
+    grep -vxF "$pattern" "$file" > "$tmp" 2>/dev/null || true
+    if [ -f "$tmp" ]; then
+        mv -f "$tmp" "$file"
+    fi
+    rm -f "$tmp" 2>/dev/null
+    return 0
+}
+
+# ------------------------------------------------- 手动断开排除名单
+#
+# 用户在界面上点「断开连接」后，如果守护下一轮又按记忆端点把它连回来，
+# 「断开」就失去了意义。所以断开时写下标记，守护连接前先排除。
+# 解除方式：点「只重连这台」/ 设备重新出现 / 该端点连不上被遗忘。
+
+excluded_eps() {
+    [ -f "$EXCLUDE_FILE" ] && cat "$EXCLUDE_FILE" 2>/dev/null | awk 'NF'
+    return 0
+}
+
+is_excluded() {
+    local ep="$1"
+    [ -f "$EXCLUDE_FILE" ] || return 1
+    grep -qxF "$ep" "$EXCLUDE_FILE" 2>/dev/null
+}
+
+exclude_endpoint() {
+    local ep="$1"
+    touch "$EXCLUDE_FILE" 2>/dev/null || return 0
+    grep -qxF "$ep" "$EXCLUDE_FILE" 2>/dev/null || echo "$ep" >> "$EXCLUDE_FILE"
+    info "已记录手动断开 $ep，守护将不再自动重连"
+}
+
+unexclude_endpoint() {
+    local ep="$1"
+    [ -f "$EXCLUDE_FILE" ] || return 0
+    grep -qxF "$ep" "$EXCLUDE_FILE" 2>/dev/null || return 0
+    remove_line_from_file "$EXCLUDE_FILE" "$ep"
+    info "已解除手动断开标记，允许自动重连 $ep"
 }
 
 # 统计：身份档案里有、但当前没连上的设备数
@@ -373,6 +426,14 @@ ensure_tcpip_for() {
         return 1
     fi
     ep="$ip:$TCPIP_PORT"
+
+    # 用户手动断开过的端点不再自动连回（USB 只是"重新插线"的手段之一）。
+    # 之前漏了这一路：USB 设备会经这里直接 connect，绕过候选端点过滤，
+    # 表现为「点了断开，几秒后又连上了」。
+    if is_excluded "$ep"; then
+        info "USB 设备 $serial 对应的 $ep 已被手动断开，跳过自动连接" >&2
+        return 1
+    fi
 
     # 已经连上该端点，直接返回
     if wifi_devices | grep -qxF "$ep"; then
@@ -645,8 +706,7 @@ forget_endpoint() {
     n=$((n + 1))
     echo "$n" > "$f" 2>/dev/null
     if [ "$n" -ge "$KNOWN_FAIL_LIMIT" ]; then
-        grep -vxF "$ep" "$KNOWN_FILE" > "$KNOWN_FILE.tmp" 2>/dev/null \
-            && mv -f "$KNOWN_FILE.tmp" "$KNOWN_FILE"
+        remove_line_from_file "$KNOWN_FILE" "$ep"
         info "端点 $ep 连续失败 $n 次，移出记忆列表（网段扫描仍可找回）"
     else
         info "端点 $ep 连接失败（$n/$KNOWN_FAIL_LIMIT），暂不移除"
@@ -922,9 +982,14 @@ main_loop() {
         fi
 
         # 只接受合法的 IP:PORT，过滤非端点输出（防止提示文本混入被误当成设备）
+        # 排除用户手动断开的端点（USB 连接的除外：主动插线视为想用它）
+        local _excluded _usb_list
+        _excluded=$(excluded_eps)
+        _usb_list=$(printf '%s\n' "$usb_eps" | awk 'NF')
         candidates=$(printf '%s\n%s\n%s\n%s\n%s\n' "$mdns_eps" "$usb_eps" "$known_eps" "$tcpip_eps" "$scan_eps" \
             | awk 'NF' \
             | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$' \
+            | { if [ -n "$_excluded" ]; then grep -vxF "$_excluded"; else cat; fi } \
             | sort -u)
 
         if [ -z "$candidates" ] && [ -z "$connected_eps" ]; then
@@ -1433,10 +1498,82 @@ recover_one() {
     return 1
 }
 
+# 断开单台设备的 adb 连接（只断开，不影响手机本身，也不动其他设备）。
+# 用途：设备卡住/无响应时手动断开，之后守护会按记忆端点或扫描重新连上，
+# 也方便"我只想留一台调试"时临时踢掉其余的。
+cmd_disconnect() {
+    local target="" ep rc=0 is_kv_out=0
+    is_kv && is_kv_out=1
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --serial) target="${2:-}"; shift 2 ;;
+            --serial=*) target="${1#--serial=}"; shift ;;
+            *) [ -z "$target" ] && target="$1"; shift ;;
+        esac
+    done
+    if [ -z "$target" ]; then
+        if [ "$is_kv_out" = "1" ]; then
+            echo "RESULT=failed"; echo "ERROR=no_target"
+        else
+            echo "✗ 未指定设备"
+        fi
+        return 1
+    fi
+
+    # 允许传 IP（按 IP 匹配到 IP:PORT）
+    case "$target" in
+        *:*) ;;
+        *)   ep=$(wifi_devices | grep -E '^[0-9.]+:' | grep -m1 "^${target}:" || true)
+             [ -n "$ep" ] && target="$ep" ;;
+    esac
+
+    # 断开前确认它确实连着，避免对不存在的端点做无意义操作
+    if ! wifi_devices | grep -E '^[0-9.]+:[0-9]+$' | grep -qxF "$target"; then
+        if [ "$is_kv_out" = "1" ]; then
+            echo "RESULT=not_connected"; echo "SERIAL=$target"
+        else
+            echo "○ $target 当前未连接"
+        fi
+        return 0
+    fi
+
+    adbw disconnect "$target" >/dev/null 2>&1 || rc=1
+    sleep 1
+    if wifi_devices | grep -E '^[0-9.]+:[0-9]+$' | grep -qxF "$target"; then
+        # disconnect 返回成功但仍在列表里，视为失败
+        if [ "$is_kv_out" = "1" ]; then
+            echo "RESULT=failed"; echo "SERIAL=$target"; echo "ERROR=still_connected"
+        else
+            echo "✗ 断开 $target 失败（仍显示已连接）"
+        fi
+        return 1
+    fi
+
+    # 记入排除名单：否则守护下一轮会按记忆端点把它连回来，「断开」等于无效
+    exclude_endpoint "$target"
+    if [ "$is_kv_out" = "1" ]; then
+        echo "RESULT=disconnected"; echo "SERIAL=$target"
+    else
+        echo "✓ 已断开 $target"
+        echo "  守护不会再自动连它；要恢复请点「只重连这台」或重新插 USB。"
+    fi
+    return 0
+}
+
 cmd_recover() {
     local only=""
     parse_target_flags "$@"
     only="$OPEN_SERIAL"
+
+    # 主动恢复请求解除手动断开标记：用户明确要求连回来，就不该再被排除。
+    # 必须放在 parse_target_flags 之后——它同时支持 `--serial S` 和 `--serial=S`
+    # 两种写法，只按字符串匹配前者会漏掉（实测漏过）。
+    if [ -n "$only" ]; then
+        unexclude_endpoint "$only"
+    elif [ "$OPEN_ALL" = "1" ]; then
+        # 「恢复全部」也清除名单：这是明确的用户意图
+        rm -f "$EXCLUDE_FILE" 2>/dev/null
+    fi
 
     # ---- 批量模式：对所有**已知**设备做一次「保活校验 / 重连」----
     # 范围 = 当前在线的 + 记忆文件里记录过的（含已掉线的）。
@@ -1446,8 +1583,10 @@ cmd_recover() {
     if [ "$OPEN_ALL" = "1" ]; then
         local s i=0 ok=0 fail=0
         is_kv || echo "正在校验并恢复所有设备的无线连接 ..."
-        local targets
-        targets=$( { all_serial; [ -f "$KNOWN_FILE" ] && cat "$KNOWN_FILE"; } | awk 'NF' | sort -u )
+        local targets _ex
+        _ex=$(excluded_eps)
+        targets=$( { all_serial; [ -f "$KNOWN_FILE" ] && cat "$KNOWN_FILE"; } | awk 'NF' | sort -u \
+            | { if [ -n "$_ex" ]; then grep -vxF "$_ex"; else cat; fi } )
         for s in $targets; do
             i=$((i + 1))
             local r; r=$(recover_one "$s")
@@ -2575,6 +2714,7 @@ case "${1:-}" in
     netinfo-refresh) shift; cmd_netinfo_refresh_one "${1:-}" ;;
     open)    shift; cmd_open "$@" ;;
     recover) shift; cmd_recover "$@" ;;
+    disconnect) shift; cmd_disconnect "$@" ;;
     devices) cmd_devices ;;
     rate)    cmd_rate "${2:-1}" ;;
     _daemon) main_loop ;;
