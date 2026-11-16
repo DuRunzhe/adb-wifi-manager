@@ -633,13 +633,14 @@ There are two update entries:
 
 | Entry | Style | Source | Notes |
 |---|---|---|---|
-| "Check for Updates" (stable) | Large default button (Return) | `releases/latest` | Primary entry, stable only |
+| "Check for Updates" (stable) | Large default button (Return) | `releases/latest` (web/atom fallback when rate limited) | Primary entry, stable only |
 | "Pre-release channel: Alpha" | Small text link | First prerelease in `/releases` | Secondary, may be unstable |
 
-The stable check calls the GitHub API (`releases/latest`, falling back to tags without
-a suffix when no Release exists) and compares versions segment by segment: for the same
-core version, stable > pre-release; pre-release suffixes are compared numerically
-(`alpha.10 > alpha.9`).
+The stable check calls the GitHub API first (`releases/latest`) and falls back through
+web redirect → `releases.atom` → tags API so anonymous API rate limits (60 req/hour)
+cannot break the check; when no Release exists it falls back to tags without a suffix.
+Versions are compared segment by segment: for the same core version, stable > pre-release;
+pre-release suffixes are compared numerically (`alpha.10 > alpha.9`).
 
 - **Opening About auto-checks the stable channel** (throttled to once per 60 s); the
   result is shown directly on the button, never in a popup:

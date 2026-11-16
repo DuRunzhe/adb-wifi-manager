@@ -621,10 +621,12 @@ Mac 侧字段（`NET_MAC_*` / `NET_CHANNEL_*` / `NET_WIFI_*`）另存
 
 | 入口 | 样式 | 来源 | 说明 |
 |---|---|---|---|
-| 「检查正式版更新」 | 大号默认按钮（回车触发） | `releases/latest` | 主入口，只含正式版 |
+| 「检查正式版更新」 | 大号默认按钮（回车触发） | `releases/latest`（API 限流时走网页 / atom） | 主入口，只含正式版 |
 | 「预发布通道：Alpha 预览版」 | 小号文字链 | `/releases` 中第一个 prerelease | 次要入口，可能不稳定 |
 
-正式版检查调用 GitHub API（`releases/latest`，仓库尚无 Release 时回退到不带后缀的 tag），
+正式版检查优先调用 GitHub API（`releases/latest`），API 不可用时按「网页 302 跳转 →
+`releases.atom` 订阅源 → tags API」三级兜底，避免匿名 API 60 次/小时限流导致检查失败；
+仓库尚无 Release 时回退到不带后缀的 tag。
 按版本号逐段比较：主版本相同则正式版 > 预发布版，预发布后缀按数值比较
 （`alpha.10 > alpha.9`）。
 

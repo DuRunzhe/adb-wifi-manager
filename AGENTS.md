@@ -67,6 +67,8 @@
   部署到 `~/mycode/adb-wifi-manager`（可用 `ADBWIFI_DIR` 覆盖），再调用包内 `install.sh`
 - 手动：从 Releases 下载完整包解压后 `./install.sh`；或克隆仓库本地 `./install.sh`
 - `get.sh` 默认只取正式版；`ADBWIFI_VERSION=0.0.2-alpha.1` 可安装 Alpha 版本
+- `get.sh` 解析最新版本时会被 GitHub 匿名 API 限流（403，60 次/小时）：脚本按
+  「API → 网页 302 → `releases.atom`」兜底，或用 `GITHUB_TOKEN` 提高额度
 - `ADBWIFI_SKIP_INSTALL=1` 只下载部署，不注册 launchd / 不安装 App
 
 ## 修改后的默认工作流
@@ -124,8 +126,9 @@
 
 ## 更新检查的分流
 
-- 稳定版检查：`releases/latest`，只包含正式版本
-- Alpha 检查：`/releases` 中第一个 prerelease，无则回退到带后缀的 tag
+- 稳定版检查：`releases/latest`，只包含正式版本；API 失败（403 限流等）时按
+  「网页 302 `releases/latest` → `releases.atom` → tags API」兜底，不阻断检查
+- Alpha 检查：`/releases` 中第一个 prerelease，无则回退到 atom / 带后缀的 tag
 - 版本比较：核心版本逐段比较；核心相同时正式版 > 预发布版；预发布后缀按数值比较
   （`alpha.10 > alpha.9`）
 

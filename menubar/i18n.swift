@@ -219,6 +219,7 @@ final class L {
         "err.badURL": "无效的地址",
         "err.noResponse": "未收到服务器响应",
         "err.http": "GitHub 返回 HTTP %d",
+        "err.rateLimited": "GitHub API 已限流（超过 60 次/小时），请稍后重试或手动打开版本页",
 
         // ---- 帮助弹窗 ----
         "help.usb.title": "如何用 USB 自动读取端口",
@@ -600,6 +601,7 @@ final class L {
         "err.badURL": "無效的位址",
         "err.noResponse": "未收到伺服器回應",
         "err.http": "GitHub 傳回 HTTP %d",
+        "err.rateLimited": "GitHub API 已限流（超過 60 次/小時），請稍後重試或手動開啟版本頁",
 
         // ---- 說明視窗 ----
         "help.usb.title": "如何用 USB 自動讀取連接埠",
@@ -983,6 +985,7 @@ final class L {
         "err.badURL": "Invalid URL",
         "err.noResponse": "No response from server",
         "err.http": "GitHub returned HTTP %d",
+        "err.rateLimited": "GitHub API is rate limited (60 requests/hour), retry later or open the releases page manually",
 
         // ---- help dialogs ----
         "help.usb.title": "Read the port over USB",

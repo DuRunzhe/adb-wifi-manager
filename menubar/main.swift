@@ -2473,7 +2473,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         url: d["html_url"] as? String ?? RELEASES_URL,
                         notes: d["body"] as? String ?? "")))
                 case .failure(let err):
-                    self.fetchLatestTag(prerelease: false) { res2 in
+                    self.fetchLatestTagFallback(prerelease: false, original: err) { res2 in
                         switch res2 {
                         case .success(let info):
                             completion(.success(info))
@@ -2497,11 +2497,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             url: r["html_url"] as? String ?? RELEASES_URL,
                             notes: r["body"] as? String ?? "")))
                     } else {
-                        self.fetchLatestTag(prerelease: true, completion: completion)
+                        // atom 订阅源优先（不吃 API 配额），失败再走 tags API
+                        self.fetchLatestTagViaAtom(prerelease: true) { res2 in
+                            switch res2 {
+                            case .success(let info):
+                                completion(.success(info))
+                            case .failure:
+                                self.fetchLatestTag(prerelease: true, completion: completion)
+                            }
+                        }
                     }
                 case .failure(let e):
-                    let code = (e as NSError).code
-                    completion(.failure(code == 404 ? Self.notFoundError() : e))
+                    self.fetchLatestTagFallback(prerelease: true, original: e) { res2 in
+                        switch res2 {
+                        case .success(let info):
+                            completion(.success(info))
+                        case .failure:
+                            let code = (e as NSError).code
+                            completion(.failure(code == 404 ? Self.notFoundError() : e))
+                        }
+                    }
                 }
             }
         }
@@ -2536,6 +2551,132 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// GitHub API 不可用（403 限流、网络异常）时的兜底链：
+    /// 正式版先试网页 302 跳转，再试 atom 订阅源，最后才试 tags API。
+    func fetchLatestTagFallback(prerelease: Bool,
+                                original: Error,
+                                completion: @escaping (Result<(tag: String, url: String, notes: String), Error>) -> Void) {
+        let fromAtom: () -> Void = {
+            self.fetchLatestTagViaAtom(prerelease: prerelease) { res in
+                switch res {
+                case .success(let info):
+                    completion(.success(info))
+                case .failure:
+                    self.fetchLatestTag(prerelease: prerelease) { res2 in
+                        switch res2 {
+                        case .success(let info):
+                            completion(.success(info))
+                        case .failure:
+                            let code = (original as NSError).code
+                            completion(.failure(code == 404 ? Self.notFoundError() : original))
+                        }
+                    }
+                }
+            }
+        }
+        if prerelease {
+            fromAtom()
+        } else {
+            fetchLatestTagViaWeb { res in
+                switch res {
+                case .success(let info):
+                    completion(.success(info))
+                case .failure:
+                    fromAtom()
+                }
+            }
+        }
+    }
+
+    /// 网页路径取最新正式版：`releases/latest` 会 302 到 `/releases/tag/<tag>`，
+    /// 走的是 github.com 站点而非 REST API，不受 60 次/小时的匿名 API 配额限制。
+    func fetchLatestTagViaWeb(_ completion: @escaping (Result<(tag: String, url: String, notes: String), Error>) -> Void) {
+        guard let url = URL(string: "\(REPO_URL)/releases/latest") else {
+            completion(.failure(NSError(domain: "AdbWifiBar", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: L.t("err.badURL")])))
+            return
+        }
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.setValue("Mozilla/5.0 (Macintosh)", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { _, resp, err in
+            if let err = err { completion(.failure(err)); return }
+            guard let http = resp as? HTTPURLResponse else {
+                completion(.failure(NSError(domain: "AdbWifiBar", code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: L.t("err.noResponse")])))
+                return
+            }
+            guard (200..<300).contains(http.statusCode), let final = http.url else {
+                completion(.failure(NSError(domain: "AdbWifiBar", code: http.statusCode,
+                    userInfo: [NSLocalizedDescriptionKey: L.t("err.http", http.statusCode)])))
+                return
+            }
+            let comps = final.pathComponents
+            guard comps.count >= 2, comps[comps.count - 2] == "tag" else {
+                completion(.failure(Self.notFoundError()))
+                return
+            }
+            let tag = comps[comps.count - 1]
+            guard !tag.isEmpty, tag != "latest" else {
+                completion(.failure(Self.notFoundError()))
+                return
+            }
+            completion(.success((tag: tag, url: final.absoluteString, notes: "")))
+        }.resume()
+    }
+
+    /// 从 releases.atom 订阅源取 tag（同样不走 REST API）
+    func fetchLatestTagViaAtom(prerelease: Bool,
+                               completion: @escaping (Result<(tag: String, url: String, notes: String), Error>) -> Void) {
+        guard let url = URL(string: "\(REPO_URL)/releases.atom") else {
+            completion(.failure(NSError(domain: "AdbWifiBar", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: L.t("err.badURL")])))
+            return
+        }
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.setValue("application/atom+xml,application/xml,text/xml", forHTTPHeaderField: "Accept")
+        req.setValue("AdbWifiBar/\(APP_VERSION)", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            if let err = err { completion(.failure(err)); return }
+            guard let http = resp as? HTTPURLResponse else {
+                completion(.failure(NSError(domain: "AdbWifiBar", code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: L.t("err.noResponse")])))
+                return
+            }
+            guard (200..<300).contains(http.statusCode),
+                  let data = data,
+                  let xml = String(data: data, encoding: .utf8) else {
+                completion(.failure(NSError(domain: "AdbWifiBar", code: http.statusCode,
+                    userInfo: [NSLocalizedDescriptionKey: L.t("err.http", http.statusCode)])))
+                return
+            }
+            let tags = Self.extractTags(fromAtom: xml).filter { $0.contains("-") == prerelease }
+            guard var best = tags.first else {
+                completion(.failure(Self.notFoundError()))
+                return
+            }
+            for t in tags.dropFirst() where self.isNewer(t, than: best) { best = t }
+            completion(.success((tag: best,
+                                 url: "\(REPO_URL)/releases/tag/\(best)",
+                                 notes: "")))
+        }.resume()
+    }
+
+    /// 从 atom XML 里抽取本仓库的 release tag（按出现顺序去重）
+    static func extractTags(fromAtom xml: String) -> [String] {
+        let slug = NSRegularExpression.escapedPattern(for: REPO_SLUG)
+        let pattern = "href=\"https://github\\.com/\(slug)/releases/tag/([^\"#?<>\\s]+)\""
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let ns = xml as NSString
+        var seen = Set<String>()
+        var tags: [String] = []
+        for m in re.matches(in: xml, range: NSRange(location: 0, length: ns.length)) {
+            guard m.numberOfRanges > 1 else { continue }
+            let tag = ns.substring(with: m.range(at: 1))
+            if !tag.isEmpty, seen.insert(tag).inserted { tags.append(tag) }
+        }
+        return tags
+    }
+
     static func notFoundError() -> NSError {
         NSError(domain: "AdbWifiBar", code: 404, userInfo: [
             NSLocalizedDescriptionKey: L.t("err.noRelease")])
@@ -2558,8 +2699,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             guard (200..<300).contains(http.statusCode), let data = data else {
-                completion(.failure(NSError(domain: "AdbWifiBar", code: http.statusCode,
-                    userInfo: [NSLocalizedDescriptionKey: L.t("err.http", http.statusCode)])))
+                let status = http.statusCode
+                completion(.failure(NSError(domain: "AdbWifiBar", code: status,
+                    userInfo: [NSLocalizedDescriptionKey: status == 403
+                        ? L.t("err.rateLimited")
+                        : L.t("err.http", status)])))
                 return
             }
             do {
