@@ -7,6 +7,7 @@
 #   ADBWIFI_VERSION=0.0.3                   指定版本（默认最新正式版；可传 Alpha）
 #   ADBWIFI_DIR=~/mycode/adb-wifi-manager   安装目录
 #   ADBWIFI_SKIP_INSTALL=1                  只下载部署，不注册 launchd / 不安装 App
+#   GITHUB_TOKEN=ghp_xxx                    可选，提高 GitHub API 限流额度（避免 403）
 set -uo pipefail
 
 REPO="DuRunzhe/adb-wifi-manager"
@@ -24,6 +25,34 @@ shorten_path() {
     esac
 }
 
+# 解析最新正式版 tag：API -> 网页 302 重定向 -> releases.atom 三级兜底
+resolve_latest_tag() {
+    local token="${GITHUB_TOKEN:-${GH_TOKEN:-}}" auth=() tag loc
+    [ -n "$token" ] && auth=(-H "Authorization: Bearer $token")
+
+    tag=$(curl -fsSL --max-time 20 \
+        -H 'Accept: application/vnd.github+json' \
+        -H "User-Agent: adb-wifi-manager-get" \
+        "${auth[@]}" \
+        "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    [ -n "$tag" ] && { printf '%s' "$tag"; return 0; }
+
+    # GitHub API 限流（未认证 60 次/小时）时，改用网页跳转，不走 API 配额
+    loc=$(curl -sSI --max-time 20 -H "User-Agent: Mozilla/5.0" \
+        "https://github.com/$REPO/releases/latest" 2>/dev/null \
+        | tr -d '\r' | sed -n 's/^[Ll]ocation:[[:space:]]*//p' | tail -1)
+    case "$loc" in
+        */releases/tag/?*) printf '%s' "${loc##*/releases/tag/}"; return 0 ;;
+    esac
+
+    tag=$(curl -fsSL --max-time 20 "https://github.com/$REPO/releases.atom" 2>/dev/null \
+        | sed -n 's#.*<link[^>]*href="https://github.com/[^"]*/releases/tag/\([^"]*\)".*#\1#p' | head -1)
+    [ -n "$tag" ] && { printf '%s' "$tag"; return 0; }
+
+    return 1
+}
+
 [ "$(uname -s)" = "Darwin" ] || die "目前仅支持 macOS"
 command -v curl >/dev/null 2>&1 || die "未找到 curl"
 command -v rsync >/dev/null 2>&1 || die "未找到 rsync"
@@ -36,12 +65,8 @@ if [ -n "$VERSION" ]; then
     info "使用指定版本: $VERSION"
 else
     info "查询最新正式版本 ..."
-    TAG=$(curl -fsSL --max-time 20 \
-        -H 'Accept: application/vnd.github+json' \
-        -H "User-Agent: adb-wifi-manager-get" \
-        "https://api.github.com/repos/$REPO/releases/latest" \
-        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-    [ -n "$TAG" ] || die "未获取到最新正式版本；可用 ADBWIFI_VERSION=0.0.1 指定版本"
+    TAG=$(resolve_latest_tag)
+    [ -n "$TAG" ] || die "未获取到最新正式版本（GitHub API 可能已限流）；可用 ADBWIFI_VERSION=0.0.5 指定版本，或设置 GITHUB_TOKEN 后重试"
     VERSION="${TAG#v}"
     info "最新正式版本: $VERSION"
 fi
