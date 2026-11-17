@@ -188,7 +188,7 @@ sync_known_from_devices() {
         case "$ep" in *:*) ;; *) continue ;; esac
         if ! grep -qxF "$ep" "$KNOWN_FILE" 2>/dev/null; then
             echo "$ep" >> "$KNOWN_FILE"
-            info "记住新端点 $ep（来源：当前已连接设备）"
+            info "记住新端点 ${ep}（来源：当前已连接设备）"
         fi
         # 记录设备身份：serialno 不会随 IP 变化，用来识别"是同一台手机回来了"，
         # 而不是只看 IP。端点了丢的时候，靠它能知道还有哪台设备没连上。
@@ -203,7 +203,7 @@ sync_known_from_devices() {
             mv -f "$_dtmp" "$DEVICE_FILE"
         else
             printf '%s|%s|%s\n' "$sn" "$model" "$ep" >> "$DEVICE_FILE"
-            info "记录设备身份 $model（$sn）"
+            info "记录设备身份 ${model}（${sn}）"
         fi
     done
     return 0
@@ -248,7 +248,7 @@ exclude_endpoint() {
     local ep="$1"
     touch "$EXCLUDE_FILE" 2>/dev/null || return 0
     grep -qxF "$ep" "$EXCLUDE_FILE" 2>/dev/null || echo "$ep" >> "$EXCLUDE_FILE"
-    info "已记录手动断开 $ep，守护将不再自动重连"
+    info "已记录手动断开 ${ep}，守护将不再自动重连"
 }
 
 unexclude_endpoint() {
@@ -495,10 +495,18 @@ ensure_tcpip_for() {
 # 重要：不通时**不再立即删除**。手机临时掉线、睡眠、换网段都会让端口暂时不可达，
 # 早先的实现一探测失败就删掉记忆，导致"连不上就永远找不回来"，只能重新插 USB。
 # 现在改为：保留记忆，仅记录失败次数；连续失败超过 MAX_KNOWN_FAILS 次才清理。
+# $1=--readonly：只探测可达性，不写任何状态文件。
+#
+# 为什么需要：菜单栏每 5 秒调一次 diag，diag 会走这里；守护每轮也走这里。
+# 两边并发改写 known_fails.txt 时抢同一个临时文件（实测日志里上千次
+# mv/grep 报 No such file or directory），失败计数被写坏会导致
+# 「记忆端点」被误判为连续失败而清理掉。只读查询不该有写入副作用。
 discover_known() {
     [ -f "$KNOWN_FILE" ] || return 0
     local ep ip port fails_file="$STATE_DIR/known_fails.txt"
-    [ -f "$fails_file" ] || : > "$fails_file"
+    local readonly=0
+    [ "${1:-}" = "--readonly" ] && readonly=1
+    [ "$readonly" = "1" ] || { [ -f "$fails_file" ] || : > "$fails_file"; }
     local -a alive=() dead=()
 
     while read -r ep; do
@@ -512,8 +520,13 @@ discover_known() {
         fi
     done < "$KNOWN_FILE"
 
+    # 只读模式到这里就结束：上面已经把「当前可达的端点」输出给调用方了
+    [ "$readonly" = "1" ] && return 0
+
     # 更新失败计数：通了的清零，不通的 +1
-    local newfails="$fails_file.tmp"
+    # 临时文件必须带 $$：守护与一次性命令（diag/recover/netinfo）会并发调用本函数，
+    # 固定名字会让先完成的一方把源文件 mv 走，另一方 mv/grep 直接失败。
+    local newfails="$fails_file.tmp.$$"
     : > "$newfails"
     local e n
     while read -r e n; do
@@ -545,7 +558,7 @@ discover_known() {
         fi
     done < "$fails_file"
     if [ -n "$pruned" ]; then
-        local keep="$KNOWN_FILE.keep"
+        local keep="$KNOWN_FILE.keep.$$"
         : > "$keep"
         while read -r e; do
             [ -z "$e" ] && continue
@@ -871,9 +884,26 @@ wait_or_event() {
 # ------------------------------------------------------------- 事件源
 # 用 `adb track-devices` 监听设备增删/状态变化（毫秒级推送，替代轮询感知）
 # 事件流格式: 每行 "序列号<TAB>状态"，如 "192.168.1.5:37001\tdevice"
+# 停掉设备事件监听。
+#
+# 顺序很重要：tracker 是 `( while ...; do adb track-devices | while read; done ) &`，
+# 只 kill 那个 subshell 的话，它派生的 adb track-devices 与内层 while 会被 init 收养
+# （父进程变成 1）永久残留 —— 每 restart 一次泄漏一个，一直占着 adb server 连接。
+# 必须先给子进程发信号（此时它们的 ppid 还是 tracker，能被准确匹配），再杀 subshell。
+stop_device_tracker() {
+    [ -z "${TRACKER_PID:-}" ] && return 0
+    pkill -TERM -P "$TRACKER_PID" 2>/dev/null
+    sleep 0.1                       # 留出退出时间，避免先死父进程导致子进程被 reparent
+    kill -TERM "$TRACKER_PID" 2>/dev/null
+    sleep 0.1
+    pkill -KILL -P "$TRACKER_PID" 2>/dev/null
+    TRACKER_PID=""
+    return 0
+}
+
 start_device_tracker() {
     # 清掉旧的后台任务
-    [ -n "${TRACKER_PID:-}" ] && kill "$TRACKER_PID" 2>/dev/null
+    stop_device_tracker
     mkfifo "$STATE_DIR/events.fifo" 2>/dev/null || true
     (
         # 若 adb server 重启，track-devices 会断开，这里循环重连
@@ -890,10 +920,29 @@ start_device_tracker() {
     info "设备事件监听已启动 (track-devices, PID $TRACKER_PID)"
 }
 
+# 守护进程退出时的统一清理。
+# 必须幂等：INT/TERM 先触发，随后 EXIT 也会触发一次。
+_daemon_cleanup() {
+    stop_device_tracker
+    [ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ] && rm -f "$PID_FILE"
+    daemon_lock_release
+    return 0
+}
+
 main_loop() {
+    # 单实例：抢不到锁说明已有守护在跑，直接退出。
+    # launchd 的 KeepAlive、install.sh 的 unload→load、restart 子命令都不保证
+    # 旧进程已完全退出就拉起新进程，没有这道锁就会出现两个守护并行。
+    if ! daemon_lock_acquire; then
+        warn "已有守护实例在运行，本进程退出（持有者 PID $(cat "$DAEMON_LOCK/pid" 2>/dev/null)）"
+        exit 0
+    fi
     echo $$ > "$PID_FILE"
-    # 退出时只删除属于自己的 PID 文件，避免 restart 时误删新进程刚写入的 PID
-    trap 'info "收到停止信号，退出"; [ -n "${TRACKER_PID:-}" ] && kill "$TRACKER_PID" 2>/dev/null; [ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ] && rm -f "$PID_FILE"; exit 0' INT TERM
+    # 退出时只删除属于自己的 PID 文件与锁，避免 restart 时误删新进程刚写入的
+    # EXIT 也要 trap：脚本因任何原因退出（异常、set -u 等）都必须释放锁，
+    # 否则锁会一直走到「陈旧接管」路径，短时间内表现为多实例。
+    trap 'info "收到停止信号，退出"; exit 0' INT TERM
+    trap '_daemon_cleanup' EXIT
 
     local last_prefix="" last_usb_listing="" prefix="" fails=0
     local ep mdns_eps usb_eps known_eps candidates connected_eps tcpip_eps
@@ -1057,9 +1106,69 @@ LAUNCHD_PLIST="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
 
 launchd_loaded() { launchctl list "$LAUNCHD_LABEL" >/dev/null 2>&1; }
 
+# ----------------------------------------------- 守护单实例锁
+#
+# 为什么必须有：launchd 的 KeepAlive、install.sh 的 unload→load、「restart」子命令
+# 都不保证旧进程已完全退出就拉起新进程，而 main_loop 本身不做互斥 —— 一旦重叠
+# 就会出现两个守护：双份 mDNS 轮询、双份事件写入、双份链路采集。
+# 用 mkdir 做原子锁（与 netinfo 同一套思路），锁内记录持有者 PID：
+# 持有者已死或目录过旧则接管，保证 kill -9 / 强杀之后不会永久死锁。
+DAEMON_LOCK="$STATE_DIR/daemon.lock.d"
+
+daemon_lock_acquire() {
+    local owner lmt lage
+    if mkdir "$DAEMON_LOCK" 2>/dev/null; then
+        printf '%s\n' "$$" > "$DAEMON_LOCK/pid"
+        return 0
+    fi
+    owner=$(cat "$DAEMON_LOCK/pid" 2>/dev/null || echo "")
+    # 持有者还活着 → 已有实例
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+        return 1
+    fi
+    lmt=$(stat -f %m "$DAEMON_LOCK" 2>/dev/null || echo 0)
+    lage=$(( $(date +%s) - lmt ))
+    # 刚创建、还没写入 PID：可能是另一个进程正在抢锁，让一步
+    if [ -z "$owner" ] && [ "$lage" -lt 5 ]; then
+        return 1
+    fi
+    rm -rf "$DAEMON_LOCK" 2>/dev/null      # 陈旧锁，接管
+    mkdir "$DAEMON_LOCK" 2>/dev/null || return 1
+    printf '%s\n' "$$" > "$DAEMON_LOCK/pid"
+    return 0
+}
+
+daemon_lock_release() {
+    [ "$(cat "$DAEMON_LOCK/pid" 2>/dev/null)" = "$$" ] || return 0
+    rm -rf "$DAEMON_LOCK" 2>/dev/null
+    return 0
+}
+
+# 所有守护实例的 PID。正常情况下只有一个；返回全部是为了把历史遗留的
+# 重复实例一并清理掉（只杀第一个的话，剩下的会一直跑下去）。
+#
+# 为什么要剥掉祖先链：bash 的命令替换/管道会 fork 出「命令行一模一样」的子 shell
+# （argv 仍是 `adb-wifi.sh _daemon`），直接 grep 会把它们当成独立的守护实例。
+# 只保留祖先链上没有其它同类进程的那个——那才是真正的入口进程。
+daemon_pids() {
+    ps -axo pid=,ppid=,command= | awk '
+        { par[$1] = $2 }
+        $0 ~ /adb-wifi\.sh _daemon$/ { isdaemon[$1] = 1 }
+        END {
+            for (p in isdaemon) {
+                q = par[p]; n = 0; fork = 0
+                while (q != "" && q != 1 && n < 64) {
+                    if (q in isdaemon) { fork = 1; break }
+                    q = par[q]; n++
+                }
+                if (!fork) print p
+            }
+        }' | sort -n
+}
+
 # 守护是否在跑（launchd 托管或手动 nohup 启动）
 daemon_pid() {
-    ps aux | grep -E "[a]db-wifi\.sh _daemon$" | awk '{print $2}' | head -1
+    daemon_pids | head -1
 }
 
 cmd_start() {
@@ -1100,21 +1209,29 @@ cmd_stop() {
     if launchd_loaded; then
         launchctl unload "$LAUNCHD_PLIST" 2>/dev/null
         UNLOADED_LAUNCHD=1
-        echo "✓ 已卸载 launchd 托管（重启后不会自动启动，可用 ./install.sh 恢复）"
+        # unload 只影响当前会话：plist 仍留在 LaunchAgents，下次登录 launchd 会重新加载，
+        # 所以「停止守护」不等于「取消开机自启」（也没写 disable 数据库）。
+        echo "✓ 已停止并卸载本次会话的 launchd 托管（下次登录仍会自动启动）"
     fi
 
-    local pid i
-    pid=$(daemon_pid)
-    if [ -n "$pid" ]; then
-        kill "$pid" 2>/dev/null
+    local pid i pids alive
+    pids=$(daemon_pids)
+    if [ -n "$pids" ]; then
+        # 全部实例一起停：历史遗留的重复守护若只杀第一个，剩下的会一直跑下去
+        for pid in $pids; do kill "$pid" 2>/dev/null; done
         # 等待进程真正退出（最多 5 秒），避免 restart 时新旧进程的 PID 文件互相覆盖
         for i in 1 2 3 4 5 6 7 8 9 10; do
-            kill -0 "$pid" 2>/dev/null || break
+            alive=0
+            for pid in $pids; do
+                kill -0 "$pid" 2>/dev/null && alive=1
+            done
+            [ "$alive" = "0" ] && break
             sleep 0.5
         done
-        kill -9 "$pid" 2>/dev/null
+        for pid in $pids; do kill -9 "$pid" 2>/dev/null; done
         sleep 0.2
         rm -f "$PID_FILE"
+        rm -rf "$DAEMON_LOCK" 2>/dev/null
         echo "✓ 已停止"
     else
         rm -f "$PID_FILE"
@@ -1358,7 +1475,7 @@ cmd_open() {
             else
                 case "$result" in
                     opened)  echo "  ✓ $s" ;;
-                    partial) echo "  △ $s（已到开发者选项，请手动点「无线调试」）" ;;
+                    partial) echo "  △ ${s}（已到开发者选项，请手动点「无线调试」）" ;;
                     *)       echo "  ✗ $s 打开失败" ;;
                 esac
             fi
@@ -1439,7 +1556,7 @@ cmd_open() {
         *)        label="$title" ;;
     esac
     case "$result" in
-        opened)   echo "✓ 已在手机上打开「$label」页面" ;;
+        opened)   echo "✓ 已在手机上打开「${label}」页面" ;;
         partial)  echo "△ $label"
                   echo "  未能直接定位到无线调试页，请在列表中手动点击「无线调试」" ;;
         need_usb) echo "✗ 需要先连接手机"; return 1 ;;
@@ -1726,9 +1843,11 @@ rate_hist_append() {
     local down="$1" up="$2" now
     now=$(date +%s)
     printf '%s %s %s\n' "$now" "${down:-0}" "${up:-0}" >> "$RATE_HIST_FILE" 2>/dev/null || return 0
+    # 临时文件带 $$：守护（每秒采样）与 `rate` 命令可能同时追加并裁剪
     awk -v cut=$((now - RATE_HIST_KEEP)) '$1 >= cut' "$RATE_HIST_FILE" \
-        > "$RATE_HIST_FILE.tmp" 2>/dev/null \
-        && mv -f "$RATE_HIST_FILE.tmp" "$RATE_HIST_FILE" 2>/dev/null
+        > "$RATE_HIST_FILE.tmp.$$" 2>/dev/null \
+        && mv -f "$RATE_HIST_FILE.tmp.$$" "$RATE_HIST_FILE" 2>/dev/null \
+        || rm -f "$RATE_HIST_FILE.tmp.$$" 2>/dev/null
     return 0
 }
 
@@ -2430,10 +2549,11 @@ cmd_diag() {
         echo "TCPIP_PORT=$TCPIP_PORT"; echo "TCPIP_LISTEN=0"; echo "AUTO_TCPIP=$AUTO_TCPIP"
     fi
 
-    # 先补记当前在线端点，保证菜单栏/命令行走 diag 时也能收录
-    # 手动 adb connect 或 legacy tcpip 模式建立的连接。
-    sync_known_from_devices >/dev/null 2>&1
-    known_eps=$(discover_known 2>/dev/null)
+    # 只读探测记忆端点。
+    # 这里**不能**再调 sync_known_from_devices / discover_known 的写入分支：
+    # diag 是每 5 秒一次的高频只读查询，补记端点由守护循环负责（见 main_loop 1.5）。
+    # 两边同时写 known_fails.txt / known_devices.txt 会造成状态文件竞争与丢失。
+    known_eps=$(discover_known --readonly 2>/dev/null)
     echo "KNOWN_FOUND=$(echo $known_eps | tr '\n' ',')"
     echo "KNOWN_LIST=$( [ -f "$KNOWN_FILE" ] && tr '\n' ',' < "$KNOWN_FILE" )"
 
@@ -2654,20 +2774,50 @@ netinfo_merge_one() {
     return 0
 }
 
-# 等待守护的异步采集释放锁（避免两路 dumpsys 同时打手机）
+# 等待守护的异步采集释放锁（避免两路 dumpsys 同时打手机）。
+# 返回 0=锁已空闲；1=仍在采集中。
+# 不能无条件 rm -rf 掉锁：那会把正在生效的锁强行删掉，锁就形同虚设。
+# 只有确认是陈旧锁（超过 2×TTL）才接管。
 netinfo_wait_lock() {
-    local waited=0
+    local waited=0 lmt lage
     [ -d "$NETINFO_LOCK" ] || return 0
     while [ -d "$NETINFO_LOCK" ] && [ "$waited" -lt 40 ]; do
         sleep 0.5
         waited=$((waited + 1))
     done
+    [ -d "$NETINFO_LOCK" ] || return 0
+    lmt=$(stat -f %m "$NETINFO_LOCK" 2>/dev/null || echo 0)
+    lage=$(( $(date +%s) - lmt ))
+    [ "$lage" -ge $(( NETINFO_TTL * 2 )) ] || return 1
+    rm -rf "$NETINFO_LOCK" 2>/dev/null
     return 0
 }
 
-cmd_netinfo_refresh() {
-    netinfo_wait_lock
+# `netinfo` 子命令：一次性采集，同样要拿锁。
+# 不加锁时它会与守护的异步采集同时跑，两路 dumpsys + system_profiler + ping
+# 一起打手机（文件头 netinfo 段记录的“6 次调用起了 6 个采集”就是这个原因）。
+cmd_netinfo() {
+    if ! netinfo_wait_lock; then
+        is_kv && echo "REFRESHED=0"
+        return 1
+    fi
+    if ! mkdir "$NETINFO_LOCK" 2>/dev/null; then
+        is_kv && echo "REFRESHED=0"
+        return 1
+    fi
+    trap 'rm -rf "$NETINFO_LOCK" 2>/dev/null' EXIT INT TERM
+    local rc=0
+    net_info_collect || rc=$?
     rm -rf "$NETINFO_LOCK" 2>/dev/null
+    trap - EXIT INT TERM
+    return $rc
+}
+
+cmd_netinfo_refresh() {
+    if ! netinfo_wait_lock; then
+        is_kv && echo "REFRESHED=0"
+        return 1
+    fi
     if ! mkdir "$NETINFO_LOCK" 2>/dev/null; then
         is_kv && echo "REFRESHED=0"
         return 1
@@ -2703,8 +2853,10 @@ cmd_netinfo_refresh_one() {
         return $?
     fi
 
-    netinfo_wait_lock
-    rm -rf "$NETINFO_LOCK" 2>/dev/null
+    if ! netinfo_wait_lock; then
+        is_kv && echo "REFRESHED=0"
+        return 1
+    fi
     if ! mkdir "$NETINFO_LOCK" 2>/dev/null; then
         is_kv && echo "REFRESHED=0"
         return 1
@@ -2755,7 +2907,7 @@ case "${1:-}" in
     log)     tail -f "$LOG_FILE" ;;
     once)    cmd_once ;;
     diag)    cmd_diag ;;
-    netinfo) net_info_collect ;;
+    netinfo) cmd_netinfo ;;
     netinfo-refresh) shift; cmd_netinfo_refresh_one "${1:-}" ;;
     open)    shift; cmd_open "$@" ;;
     recover) shift; cmd_recover "$@" ;;

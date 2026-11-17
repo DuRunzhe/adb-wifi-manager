@@ -52,6 +52,39 @@
 - 界面文案统一在 `menubar/i18n.swift` 维护，`zhHans` / `zhHant` / `en` 三表必须同时补齐
 - 速率类数值协议层用 Mbps（原始值），显示层统一换算为 MB/s（字节基准）
 
+## 进程与单实例约束
+
+同一条链路上会同时存在多个进程（菜单栏 App、守护、一次性命令、TUI），
+代码必须假设它们并发运行，不能有任何「全局唯一临时文件」或「只杀一个进程」的假设。
+
+- **菜单栏 App**：三层保护 —— `LSMultipleInstancesProhibited`（Info.plist）、
+  `menubar.lock` 的 `flock` 独占锁、`StaleInstance` 清理旧副本（`menubar/main.swift` 末尾）
+- **守护 `_daemon`**：`main_loop` 入口用 `state/daemon.lock.d`（mkdir 原子锁，内含持有者 PID）
+  做单实例；抢不到锁直接 `exit 0`，持有者已死/目录过旧则接管。
+  `INT`/`TERM`/`EXIT` 都必须释放锁（异常退出也要），否则会退化到「陈旧接管」
+- **禁止 `rm -f menubar.lock`**：flock 随进程退出由内核释放，删文件会让新旧实例
+  各自持有一把锁（旧 inode / 新 inode），等于双实例
+- **临时文件必须带 `$$`**：`known_fails.txt.tmp.$$`、`known_endpoints.txt.keep.$$`、
+  `netinfo.cache.tmp.$$` 等。固定名字在守护与一次性命令并发时会导致
+  `mv: No such file or directory` 与状态丢失
+- **`diag` 必须只读**：不写 `known_*` 状态文件，`discover_known` 用 `--readonly`。
+  补记端点由守护循环负责（`main_loop` 步骤 1.5）
+- **子进程按组清理**：`stop_device_tracker` 先 `pkill -P` 再 kill 本体；
+  Swift 侧 `runScript` 超时用 `processDescendants` 先杀后代再杀 bash。
+  只杀父进程会让 `adb` / `perl` / `ping` 被 init 收养永久残留
+- **`daemon_pids` 返回全部实例**（祖先链过滤掉 bash 的 fork 子 shell），
+  `cmd_stop` 全杀；不要退回 `head -1`
+
+### 修改进程相关逻辑时的检查清单
+
+- [ ] `_daemon` 仍抢不到锁即退出，且 `INT`/`TERM`/`EXIT` 都释放锁
+- [ ] 新增后台 subshell 时，退出路径能连带清理其子进程
+- [ ] 新增临时文件用 `$$` 后缀，失败分支会删除自己创建的临时文件
+- [ ] `diag` / 高频查询路径不写状态文件
+- [ ] `bash -n bin/adb-wifi.sh` 与 `swiftc -typecheck menubar/main.swift menubar/i18n.swift` 通过
+- [ ] 用 `start` → 再 `start` → `restart` → `stop` 验证：始终只有 1 个 `_daemon`、
+      1 个 `adb track-devices`，stop 后两者都为 0
+
 ### 修改协议时的检查清单
 
 - [ ] 新增诊断分支同时设置 `code` 与中文 `title` / `hint`

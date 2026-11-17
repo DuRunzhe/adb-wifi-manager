@@ -327,13 +327,17 @@ Mac  链路 22 MB/s（-55 dBm）· 信道 40 · 电量 100%（已充满）
 | 命令 | 说明 |
 |---|---|
 | `./bin/adb-wifi.sh start` | 启动守护（幂等，重复执行无副作用） |
-| `./bin/adb-wifi.sh stop` | 停止守护，并取消 launchd 开机自启 |
+| `./bin/adb-wifi.sh stop` | 停止守护（仅本次会话；`LaunchAgents` 里的配置保留，下次登录仍会自动启动） |
 | `./bin/adb-wifi.sh restart` | 重启 |
 | `./bin/adb-wifi.sh status` | 查看运行状态、在线设备、最近日志 |
 | `./bin/adb-wifi.sh log` | 实时跟随日志（Ctrl-C 退出） |
 | `./bin/adb-wifi.sh once` | 前台跑一轮发现，用于排查问题 |
 | `./bin/adb-wifi.sh open` | 在手机上直接打开「无线调试」页面 |
 | `./bin/adb-wifi.sh open dev` | 在手机上打开「开发者选项」页面 |
+
+> `stop` 只是本次会话停止：plist 仍留在 `~/Library/LaunchAgents/`，下次登录 launchd 会重新加载，
+> 因此它**不会**取消开机自启。要彻底取消：
+> `launchctl unload ~/Library/LaunchAgents/com.durunzhe.adb-wifi-manager.plist && rm ~/Library/LaunchAgents/com.durunzhe.adb-wifi-manager.plist`
 | `./bin/adb-wifi.sh open dev --all` | 在**所有**已连接设备上打开该页面（`--serial S` 指定单台） |
 | `./bin/adb-wifi.sh recover` | 主动恢复无线连接（**无需 USB**） |
 | `./bin/adb-wifi.sh recover --all` | 逐台校验 / 恢复所有已连接设备 |

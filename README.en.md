@@ -324,13 +324,17 @@ After that the endpoint is remembered and automatic reconnection takes over.
 | Command | Description |
 |---|---|
 | `./bin/adb-wifi.sh start` | Start the daemon (idempotent) |
-| `./bin/adb-wifi.sh stop` | Stop the daemon and disable launchd auto-start |
+| `./bin/adb-wifi.sh stop` | Stop the daemon for this session only (the LaunchAgent stays registered, so it starts again at next login) |
 | `./bin/adb-wifi.sh restart` | Restart |
 | `./bin/adb-wifi.sh status` | Show status, connected devices, recent logs |
 | `./bin/adb-wifi.sh log` | Follow the log in real time (Ctrl-C to exit) |
 | `./bin/adb-wifi.sh once` | Run one discovery round in the foreground (for troubleshooting) |
 | `./bin/adb-wifi.sh open` | Open the **Wireless debugging** page on the phone |
 | `./bin/adb-wifi.sh open dev` | Open the **Developer options** page on the phone |
+
+> `stop` only stops the current session: the plist stays in `~/Library/LaunchAgents/`, so launchd
+> loads it again at next login — it does **not** disable launch at login. To remove it entirely:
+> `launchctl unload ~/Library/LaunchAgents/com.durunzhe.adb-wifi-manager.plist && rm ~/Library/LaunchAgents/com.durunzhe.adb-wifi-manager.plist`
 | `./bin/adb-wifi.sh open dev --all` | Open that page on **every** connected device |
 | `./bin/adb-wifi.sh recover` | Actively restore the wireless connection (**no USB needed**) |
 | `./bin/adb-wifi.sh recover --all` | Check / restore every connected device in turn |

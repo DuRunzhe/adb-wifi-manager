@@ -92,8 +92,9 @@ if [ -n "$APP_SRC" ] && [ -d "$APP_SRC" ]; then
     mkdir -p "$HOME/Applications"
     rm -rf "$HOME/Applications/AdbWifiBar.app"
     cp -R "$APP_SRC" "$HOME/Applications/"
-    # 清掉可能残留的单实例锁（进程已退出时锁会自动释放，这里只防御异常情况）
-    rm -f "$HOME/Library/Application Support/adb-wifi-manager/menubar.lock"
+    # 不要删 menubar.lock：flock 在进程退出时由内核自动释放，文件本身留着无害。
+    # 删掉反而制造竞态 —— 仍在退出的旧实例持有的是旧 inode 的锁，
+    # 新实例会拿到一个新建文件的锁，两边同时成立（等于双实例）。
     echo "✓ 菜单栏 App 已安装到 ~/Applications/AdbWifiBar.app"
     echo "  可直接在访达中双击打开，或加入「登录项」"
 fi
@@ -107,6 +108,6 @@ sleep 15
 echo
 echo "常用命令:"
 echo "  $(shorten_path "$ROOT/bin/adb-wifi.sh") status    # 查看状态"
-echo "  $(shorten_path "$ROOT/bin/adb-wifi.sh") stop      # 停止并取消开机自启"
+echo "  $(shorten_path "$ROOT/bin/adb-wifi.sh") stop      # 停止守护（下次登录仍会自动启动）"
 echo "  $(shorten_path "$ROOT/bin/adb-wifi.sh") log       # 实时日志"
 echo "  open ~/Applications/AdbWifiBar.app   # 打开菜单栏 App"

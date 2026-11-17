@@ -98,6 +98,41 @@ let KV_ENV = ["ADBWIFI_FORMAT": "kv"]
 
 // MARK: - 执行脚本
 
+/// 收集某个进程的全部后代（子、孙…），用于超时时整棵树清理。
+///
+/// 为什么需要：只对 `/bin/bash` 本体调 `terminate()` 时，脚本派生的
+/// adb / perl / ping / system_profiler 会被 init（pid 1）收养并继续运行。
+/// `recover`（180s）、`open`（60s）、`netinfo-refresh`（60s）超时后就会留下孤儿。
+/// 脚本侧的 `tmo()` 早就因为同样的坑改成了「按进程组清理」，这里补齐同一件事。
+func processDescendants(of root: pid_t) -> [pid_t] {
+    let ps = Process()
+    ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+    ps.arguments = ["-axo", "pid=,ppid="]
+    let pipe = Pipe()
+    ps.standardOutput = pipe
+    ps.standardError = FileHandle.nullDevice
+    guard (try? ps.run()) != nil else { return [] }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    ps.waitUntilExit()
+    guard let text = String(data: data, encoding: .utf8) else { return [] }
+
+    var children: [pid_t: [pid_t]] = [:]
+    for line in text.split(separator: "\n") {
+        let f = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard f.count >= 2, let child = pid_t(f[0]), let parent = pid_t(f[1]) else { continue }
+        children[parent, default: []].append(child)
+    }
+    var result: [pid_t] = []
+    var queue = children[root] ?? []
+    // 上限防御：ppid 异常时不会死循环
+    while !queue.isEmpty && result.count < 512 {
+        let cur = queue.removeFirst()
+        result.append(cur)
+        if let kids = children[cur] { queue.append(contentsOf: kids) }
+    }
+    return result
+}
+
 @discardableResult
 func runScript(_ args: [String], timeout: TimeInterval = 20,
                env extraEnv: [String: String] = [:]) -> (code: Int32, out: String) {
@@ -123,7 +158,16 @@ func runScript(_ args: [String], timeout: TimeInterval = 20,
         usleep(50_000)
     }
     if p.isRunning {
+        // 先给后代发信号（此刻它们的 ppid 还指向本脚本，能被准确枚举），
+        // 再杀 bash 本体 —— 顺序反了的话后代会被 reparent，就再也找不到了。
+        let root = p.processIdentifier
+        let tree = processDescendants(of: root)
+        for c in tree { kill(c, SIGTERM) }
         p.terminate()
+        usleep(200_000)
+        for c in tree { kill(c, SIGKILL) }
+        if p.isRunning { kill(root, SIGKILL) }
+        p.waitUntilExit()
         return (-1, L.t("err.timeout"))
     }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -480,7 +524,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// App 图标（.icns）则由 menubar/gen-icon.swift 用同一个符号生成，
     /// 两者视觉同源但各自走最适合的渲染路径。
     func setIcon(_ candidates: [String], fallbackText: String) {
-        guard let button = statusItem.button else { return }
+        guard let button = statusItem?.button else { return }
         for name in candidates {
             if let img = NSImage(systemSymbolName: name, accessibilityDescription: "ADB WiFi") {
                 img.isTemplate = true
@@ -1094,11 +1138,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let about = NSMenuItem(title: L.t("menu.about"), action: #selector(showAbout),
                                keyEquivalent: "")
         about.target = self
+        about.image = NSImage(systemSymbolName: "info.circle", accessibilityDescription: nil)
         menu.addItem(about)
 
-        let quit = NSMenuItem(title: L.t("menu.quit"), action: #selector(quitApp),
-                              keyEquivalent: "q")
+        // 退出：点击（或 ⌘Q）先立即撤掉菜单栏图标，再在守护仍在跑时二次确认是否停止它。
+        let quit = NSMenuItem(title: L.t("menu.quitOnly"),
+                              action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
+        quit.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
         menu.addItem(quit)
     }
 
@@ -1840,12 +1887,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 轻量反馈：在菜单栏图标处短暂显示结果文字，无需系统通知权限
     func flash(title: String, text: String) {
-        guard let button = statusItem.button else { return }
+        guard let button = statusItem?.button else { return }
         let prevImage = button.image
         let prevTitle = button.title
         let short = text.count > 28 ? String(text.prefix(28)) + "…" : text
         button.image = nil
-        button.title = " \(title): \(short) "
+        // text 为空时只显示标题，避免出现「标题:  」这种多余冒号
+        button.title = text.isEmpty ? " \(title) " : " \(title): \(short) "
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
             guard let self = self else { return }
             button.image = prevImage
@@ -1856,8 +1904,125 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// 二次确认面板：菜单栏已经退出、但守护还在跑时，问一句「要不要一起停」。
+    /// 两个入口都显式可见：保留守护（默认/回车）、停止守护；关窗口或 Esc 等同保留守护。
+    /// 布局用固定 frame，面板尺寸恒定，不受堆叠约束影响。
+    func buildDaemonStopPanel() -> NSPanel {
+        let W: CGFloat = 360, H: CGFloat = 120
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
+                            styleMask: [.titled, .fullSizeContentView],
+                            backing: .buffered, defer: false)
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isMovableByWindowBackground = true
+        for kind in [NSWindow.ButtonType.miniaturizeButton, .zoomButton] {
+            panel.standardWindowButton(kind)?.isHidden = true
+        }
+        panel.center()
+
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: W, height: H))
+        panel.contentView = content
+        let pad: CGFloat = 20
+
+        let iconSide: CGFloat = 36
+        let icon = NSImageView(frame: NSRect(x: pad, y: H - 16 - iconSide,
+                                             width: iconSide, height: iconSide))
+        icon.image = NSApp.applicationIconImage
+        content.addSubview(icon)
+
+        let textX = pad + iconSide + 12
+        let title = NSTextField(labelWithString: L.t("quit.daemon.title"))
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        title.sizeToFit()
+        title.frame.origin = NSPoint(x: textX, y: H - 18 - title.frame.height)
+        content.addSubview(title)
+
+        let body = NSTextField(wrappingLabelWithString: L.t("quit.daemon.body"))
+        body.font = .systemFont(ofSize: 11)
+        body.textColor = .secondaryLabelColor
+        body.frame = NSRect(x: textX, y: title.frame.minY - 4 - 28,
+                            width: W - textX - pad, height: 28)
+        content.addSubview(body)
+
+        // 右 → 左：保留守护（默认 / Return）、停止守护
+        let keepBtn = NSButton(title: L.t("quit.daemon.keep"), target: self,
+                               action: #selector(quitPanelAction(_:)))
+        keepBtn.tag = 1
+        keepBtn.bezelStyle = .rounded
+        keepBtn.keyEquivalent = "\r"
+        keepBtn.sizeToFit()
+        keepBtn.frame = NSRect(x: W - pad - keepBtn.frame.width, y: 14,
+                               width: keepBtn.frame.width, height: keepBtn.frame.height)
+        content.addSubview(keepBtn)
+
+        let stopBtn = NSButton(title: L.t("quit.daemon.stop"), target: self,
+                               action: #selector(quitPanelAction(_:)))
+        stopBtn.tag = 2
+        stopBtn.bezelStyle = .rounded
+        stopBtn.sizeToFit()
+        stopBtn.frame = NSRect(x: keepBtn.frame.minX - 10 - stopBtn.frame.width, y: 14,
+                               width: stopBtn.frame.width, height: stopBtn.frame.height)
+        content.addSubview(stopBtn)
+
+        // 关闭按钮 = 保留守护
+        if let close = panel.standardWindowButton(.closeButton) {
+            close.target = self
+            close.action = #selector(dismissQuitPanel(_:))
+        }
+        // Esc 同样表示保留守护
+        let esc = NSButton(title: "", target: self, action: #selector(dismissQuitPanel(_:)))
+        esc.keyEquivalent = "\u{1b}"
+        esc.isBordered = false
+        esc.frame = NSRect(x: 0, y: 0, width: 1, height: 1)
+        content.addSubview(esc)
+        return panel
+    }
+
+    /// 关窗 / 关闭按钮 / Esc：保留守护，结束模态
+    @objc func dismissQuitPanel(_ sender: Any?) {
+        (sender as? NSButton)?.window?.orderOut(nil)
+        NSApp.stopModal(withCode: NSApplication.ModalResponse(rawValue: 0))
+    }
+
+    /// 面板里的「停止守护」：关窗并带回 1
+    @objc func quitPanelAction(_ sender: NSButton) {
+        sender.window?.orderOut(nil)
+        NSApp.stopModal(withCode: NSApplication.ModalResponse(sender.tag))
+    }
+
+    /// 退出。先把菜单栏图标撤掉 —— 用户点了退出就应该立刻「退出菜单」，
+    /// 不该还要先回答一个问题。图标撤掉之后再问守护要不要一起停，
+    /// 「关菜单栏」和「停守护」本来就是两个独立决定。
     @objc func quitApp() {
-        NSApp.terminate(nil)
+        timer?.invalidate()
+        timer = nil
+        eventSource?.cancel()
+        eventSource = nil
+        if let item = statusItem {
+            NSStatusBar.system.removeStatusItem(item)
+            statusItem = nil
+        }
+
+        guard status.running else {
+            NSApp.terminate(nil)
+            return
+        }
+
+        let panel = buildDaemonStopPanel()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        let resp = NSApp.runModal(for: panel)
+        panel.orderOut(nil)
+
+        guard resp.rawValue == 2 else {
+            NSApp.terminate(nil)              // 保留守护（含关窗 / Esc / Return）
+            return
+        }
+        // 停止守护可能要等几秒，停稳再退出，避免 stop 被中途打断
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = runScript(["stop"], timeout: 30)
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
     }
 
     // MARK: - 关于 / 版本更新
@@ -2405,8 +2570,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             rm -rf "$APP"
             /usr/bin/ditto "$NEW" "$APP"
             /usr/bin/xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
-            # 清掉单实例锁：正常退出会自动释放，这里只防御异常退出的残留
-            rm -f "$HOME/Library/Application Support/adb-wifi-manager/menubar.lock"
+            # 不删 menubar.lock：flock 在进程退出时由内核释放，删文件反而制造竞态
+            # （旧实例持旧 inode 的锁，新实例拿新建文件的锁，两边同时成立）。
             # 让 LaunchServices 重新读取 bundle（否则可能仍指向刚被删除的旧路径）
             /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
               -f "$APP" >/dev/null 2>&1 || true
