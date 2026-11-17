@@ -426,6 +426,292 @@ func loadDevices() -> [DevEntry] {
     return list
 }
 
+// MARK: - 文字链接按钮
+
+/// 可点的文字链接：链接色 + 悬停下划线 + 手型光标。
+/// 曾经用灰色当「次要链接」，结果完全看不出能点（用户反馈过），
+/// 所以静态就必须用链接色，悬停再补下划线与光标两重反馈。
+final class LinkButton: NSButton {
+    private var text = ""
+    private var fontSize: CGFloat = 11
+    private var hovered = false
+    private var hoverArea: NSTrackingArea?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configure()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configure()
+    }
+
+    private func configure() {
+        bezelStyle = .inline
+        isBordered = false
+        setButtonType(.momentaryChange)
+        focusRingType = .default
+    }
+
+    override var isEnabled: Bool {
+        didSet {
+            applyTitle()
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+
+    /// 设置链接文案（内部用 attributedTitle，才能控字号与下划线）
+    func setLink(_ text: String, size: CGFloat = 11) {
+        self.text = text
+        self.fontSize = size
+        applyTitle()
+        // attributedTitle 不会同步给 AX，必须显式给无障碍标签
+        setAccessibilityLabel(text)
+    }
+
+    private func applyTitle() {
+        var attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: fontSize),
+            .foregroundColor: isEnabled ? NSColor.linkColor : NSColor.tertiaryLabelColor,
+        ]
+        if hovered && isEnabled {
+            attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            attrs[.underlineColor] = NSColor.linkColor
+        }
+        attributedTitle = NSAttributedString(string: text, attributes: attrs)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let old = hoverArea { removeTrackingArea(old) }
+        let area = NSTrackingArea(rect: .zero,
+                                  options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                  owner: self)
+        addTrackingArea(area)
+        hoverArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard isEnabled, !hovered else { return }
+        hovered = true
+        applyTitle()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard hovered else { return }
+        hovered = false
+        applyTitle()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard isEnabled else { return }
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+}
+
+// MARK: - 更新按钮（内嵌下载进度动画）
+
+/// 更新按钮：底部内嵌一条进度条。
+/// 下载阶段按百分比填充（缓动推进），总量未知时用色块来回扫描，其余状态自动隐藏。
+/// 进度条直接画在按钮自己的 `draw(_:)` 里，不改点击区域，也不需要额外的子视图或
+/// 图层（layer 子层会被按钮内容层压住），因此始终复用同一个按钮。
+final class ProgressButton: NSButton {
+    private var visible = false
+    private var indeterminate = false
+    private var targetRatio: Double = 0
+    private var displayRatio: Double = 0
+    private var scanPhase: Double = 0.5
+    private var scanForward = true
+    private var ticker: Timer?
+
+    private let barHeight: CGFloat = 3
+    private let barInset: CGFloat = 14
+    private let barBottom: CGFloat = 1
+
+    /// 系统开启「减少动态效果」时不做缓动与扫描，只静态更新
+    private var reduceMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    /// 系统开启「增强对比度」时把轨道底色加深，剩余部分也看得清
+    private var increaseContrast: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+    }
+
+    /// VoiceOver 读到的值：进度百分比（进度条是自绘的，没有原生 AX 元素）
+    override func accessibilityValue() -> Any? {
+        // 不确定态没有可报的百分比，标题已经写了「下载中…」，不必重复
+        guard visible, !indeterminate else { return super.accessibilityValue() }
+        return "\(Int((displayRatio * 100).rounded()))%"
+    }
+
+    /// 按十个一档播报，避免每 1% 都打断 VoiceOver
+    private var lastAnnouncedDecile = -1
+
+    private func announceProgress() {
+        guard visible, !indeterminate else { return }
+        let decile = Int((displayRatio * 100).rounded()) / 10
+        guard decile != lastAnnouncedDecile else { return }
+        lastAnnouncedDecile = decile
+        NSAccessibility.post(element: self, notification: .valueChanged)
+    }
+
+    deinit { ticker?.invalidate() }
+
+    // MARK: 对外接口
+
+    /// 确定态进度（0...1），缓动到目标值
+    func setProgress(_ value: Double) {
+        visible = true
+        indeterminate = false
+        targetRatio = max(0, min(1, value))
+        if reduceMotion {
+            displayRatio = targetRatio
+            stopTicking()
+            needsDisplay = true
+        } else {
+            startTicking()
+        }
+    }
+
+    /// 不确定态（总量未知）：色块在轨道内来回扫描
+    func setIndeterminate() {
+        if !visible {
+            visible = true
+            displayRatio = 0
+        }
+        guard !indeterminate else { return }
+        indeterminate = true
+        scanPhase = 0.5
+        scanForward = true
+        if reduceMotion {
+            stopTicking()
+            needsDisplay = true
+        } else {
+            startTicking()
+        }
+    }
+
+    /// 退出下载阶段（校验 / 安装 / 失败 / 非安装态）
+    func hideProgress() {
+        guard visible else { return }
+        visible = false
+        indeterminate = false
+        lastAnnouncedDecile = -1
+        stopTicking()
+        needsDisplay = true
+        NSAccessibility.post(element: self, notification: .valueChanged)
+    }
+
+    // MARK: 绘制
+
+    /// 默认按钮在 key window 里才是蓝底白字，此时进度条要用白色；
+    /// 窗口失焦后按钮会退成灰底黑字，颜色必须跟着切回强调色。
+    private var onAccentBackground: Bool {
+        guard keyEquivalent == "\r", isEnabled, bezelColor == nil else { return false }
+        return window?.isKeyWindow ?? false
+    }
+
+    /// 按钮是 flipped 的，y 从顶部算，所以「底部」是 height - bottom - barHeight
+    private var barRect: NSRect {
+        NSRect(x: barInset, y: bounds.height - barBottom - barHeight,
+               width: max(0, bounds.width - barInset * 2), height: barHeight)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard visible else { return }
+        let rect = barRect
+        guard rect.width > 2 else { return }
+        let radius = rect.height / 2
+        let onAccent = onAccentBackground
+
+        let trackAlpha: CGFloat = onAccent ? (increaseContrast ? 0.45 : 0.30)
+                                          : (increaseContrast ? 0.35 : 0.22)
+        (onAccent ? NSColor.white.withAlphaComponent(trackAlpha)
+                  : NSColor.controlAccentColor.withAlphaComponent(trackAlpha)).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+
+        let width = indeterminate ? rect.width * 0.3 : rect.width * CGFloat(displayRatio)
+        guard width > 0.5 else { return }
+        var bar = rect
+        bar.size.width = width
+        if indeterminate {
+            bar.origin.x = rect.minX + CGFloat(scanPhase) * (rect.width - width)
+        }
+        (onAccent ? NSColor.white : NSColor.controlAccentColor).setFill()
+        NSBezierPath(roundedRect: bar, xRadius: radius, yRadius: radius).fill()
+    }
+
+    override func layout() {
+        super.layout()
+        if visible { needsDisplay = true }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        if visible { needsDisplay = true }
+    }
+
+    /// 跟随窗口的 key 状态重绘：按钮底色会随焦点在蓝底/灰底之间切换
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        let nc = NotificationCenter.default
+        nc.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: nil)
+        nc.removeObserver(self, name: NSWindow.didResignKeyNotification, object: nil)
+        guard let w = window else { return }
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            nc.addObserver(self, selector: #selector(windowKeyChanged), name: name, object: w)
+        }
+    }
+
+    @objc private func windowKeyChanged() {
+        if visible { needsDisplay = true }
+    }
+
+    // MARK: 动画
+
+    private func startTicking() {
+        guard ticker == nil else { return }
+        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+        // .common 模式：菜单/滚动时动画也不会停
+        RunLoop.main.add(t, forMode: .common)
+        ticker = t
+    }
+
+    private func stopTicking() {
+        ticker?.invalidate()
+        ticker = nil
+    }
+
+    private func tick() {
+        var dirty = false
+        if indeterminate {
+            let step = 1.0 / 60.0
+            scanPhase += scanForward ? step : -step
+            if scanPhase >= 1 { scanPhase = 1; scanForward = false }
+            if scanPhase <= 0 { scanPhase = 0; scanForward = true }
+            dirty = true
+        } else if abs(targetRatio - displayRatio) > 0.001 {
+            // 简单指数逼近：每帧走剩余距离的 30%，约 0.2s 收敛
+            displayRatio += (targetRatio - displayRatio) * 0.3
+            dirty = true
+        } else if displayRatio != targetRatio {
+            displayRatio = targetRatio
+            dirty = true
+        }
+        if dirty {
+            needsDisplay = true
+            announceProgress()
+        }
+        if !indeterminate && displayRatio == targetRatio { stopTicking() }
+    }
+}
+
 // MARK: - App
 
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -438,6 +724,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         setIcon(["smartphone", "iphone", "wifi"], fallbackText: "ADB")
+        statusItem.button?.setAccessibilityLabel(L.t("app.name"))
+        statusItem.button?.setAccessibilityHelp(L.t("app.tooltip"))
 
         let menu = NSMenu()
         menu.delegate = self
@@ -1357,6 +1645,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let lang = sender.representedObject as? AppLanguage else { return }
         L.setLanguage(lang)
         statusItem.button?.toolTip = L.t("app.tooltip")
+        statusItem.button?.setAccessibilityLabel(L.t("app.name"))
+        statusItem.button?.setAccessibilityHelp(L.t("app.tooltip"))
         let reopen = aboutWindow?.isVisible == true
         aboutWindow?.close()
         aboutWindow = nil
@@ -2029,13 +2319,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var aboutWindow: NSWindow?
     var checkUpdateButton: NSButton?
-    var checkAlphaButton: NSButton?
+    var checkAlphaButton: LinkButton?
 
     /// 已检查到、可安装的更新
     var pendingStable: (tag: String, url: String, notes: String)?
     var pendingAlpha: (tag: String, url: String, notes: String)?
+
+    /// 各 tag 通用包的字节数（Release JSON 的 assets[].size）。
+    /// 有它就能直接算出百分比，不必依赖下载响应头；访问可能跨线程，加锁。
+    private let assetBytesLock = NSLock()
+    private var assetBytesByTag: [String: Int] = [:]
     var installingUpdate = false
     var lastAutoCheck = Date.distantPast
+
+    /// 安装阶段：下载 → 解压校验 → 替换安装。
+    /// 三个阶段都只复用更新按钮（与 Alpha 文字链）提示，不额外弹窗或占新控件。
+    enum UpdatePhase { case download, verify, apply }
+    var updatePhase: UpdatePhase = .download
+    /// 下载进度 0...1；nil 表示总量未知（按钮只显示「下载中…」）
+    var downloadProgress: Double?
 
     /// Alpha 入口自身显示检查状态（与正式版按钮一致，不占用状态行）
     enum AlphaState {
@@ -2073,7 +2375,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func makeAboutWindow() -> NSWindow {
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 380),
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 366),
             styleMask: [.titled, .closable],
             backing: .buffered, defer: false)
         w.title = L.t("about.title")
@@ -2093,80 +2395,100 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         icon.imageScaling = .scaleProportionallyUpOrDown
         icon.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            icon.widthAnchor.constraint(equalToConstant: 64),
-            icon.heightAnchor.constraint(equalToConstant: 64),
+            icon.widthAnchor.constraint(equalToConstant: 68),
+            icon.heightAnchor.constraint(equalToConstant: 68),
         ])
+        // 版本信息就在下面，图标纯装饰，避免 VoiceOver 多念一个「图片」
+        icon.setAccessibilityElement(false)
         stack.addArrangedSubview(icon)
+        stack.setCustomSpacing(12, after: icon)
 
         let name = NSTextField(labelWithString: "ADB WiFi")
-        name.font = NSFont.systemFont(ofSize: 18, weight: .semibold)
+        name.font = NSFont.systemFont(ofSize: 19, weight: .semibold)
         stack.addArrangedSubview(name)
+        stack.setCustomSpacing(3, after: name)
 
         var verText = L.t("about.version", APP_VERSION)
         if !APP_BUILD.isEmpty { verText += L.t("about.buildSuffix", APP_BUILD) }
         let ver = NSTextField(labelWithString: verText)
-        ver.font = NSFont.systemFont(ofSize: 11)
+        ver.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         ver.textColor = .secondaryLabelColor
         stack.addArrangedSubview(ver)
+        stack.setCustomSpacing(10, after: ver)
 
         let desc = NSTextField(wrappingLabelWithString: L.t("about.desc"))
         desc.alignment = .center
-        desc.font = NSFont.systemFont(ofSize: 11)
+        desc.font = NSFont.systemFont(ofSize: 11.5)
         desc.textColor = .secondaryLabelColor
-        desc.widthAnchor.constraint(equalToConstant: 360).isActive = true
+        desc.widthAnchor.constraint(equalToConstant: 380).isActive = true
         stack.addArrangedSubview(desc)
-
-        stack.setCustomSpacing(16, after: desc)
+        stack.setCustomSpacing(18, after: desc)
 
         // 正式版是主入口：大号默认按钮 + 加粗，视觉上明显突出
-        let check = NSButton(title: L.t("about.check"), target: self, action: #selector(checkStableUpdates))
+        let check = ProgressButton(title: L.t("about.check"),
+                                   target: self, action: #selector(checkStableUpdates))
         check.bezelStyle = .rounded
         check.controlSize = .large
         check.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         check.keyEquivalent = "\r"
         check.toolTip = L.t("about.checkTip")
         check.translatesAutoresizingMaskIntoConstraints = false
-        check.widthAnchor.constraint(equalToConstant: 260).isActive = true
+        check.lineBreakMode = .byTruncatingTail
+        NSLayoutConstraint.activate([
+            // 只给下限：英文「Download & Install Alpha v0.0.6-alpha.3」比中文长，
+            // 固定宽度会被截断，让按钮按内容自己撑开
+            check.widthAnchor.constraint(greaterThanOrEqualToConstant: 264),
+            // 比系统默认的 28 高一点，进度条才不会挤到标题文字上
+            check.heightAnchor.constraint(equalToConstant: 32),
+        ])
         checkUpdateButton = check
         stack.addArrangedSubview(check)
-        stack.setCustomSpacing(12, after: check)
+        stack.setCustomSpacing(10, after: check)
 
-        // Alpha 入口自身完成「状态 + 动作」，不再额外占一行状态文字
-        let alpha = NSButton(title: L.t("about.alpha.idle"), target: self, action: #selector(checkAlphaUpdates))
-        alpha.bezelStyle = .inline
-        alpha.isBordered = false
+        // Alpha 入口自身完成「状态 + 动作」
+        let alpha = LinkButton(title: L.t("about.alpha.idle"),
+                               target: self, action: #selector(checkAlphaUpdates))
+        alpha.setLink(L.t("about.alpha.idle"), size: 11.5)
         alpha.toolTip = L.t("about.alpha.tip")
         checkAlphaButton = alpha
         refreshAlphaLink()
         stack.addArrangedSubview(alpha)
-
         stack.setCustomSpacing(18, after: alpha)
+
+        // 细分隔线：把「更新区」与「外部链接 / 关闭」分开
+        let rule = NSBox()
+        rule.setAccessibilityElement(false)
+        rule.boxType = .separator
+        rule.translatesAutoresizingMaskIntoConstraints = false
+        rule.widthAnchor.constraint(equalToConstant: 360).isActive = true
+        stack.addArrangedSubview(rule)
+        stack.setCustomSpacing(14, after: rule)
 
         let links = NSStackView()
         links.orientation = .horizontal
-        links.spacing = 16
-        let home = NSButton(title: L.t("about.link.home"), target: self, action: #selector(openRepo))
-        let issues = NSButton(title: L.t("about.link.issues"), target: self, action: #selector(openIssues))
-        let releases = NSButton(title: L.t("about.link.releases"), target: self, action: #selector(openReleases))
+        links.spacing = 18
+        let home = LinkButton(title: L.t("about.link.home"), target: self, action: #selector(openRepo))
+        let issues = LinkButton(title: L.t("about.link.issues"), target: self, action: #selector(openIssues))
+        let releases = LinkButton(title: L.t("about.link.releases"), target: self, action: #selector(openReleases))
         for b in [home, issues, releases] {
-            b.bezelStyle = .inline
-            b.isBordered = false
-            b.contentTintColor = .linkColor
-            b.font = NSFont.systemFont(ofSize: 11)
+            // 链接色 + 悬停下划线 + 手型光标：静态就能看出可点
+            b.setLink(b.title, size: 11)
             links.addArrangedSubview(b)
         }
         stack.addArrangedSubview(links)
-
         stack.setCustomSpacing(18, after: links)
 
         let close = NSButton(title: L.t("about.close"), target: self, action: #selector(closeAbout))
         close.bezelStyle = .rounded
         close.keyEquivalent = "\u{1b}"
+        close.translatesAutoresizingMaskIntoConstraints = false
+        close.widthAnchor.constraint(equalToConstant: 88).isActive = true
         stack.addArrangedSubview(close)
 
+        w.initialFirstResponder = check
         NSLayoutConstraint.activate([
             stack.centerXAnchor.constraint(equalTo: w.contentView!.centerXAnchor),
-            stack.topAnchor.constraint(equalTo: w.contentView!.topAnchor, constant: 24),
+            stack.topAnchor.constraint(equalTo: w.contentView!.topAnchor, constant: 26),
             stack.leadingAnchor.constraint(greaterThanOrEqualTo: w.contentView!.leadingAnchor, constant: 24),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: w.contentView!.trailingAnchor, constant: -24),
         ])
@@ -2339,16 +2661,46 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// 安装中的阶段文案：下载（带百分比）→ 解压校验 → 替换安装。
+    /// 主更新按钮与 Alpha 文字链共用，保持单一数据源。
+    func installingTitle() -> String {
+        switch updatePhase {
+        case .download:
+            guard let p = downloadProgress else { return L.t("about.downloading") }
+            let pct = Int((max(0, min(1, p)) * 100).rounded())
+            return L.t("about.downloadProgress", "\(pct)%")
+        case .verify:
+            return L.t("about.verifying")
+        case .apply:
+            return L.t("about.installing")
+        }
+    }
+
+    /// 把当前阶段 / 进度映射到主按钮底部的进度轨
+    func applyButtonProgress() {
+        guard let b = checkUpdateButton as? ProgressButton else { return }
+        guard updatePhase == .download else { b.hideProgress(); return }
+        if let p = downloadProgress { b.setProgress(p) } else { b.setIndeterminate() }
+    }
+
+    /// 关于窗口状态行：把「检查 / 下载 / 安装 / 失败」的真实状态写出来，
     /// 主更新按钮：Alpha 检查出更新时接管按钮，否则显示正式版状态
     func setStableButtonTitle() {
         let btn = checkUpdateButton
         var tip = L.t("about.checkTip")
 
+        // 底部进度轨只在安装阶段可见（下载有百分比，校验/安装阶段隐藏）
+        if alphaState != .installing && stableState != .installing {
+            (btn as? ProgressButton)?.hideProgress()
+        }
+
         if primaryChannel == .alpha {
             switch alphaState {
             case .installing:
-                btn?.title = L.t("about.installing")
-                btn?.isEnabled = false
+                btn?.title = installingTitle()
+                // 不禁用：点击会被 guard 拦住，灰化反而看不清进度文字
+                btn?.isEnabled = true
+                applyButtonProgress()
                 tip = pendingAlpha.map { L.t("about.tip.installing", $0.tag) } ?? L.t("about.installing")
                 btn?.toolTip = tip
                 return
@@ -2374,11 +2726,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch stableState {
         case .checking:
             btn?.title = L.t("about.checking")
-            btn?.isEnabled = false
+            // 不禁用：反复点击有 guard 兜底，禁用后灰化的按钮反而像空占位
+            btn?.isEnabled = true
             tip = L.t("about.status.checking")
         case .installing:
-            btn?.title = L.t("about.installing")
-            btn?.isEnabled = false
+            btn?.title = installingTitle()
+            // 不禁用：点击会被 guard 拦住，灰化反而看不清进度文字
+            btn?.isEnabled = true
+            applyButtonProgress()
             tip = pendingStable.map { L.t("about.tip.installing", $0.tag) } ?? L.t("about.installing")
         case .installFailed:
             btn?.title = L.t("about.installFailed")
@@ -2418,10 +2773,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             enabled = false
             tip = L.t("about.alpha.checking")
         case .installing:
-            text = pendingAlpha.map { L.t("about.alpha.installingTag", $0.tag) }
-                ?? L.t("about.alpha.installing")
+            // 文字链只说明“在装”，百分比留给主按钮与进度条
+            text = L.t("about.alpha.installing")
             enabled = false
-            tip = text
+            tip = pendingAlpha.map { L.t("about.tip.installing", $0.tag) } ?? text
         case .updateAvailable:
             text = pendingAlpha.map { L.t("about.alpha.available", $0.tag) } ?? L.t("about.alpha.idle")
             tip = pendingAlpha.map { L.t("about.alpha.tip.available", $0.tag) } ?? L.t("about.alpha.tip")
@@ -2440,12 +2795,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             text = L.t("about.alpha.failed")
             tip = alphaError.isEmpty ? L.t("about.alpha.failed") : alphaError
         }
-        let attr = NSAttributedString(string: text, attributes: [
-            .font: NSFont.systemFont(ofSize: 11),
-            .foregroundColor: NSColor.linkColor,
-            .underlineStyle: NSUnderlineStyle.single.rawValue,
-        ])
-        checkAlphaButton?.attributedTitle = attr
+        // 不加下划线：主按钮是实心蓝，Alpha 入口用蓝字即可区分，底部外部链接则退成灰色
+        checkAlphaButton?.setLink(text, size: 11.5)
         checkAlphaButton?.isEnabled = enabled
         checkAlphaButton?.toolTip = tip
     }
@@ -2465,6 +2816,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         installingUpdate = true
         primaryChannel = channel
+        updatePhase = .download
+        downloadProgress = nil
         updateLog("开始更新 channel=\(channel == .stable ? "stable" : "alpha") tag=\(info.tag) url=\(zipURL)")
         checkAlphaButton?.isEnabled = false
         checkUpdateButton?.isEnabled = false
@@ -2478,8 +2831,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         DispatchQueue.global(qos: .userInitiated).async {
             let zip = tmp + "/update.zip"
+            let headers = tmp + "/update.headers"
             let unpack = tmp + "/unpack"
             var failure: String?
+
+            // 下载进度回主线程刷新按钮文案（阶段切换也从这里推）
+            let onProgress: (Double?) -> Void = { p in
+                DispatchQueue.main.async {
+                    guard self.installingUpdate else { return }
+                    self.downloadProgress = p
+                    self.setStableButtonTitle()
+                    self.refreshAlphaLink()
+                }
+            }
+            let setPhase: (UpdatePhase) -> Void = { phase in
+                DispatchQueue.main.async {
+                    guard self.installingUpdate else { return }
+                    self.updatePhase = phase
+                    if phase != .download { self.downloadProgress = nil }
+                    self.setStableButtonTitle()
+                    self.refreshAlphaLink()
+                }
+            }
 
             // 临时目录必须显式创建：curl -o 不会自动建父目录，否则报
             // “Failure writing output to destination”并立即失败
@@ -2491,21 +2864,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             if failure == nil {
-                let dl = self.shellCode("/usr/bin/curl", [
-                    "-fL", "--retry", "3", "--retry-delay", "2",
-                    "--max-time", "300", "-o", zip, zipURL])
+                let dl = self.downloadUpdate(zipURL, to: zip,
+                                             headerPath: headers,
+                                             expectedBytes: self.knownAssetBytes(for: info.tag),
+                                             onProgress: onProgress)
                 let attrs = try? FileManager.default.attributesOfItem(atPath: zip)
                 let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
-                if size == 0 {
-                    // 把 curl 的原因（HTTP 状态/网络错误）带出来，不只是“下载失败”
-                    let detail = dl.out.trimmingCharacters(in: .whitespacesAndNewlines)
+                updateLog("下载结束 code=\(dl.code) size=\(size) total=\(dl.total)")
+                let detail = dl.out.trimmingCharacters(in: .whitespacesAndNewlines)
+                if size == 0 || dl.code != 0 {
+                    // 把 curl 的原因（HTTP 状态/网络错误/传输中断）带出来，不只是“下载失败”
                     failure = detail.isEmpty
                         ? L.t("update.err.download")
                         : L.t("update.err.downloadDetail", String(detail.suffix(300)))
+                } else if dl.total > 0 && size < dl.total {
+                    // 连接被中途掐断时 curl 可能仍退出 0，不校验总长就会把半截包拿去解压
+                    failure = L.t("update.err.incomplete",
+                                  Self.sizeText(size), Self.sizeText(dl.total))
                 }
             }
 
             if failure == nil {
+                setPhase(.verify)
                 let un = self.shellCode("/usr/bin/ditto", ["-x", "-k", zip, unpack])
                 if un.code != 0 {
                     let detail = un.out.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2536,6 +2916,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 updateLog("更新失败：\(f)")
                 DispatchQueue.main.async {
                     self.installingUpdate = false
+                    self.updatePhase = .download
+                    self.downloadProgress = nil
                     self.checkAlphaButton?.isEnabled = true
                     self.checkUpdateButton?.isEnabled = true
                     if channel == .stable {
@@ -2553,6 +2935,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             // 等当前进程退出后再替换 App，避免“自己替换自己”导致异常
+            setPhase(.apply)
             let script = tmp + "/apply-update.sh"
             let body = """
             #!/bin/bash
@@ -2590,6 +2973,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 updateLog("无法启动替换脚本：\(error.localizedDescription)")
                 DispatchQueue.main.async {
                     self.installingUpdate = false
+                    self.updatePhase = .download
+                    self.downloadProgress = nil
                     self.checkAlphaButton?.isEnabled = true
                     self.checkUpdateButton?.isEnabled = true
                     if channel == .stable {
@@ -2622,6 +3007,106 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// 记下通用包的字节数（Release JSON 的 assets[].size）。
+    /// 下载进度优先用它，能直接用上下载字节数算出百分比。
+    func rememberAssetBytes(_ json: [String: Any], tag: String) {
+        guard let n = Self.assetBytes(json, tag: tag) else { return }
+        assetBytesLock.lock()
+        assetBytesByTag[tag] = n
+        assetBytesLock.unlock()
+    }
+
+    func knownAssetBytes(for tag: String) -> Int? {
+        assetBytesLock.lock()
+        defer { assetBytesLock.unlock() }
+        return assetBytesByTag[tag]
+    }
+
+    /// 从 Release JSON 里取 `AdbWifiBar-<version>-universal.zip` 的 size
+    static func assetBytes(_ json: [String: Any], tag: String) -> Int? {
+        guard !tag.isEmpty else { return nil }
+        let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        let wanted = "AdbWifiBar-\(version)-universal.zip"
+        for a in json["assets"] as? [[String: Any]] ?? [] {
+            guard (a["name"] as? String) == wanted else { continue }
+            if let n = a["size"] as? Int, n > 0 { return n }
+            if let d = a["size"] as? Double, d > 0 { return Int(d) }
+        }
+        return nil
+    }
+
+    /// 下载更新包，并在传输过程中回报进度。
+    /// 总量优先取 Release 元数据（精确、无需等待响应头），拿不到时从 curl `-D`
+    /// 写出的最后一跳（GitHub → S3）的 Content-Length 取；两者都未知时回调 nil，
+    /// 按钮退回不确定态。
+    func downloadUpdate(_ url: String, to dest: String, headerPath: String,
+                        expectedBytes: Int?,
+                        onProgress: @escaping (Double?) -> Void) -> (code: Int32, out: String, total: Int) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        // --retry-all-errors：网络中断（含 18 partial file）也重试；
+        // -C -：重试/续传从已写入的字节继续，不必从头再来。
+        p.arguments = ["-fL", "-sS", "--retry", "5", "--retry-delay", "2",
+                       "--retry-all-errors", "--continue-at", "-",
+                       "--max-time", "120", "-D", headerPath, "-o", dest, url]
+        let pipe = Pipe()
+        p.standardError = pipe
+        do { try p.run() } catch { return (-1, "", 0) }
+
+        // --max-time 是单次传输上限（重试会重新计时），留足 5 次重试的总时长
+        let deadline = Date().addingTimeInterval(620)
+        var total = expectedBytes ?? 0
+        var lastPct = -1
+        var reportedUnknown = false
+        while p.isRunning {
+            if total == 0 { total = Self.contentLength(at: headerPath) }
+            if total > 0 {
+                let attrs = try? FileManager.default.attributesOfItem(atPath: dest)
+                let got = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+                let pct = got > 0 ? min(100, got * 100 / total) : 0
+                if pct != lastPct {
+                    lastPct = pct
+                    onProgress(Double(pct) / 100)
+                }
+            } else if !reportedUnknown {
+                reportedUnknown = true
+                onProgress(nil)
+            }
+            if Date() >= deadline {
+                // 先杀后代再杀本体，否则残留的 curl 会继续写文件
+                for c in processDescendants(of: p.processIdentifier) { kill(c, SIGTERM) }
+                p.terminate()
+                usleep(200_000)
+                p.waitUntilExit()
+                return (-1, L.t("err.timeout"), total)
+            }
+            usleep(200_000)
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        // 收尾把它推到 100%，避免停在 99% 上看着像卡住
+        if p.terminationStatus == 0 { onProgress(1) }
+        return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "", total)
+    }
+
+    /// 字节数 → 人类可读（1.2 MB），用于「下载不完整」提示
+    static func sizeText(_ bytes: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
+    /// 从 curl `-D` 写出的响应头里取最终跳转的 Content-Length。
+    /// 302 那一跳的 Content-Length 是 0，所以只取最后一个大于 0 的值。
+    static func contentLength(at path: String) -> Int {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return 0 }
+        var size = 0
+        for line in text.split(separator: "\n") {
+            let f = line.split(separator: ":", maxSplits: 1).map(String.init)
+            guard f.count == 2, f[0].lowercased().hasPrefix("content-length") else { continue }
+            if let n = Int(f[1].trimmingCharacters(in: .whitespaces)), n > 0 { size = n }
+        }
+        return size
+    }
+
     /// 取最新版本。
     /// 正式版：releases/latest（GitHub 已排除 prerelease），无 Release 时回退到正式 tag；
     /// Alpha：/releases 中第一个 prerelease，无 prerelease 时回退到带后缀的 tag。
@@ -2633,8 +3118,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 switch res {
                 case .success(let obj):
                     let d = obj as? [String: Any] ?? [:]
+                    let tag = d["tag_name"] as? String ?? ""
+                    self.rememberAssetBytes(d, tag: tag)
                     completion(.success((
-                        tag: d["tag_name"] as? String ?? "",
+                        tag: tag,
                         url: d["html_url"] as? String ?? RELEASES_URL,
                         notes: d["body"] as? String ?? "")))
                 case .failure(let err):
@@ -2657,6 +3144,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     let arr = obj as? [[String: Any]] ?? []
                     if let r = arr.first(where: { ($0["prerelease"] as? Bool) == true }),
                        let tag = r["tag_name"] as? String, !tag.isEmpty {
+                        self.rememberAssetBytes(r, tag: tag)
                         completion(.success((
                             tag: tag,
                             url: r["html_url"] as? String ?? RELEASES_URL,
