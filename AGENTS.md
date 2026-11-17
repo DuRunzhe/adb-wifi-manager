@@ -117,14 +117,71 @@
    `ADBWIFI_VERSION=0.0.7 ./menubar/build.sh`，点击「下载并安装」验证升级流程。
 
 2. 把预览效果与待验证点告诉用户，**等待用户确认**。
-3. 用户确认后才打 tag 发正式版（见下方发布流程）。
+3. 用户确认后才打 tag 发正式版（见下方发布流程），并且必须先跑完
+   「发布前强制检查：多语言 + 无障碍」
 4. 未确认前不要推送 tag，也不要用 `install.sh` / `get.sh` 覆盖用户已安装的正式版；
    预览只运行 `build/AdbWifiBar.app`，不要安装到 `~/Applications`。
 5. `build/` 已在 `.gitignore` 中，预览产物不要提交。
 
+## 发布前强制检查：多语言 + 无障碍
+
+**提交推送 GitHub、打 tag、出 App 包之前必须做完下面两组检查并修复发现的问题。**
+任一项不通过就不得 `git push` tag、不得创建 Release。不允许「先发再修」。
+
+### 多语言（zhHans / zhHant / en）
+
+- [ ] `python3 scripts/check-i18n.py` 通过（键集合、占位符数量、引用 key 三项自动校验）
+- [ ] UI 文案无硬编码：按钮标题、tooltip、窗口标题、可访问性标签全部走 `L.t`
+- [ ] 逻辑删除后变成孤儿的 key 已清掉（三表同步删），避免以后漏翻
+- [ ] 长文案不截断：固定宽度的按钮/标签要么允许按内容撑开（如主按钮只给
+      `>= 264` 下限），要么有 truncation 兜底；英文
+      「Download & Install Alpha vX.Y.Z」这类最长的串要专门看过
+- [ ] 逐个语言渲染「可更新 / 下载中 / 失败」关键状态截图确认排版（见下方渲染方法）
+
+### 无障碍（VoiceOver / 键盘 / 显示偏好）
+
+- [ ] 每个可点控件有可读名字：`NSButton` 用 `title`；**用 `attributedTitle` 渲染的
+      必须额外 `setAccessibilityLabel`**（AX 不会同步 attributedTitle，VoiceOver 只会
+      念一个空按钮）
+- [ ] 自绘的进度/状态提供 `accessibilityValue`，变化时发 `.valueChanged`；
+      高频更新要节流（本项目按每 10% 播报一次）
+- [ ] 纯装饰视图（应用图标、分隔线）`setAccessibilityElement(false)`，不占 AX 顺序
+- [ ] 菜单栏 `statusItem.button` 有 `accessibilityLabel` / `accessibilityHelp`，
+      **且切换语言后要重新设置**（只设一次会残留旧语言）
+- [ ] 状态/错误不只靠颜色表达，必须同时有文字
+- [ ] 文字链接可发现：用链接色，有悬停下划线 + `pointingHand` 光标；
+      **不要用灰色假装「次要链接」**（用户已明确反馈看不出能点）
+- [ ] 颜色只用语义色（深色模式自适应）；小号灰字不要用 `tertiaryLabelColor`
+      （对比度不足），用 `secondaryLabelColor`
+- [ ] 跟随系统「减少动态效果」（动画降级为静态）与「增强对比度」
+      （轨道/边框不透明度提高）
+- [ ] 键盘：主操作为默认按钮（Return）、关闭为 `Esc`、窗口设了
+      `initialFirstResponder`、Tab 顺序与视觉顺序一致
+- [ ] 至少 dump 一次 AX 属性（label / value / help / 窗口标题）并逐语言截图确认
+      「进度条不与文字重叠、无截断」
+
+### 验证方法
+
+```bash
+# 1) 编译与脚本语法
+bash -n bin/adb-wifi.sh
+swiftc -typecheck menubar/main.swift menubar/i18n.swift
+
+# 2) 多语言自动校验（必须输出 i18n OK）
+python3 scripts/check-i18n.py
+```
+
+视觉/无障碍确认需要临时预览钩子：在 `applicationDidFinishLaunching` 末尾加一段
+由环境变量（如 `ADBWIFI_PREVIEW_ABOUT=1` + `ADBWIFI_PREVIEW_STATE=`）触发的代码，
+打开关于窗口、伪造状态、再用 `cacheDisplay` 把 `contentView` 写 PNG，配合
+`-ADBWifiLanguage en|zhHant|zhHans`（NSArgumentDomain 覆盖，不污染 UserDefaults）
+逐语言渲染。**截图核对完必须把钩子删干净**（`grep TEMP-PREVIEW-HOOK` 应为空），
+不要让调试代码进发布包。
+
 ## 发布流程
 
-1. 前置：本地预览已由用户确认（见上方默认工作流）
+1. 前置：本地预览已由用户确认（见上方默认工作流），且**已完成「发布前强制检查」
+   的多语言与无障碍两组检查**（`scripts/check-i18n.py` 通过与各项人工确认）
 2. 打 tag 并推送：
 
    ```bash
@@ -133,7 +190,8 @@
    git push origin <tag>
    ```
 
-3. `.github/workflows/release.yml` 会先校验 tag 是否符合奇偶规则，不符合直接失败
+3. `.github/workflows/release.yml` 会先校验 tag 是否符合奇偶规则，不符合直接失败；
+   随后跑 `scripts/check-i18n.py`，三张文案表不一致同样直接失败
 4. 校验通过后构建 arm64 + x86_64 通用 App，生成 `AdbWifiBar-<version>-universal.zip`、
    `adb-wifi-manager-<version>.zip`、`SHA256SUMS.txt` 并创建 Release；
    带 `alpha` 后缀的自动标记为 prerelease

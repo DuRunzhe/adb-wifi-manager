@@ -120,6 +120,12 @@ jobs:
             echo "✓ 稳定版本: ${VERSION}（PATCH ${PATCH} 为单数）"
           fi
 
+      - name: 校验多语言文案
+        run: |
+          set -euo pipefail
+          # 规则见 AGENTS.md「发布前强制检查」：三张表键集合与占位符必须一致
+          python3 scripts/check-i18n.py
+
       - name: 构建通用二进制 App（arm64 + x86_64）
         run: |
           echo "构建版本: $VERSION"
