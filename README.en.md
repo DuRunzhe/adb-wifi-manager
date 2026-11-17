@@ -646,6 +646,10 @@ cannot break the check; when no Release exists it falls back to tags without a s
 Versions are compared segment by segment: for the same core version, stable > pre-release;
 pre-release suffixes are compared numerically (`alpha.10 > alpha.9`).
 
+- **Window layout**: icon · name · version (tabular digits) · one-line blurb · primary
+  button · Alpha entry · separator · external links · close. Every state (progress,
+  stage, failure/retry) lives on the primary button itself, with no extra status line;
+  details go into the tooltip
 - **Opening About auto-checks the stable channel** (throttled to once per 60 s); the
   result is shown directly on the button, never in a popup:
   "Up to date, click to recheck" / "Check failed, click to retry" /
@@ -653,9 +657,53 @@ pre-release suffixes are compared numerically (`alpha.10 > alpha.9`).
 - **One-click auto-update**: downloads `AdbWifiBar-<version>-universal.zip`, verifies
   the signature and notarization with `spctl`, then waits for the current process to
   exit, replaces `~/Applications/AdbWifiBar.app`, and relaunches it
-- **The Alpha entry is a blue underlined hyperlink**: clicking it checks the
-  pre-release channel; when one exists the link becomes "Download Alpha vX.Y.Z" and a
-  second click opens the download page; results appear in the status line
+- **Progress and stages reuse the same button**: while downloading the button reads
+  "Downloading 43%" and a progress bar is drawn along the bottom edge of the button —
+  the fill eases forward (~0.2 s) and collapses once it reaches 100%. The blue default
+  button gets a white bar; when the window loses focus the button turns grey and the
+  bar switches back to the accent colour, so it stays visible on both backgrounds. The
+  total length comes from the release metadata (`assets[].size`) first, falling back to
+  the `Content-Length` of the final hop, which curl writes to a header file via `-D`;
+  only when both are unavailable does the fill sweep back and forth and the label
+  degrade to "Downloading…". Afterwards it switches to "Unpacking & verifying…" →
+  "Installing…". No popups, no extra controls (falls back to a static bar when Reduce
+  Motion is on)
+- **Every text link is discoverable**: the Alpha entry and the Project Home / Report an
+  Issue / Releases links all use `linkColor`, plus an underline on hover and a pointing
+  hand cursor. Using grey for "secondary links" made them read as plain text, so that
+  approach was dropped
+- **The Alpha entry** checks the pre-release channel; when one exists the primary button
+  takes over as "Download & Install Alpha vX.Y.Z" and install progress shows on the same
+  button, while the link only says "Downloading and installing…" and keeps the tag in
+  its tooltip
+
+### Localization & accessibility
+
+- **Three aligned tables**: `zhHans` / `zhHant` / `en` with 331 entries each; key sets and
+  `%@` placeholder counts must match exactly. `python3 scripts/check-i18n.py` verifies
+  this, and the release workflow runs it on every tag, failing the build on mismatch
+  (rule: AGENTS.md, "发布前强制检查")
+- **Content-sized button**: the primary button only gets a 264 lower bound, so longer
+  English strings like "Download & Install Alpha v0.0.6-alpha.3" widen it instead of
+  being clipped (`lineBreakMode = .byTruncatingTail` stays as a safety net)
+- **Colour**: semantic colours only (`secondaryLabelColor` / `linkColor` /
+  `controlAccentColor`), so dark mode is automatic; progress and failure states always
+  carry text, never colour alone
+- **VoiceOver**:
+  - the primary button is a plain `NSButton` whose title tracks the state; the custom
+    progress bar exposes `accessibilityValue` (e.g. `43%`) and posts `.valueChanged`
+    once per 10% so it does not spam the reader
+  - the Alpha entry renders via `attributedTitle`, which does not sync to AX, so its
+    `accessibilityLabel` is set explicitly — otherwise VoiceOver would announce an empty
+    button
+  - the app icon and the separator are marked as decorative (skipped in the AX order);
+    the menu bar item gets `accessibilityLabel` / `accessibilityHelp`
+  - button tooltips surface as AX help, so failure details remain audible
+- **Motion & contrast**: with Reduce Motion the bar only updates statically; with
+  Increase Contrast the track opacity goes 0.22 → 0.35 (0.30 → 0.45 for the white bar
+  on the blue button)
+- **Keyboard**: the primary button is the default button (Return), close is `Esc`, the
+  initial focus is the primary button, Tab order is primary → Alpha → links → close
 
 ### Releasing
 
