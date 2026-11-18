@@ -578,6 +578,7 @@ VIA=known
 | | `NET_CHANNEL_STRONGEST` | 同信道最强干扰：`名称\|信号dBm`；名称打码时只给 `信号dBm`，无则整行不输出 |
 | | `NET_CHANNEL_BEST` | 建议信道：`信道\|该信道AP数` |
 | | `NET_MAC_PHY` / `NET_MAC_BW` / `NET_MAC_MCS` | Wi-Fi 模式 / 信道带宽(MHz) / MCS 索引 |
+| | `NET_MAC_BAND` / `NET_MAC_FREQ` | Mac 当前频段(`2.4`/`5`/`6` GHz) / 信道中心频率(MHz) |
 | | `NET_MAC_NOISE` / `NET_MAC_SNR` | 噪声底(dBm) / 信噪比(dB)，SNR = RSSI − NOISE |
 | | `NET_WIFI_RTT_AVG/_MIN/_MAX` | 到网关的实测延迟(ms)，纯 Wi-Fi 段 |
 | | `NET_WIFI_JITTER` / `NET_WIFI_LOSS` | 抖动(ms，max−min) / 丢包率(%) |

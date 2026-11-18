@@ -235,6 +235,8 @@ struct Status {
     // ---- 链路质量（多设备：每台一份；Mac 侧全局一份）----
     var devLinks: [DevLink] = []
     var macChannel = ""
+    /// Mac 侧当前网络所在频段（2.4 / 5 / 6，单位 GHz）与信道中心频率（MHz）
+    var macBand = "", macFreq = ""
     var macRate = ""
     var macRSSI = ""
     var macBattery = ""
@@ -342,6 +344,8 @@ func loadStatus() -> Status {
     s.rateTotalUp = kv["RATE_TOTAL_UP_MB"] ?? ""
 
     s.macChannel = kv["NET_MAC_CHANNEL"] ?? ""
+    s.macBand = kv["NET_MAC_BAND"] ?? ""
+    s.macFreq = kv["NET_MAC_FREQ"] ?? ""
     s.macRate = kv["NET_MAC_RATE"] ?? ""
     s.macRSSI = kv["NET_MAC_RSSI"] ?? ""
     s.macTheo = kv["NET_MAC_THEO"] ?? ""
@@ -1006,10 +1010,54 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return (1, L.t("jitter.grade.bad"))
     }
 
+    /// 频段展示：脚本给的是 GHz 整数（"2" / "5" / "6"），2.4G 统一写成 2.4
+    func bandText(_ band: String) -> String {
+        switch band {
+        case "2", "2.4": return L.t("wifi.link.band", "2.4")
+        case "5", "5.0": return L.t("wifi.link.band", "5")
+        case "6", "6.0": return L.t("wifi.link.band", "6")
+        default: return ""
+        }
+    }
+
+    /// 手机上报的是频率（MHz，如 5745），据此反推频段；没有频率就不猜
+    func bandTextFromFreq(_ freq: String) -> String {
+        guard let f = Double(freq), f > 0 else { return "" }
+        if f >= 5925 { return L.t("wifi.link.band", "6") }
+        if f >= 4900 { return L.t("wifi.link.band", "5") }
+        if f >= 2400 { return L.t("wifi.link.band", "2.4") }
+        return ""
+    }
+
     /// 纯 Wi-Fi 质量区（Mac ↔ AP），与下方 adb 链路质量刻意分开
     func wifiQualityLines(_ s: Status) -> [(String, String?)] {
         var out: [(String, String?)] = []
-        guard !s.macPHY.isEmpty || !s.wifiRTT.isEmpty else { return out }
+        guard !s.macPHY.isEmpty || !s.wifiRTT.isEmpty
+                || !s.macChannel.isEmpty || !s.macBand.isEmpty else { return out }
+
+        // ﹣ 无线链路本身：频段 / 信道 / 频率 / 带宽 / PHY 制式
+        // 这些是「为什么快 / 为什么慢」的物理前提，以前只写在 tooltip 里，
+        // 菜单上只看得到信道号，既无频段也无单位。
+        let band = bandText(s.macBand)
+        var physical: [String] = []
+        // AP 名字（Mac 侧 SSID）：macOS 14+ 需定位权限才读得到，读不到就不占位
+        if !s.macSSID.isEmpty { physical.append(s.macSSID) }
+        if !s.macPHY.isEmpty { physical.append(s.macPHY) }
+        if !band.isEmpty { physical.append(band) }
+        if !s.macChannel.isEmpty {
+            physical.append(s.macFreq.isEmpty
+                ? L.t("wifi.link.channel", s.macChannel)
+                : L.t("wifi.link.channelFreq", s.macChannel, s.macFreq))
+        }
+        if !s.macBW.isEmpty { physical.append(L.t("wifi.link.bw", s.macBW)) }
+        if !physical.isEmpty {
+            out.append((L.t("wifi.link.line", physical.joined(separator: " · ")),
+                        L.t("wifi.link.tip",
+                            s.macPHY.isEmpty ? "-" : s.macPHY,
+                            band.isEmpty ? "-" : band,
+                            s.macChannel.isEmpty ? "-" : s.macChannel,
+                            s.macBW.isEmpty ? "-" : s.macBW)))
+        }
 
         // ⓪ 带宽三口径：理论峰值 / 当前协商 / 实际可用
         if let theo = Double(s.macTheo), theo > 0 {
@@ -1058,6 +1106,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                            String(format: "%.1f", j), jl.label)
             }
             out.append((line, L.t("wifi.rtt.tip", s.wifiLoss.isEmpty ? "-" : s.wifiLoss)))
+        } else if !s.wifiLoss.isEmpty {
+            // 网关全丢包（路由器禁 ICMP / AP 隔离）时以前整行消失，看起来像「数据没采到」。
+            // 必须明说「没有回应」而不是什么也不显示。
+            out.append((L.t("wifi.rtt.lost", s.wifiLoss), L.t("wifi.rtt.lost.tip")))
         }
         return out
     }
@@ -1166,9 +1218,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
             // ---- AP 信息 ----
-            if !link.ssid.isEmpty {
-                let ch = link.channel.isEmpty ? "-" : link.channel
-                let freq = link.freq.isEmpty ? "-" : link.freq
+            // 以前整行挂在 SSID 上：读不到 SSID（手机在切换、权限受限）时，
+            // 频段 / 信道 / BSSID 这些仍然有用的信息也一起消失。现在只要有任一项就显示。
+            if !link.ssid.isEmpty || !link.channel.isEmpty
+                || !link.freq.isEmpty || !link.bssid.isEmpty {
+                let band = bandTextFromFreq(link.freq)
+                // 频段与频率都带单位：以前写 "信道 149 · 5745 MHz"，看不出 2.4 / 5 / 6G
+                var apParts: [String] = []
+                if !band.isEmpty { apParts.append(band) }
+                if !link.channel.isEmpty {
+                    apParts.append(link.freq.isEmpty
+                        ? L.t("wifi.link.channel", link.channel)
+                        : L.t("wifi.link.channelFreq", link.channel, link.freq))
+                } else if !link.freq.isEmpty {
+                    apParts.append(L.t("net.ap.freqOnly", link.freq))
+                }
                 // BSSID 是区分「同一 SSID 下的不同 AP」的唯一依据：
                 // 两台手机 BSSID 相同 = 接在同一个 AP 上，互传延迟最低；
                 // 不同则跨 AP 转发，RTT 会明显变高。
@@ -1182,9 +1246,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         ? "…" + parts.suffix(2).joined(separator: ":")
                         : link.bssid
                 }
-                out.append(("    " + L.t("net.ap.line", link.ssid, ch, freq, bssidShort),
+                apParts.append("BSSID " + bssidShort)
+                let apDetails = apParts.joined(separator: " · ")
+                out.append(("    " + L.t("net.ap.line",
+                                         link.ssid.isEmpty ? "-" : link.ssid, apDetails),
                             L.t("net.ap.tip", link.bssid.isEmpty ? "-" : link.bssid,
-                                s.macChannel.isEmpty ? "-" : s.macChannel)))
+                                s.macChannel.isEmpty ? "-" : s.macChannel,
+                                band.isEmpty ? "-" : band)))
             }
         } else {
             // USB 设备：走本地总线，不存在网络往返；也拿不到无线指标
@@ -1602,8 +1670,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             case "medium": crowdText = L.t("chan.crowd.medium")
             default:       crowdText = L.t("chan.crowd.low")
             }
-            let line = L.t("chan.line", s.macChannel.isEmpty ? "-" : s.macChannel,
-                           String(aps), crowdText)
+            // 信道号与频率已在上面的「无线链路」行说过，这行只说拥挤度，不重复。
+            let line = L.t("chan.line", String(aps), crowdText)
             // 协议里 STRONGEST / BEST 形如 "名称|-54" / "40|0"，直接塞进文案会把
             // 竖线也显示给用户，只取需要的那一段。
             // macOS 15+ 不再上报周边 AP 信号，此时没有「最强干扰」可列。

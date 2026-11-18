@@ -1959,6 +1959,20 @@ fmt_rate() {
 NETINFO_CACHE="$STATE_DIR/netinfo.cache"
 NETINFO_TTL="${NETINFO_TTL:-60}"
 
+# 信道号 → 中心频率（MHz）。2.4G / 5G / 6G 的信道编号互相重叠，
+# 必须同时给频段才能解出唯一的频率，所以 band 是必填参数（2 / 5 / 6）。
+net_channel_to_freq() {
+    local ch="${1:-}" band="${2:-}"
+    case "$ch" in ''|*[!0-9]*) echo ""; return 0 ;; esac
+    ch=$(( 10#$ch ))   # 去前导 0，避免被当成八进制
+    case "$band" in
+        2|2.4) if [ "$ch" -eq 14 ]; then echo 2484; else echo $(( 2407 + 5 * ch )); fi ;;
+        5)     echo $(( 5000 + 5 * ch )) ;;
+        6)     echo $(( 5950 + 5 * ch )) ;;
+        *)     echo "" ;;
+    esac
+}
+
 # 频率 → 信道号（仅覆盖常见 2.4G / 5G）
 net_freq_to_channel() {
     local f="${1:-0}"
@@ -2076,6 +2090,8 @@ NETINFO_MAC_TTL="${NETINFO_MAC_TTL:-300}"
 # 足够统计「当前信道上有几个 AP 在争、最强的是谁」。
 #
 # 结果写入 Mac 侧缓存（与 NET_MAC_* 共用 300 秒 TTL），字段：
+#   NET_MAC_BAND          当前网络所在频段（2 / 5 / 6，单位 GHz）
+#   NET_MAC_FREQ          当前信道中心频率（MHz，由信道 + 频段推出）
 #   NET_CHANNEL_APS       当前信道上的 AP 总数（含自己）
 #   NET_CHANNEL_CROWD     竞争强度等级：low / medium / high
 #   NET_CHANNEL_STRONGEST 同信道最强的其他 AP 名称与信号
@@ -2210,10 +2226,11 @@ net_channel_scan() {
     cur_section=$(printf '%s\n' "$sp" | sed -n '/Current Network Information/,/Other Local/p')
     cur_ch=$(printf '%s\n' "$cur_section" | sed -n 's/.*Channel: \([0-9]*\).*/\1/p' | head -1)
     [ -z "$cur_ch" ] && return 0
+    # 带宽 / 频段不能写死 5GHz：6GHz 网络下旧正则匹配不到，带宽和频率全空。
     cur_bw=$(printf '%s\n' "$cur_section" \
-        | sed -n 's/.*Channel: [0-9]* (5GHz, \([0-9]*\)MHz).*/\1/p' | head -1)
+        | sed -n 's/.*Channel: [0-9]* ([^)]*, \([0-9]*\)MHz).*/\1/p' | head -1)
     cur_band=$(printf '%s\n' "$cur_section" \
-        | sed -n 's/.*Channel: [0-9]* (\([0-9]\)GHz.*/\1/p' | head -1)
+        | sed -n 's/.*Channel: [0-9]* (\([0-9.]*\)GHz.*/\1/p' | head -1)
     cur_ssid=$(printf '%s\n' "$cur_section" | sed -n 's/^ *\([^ ]*\):$/\1/p' | head -1)
 
     # 输出周边 AP 每行："信道|频段|带宽|信号|名称"
@@ -2307,6 +2324,10 @@ net_channel_scan() {
     else crowd=high
     fi
 
+    # 频段与频率：App/TUI 展示「无线链路」那一行要用（信道号单独看无法判断 2.4 / 5 / 6G）。
+    # 恒输出（可能为空），TTL 校验靠 KEY 是否存在判断旧缓存是否缺字段。
+    echo "NET_MAC_BAND=$cur_band"
+    echo "NET_MAC_FREQ=$(net_channel_to_freq "$cur_ch" "$cur_band")"
     echo "NET_CHANNEL_APS=$aps"
     echo "NET_CHANNEL_CROWD=$crowd"
     local strong best
@@ -2333,6 +2354,12 @@ net_mac_link_collect() {
     # 导致"同 AP"判定一直返回 unknown）。缺关键字段时视为失效，强制重采。
     if [ -f "$NETINFO_MAC_CACHE" ] && [ "$age" -lt "$NETINFO_MAC_TTL" ]; then
         case "$(grep -c '^NET_MAC_SSID=' "$NETINFO_MAC_CACHE" 2>/dev/null)" in
+            1) ;;
+            *) age=$NETINFO_MAC_TTL ;;
+        esac
+        # NET_MAC_BAND / NET_MAC_FREQ 是后加的：旧缓存里没有会让「无线链路」行
+        # 一直只显示信道号，看起来像新功能没生效。
+        case "$(grep -c '^NET_MAC_BAND=' "$NETINFO_MAC_CACHE" 2>/dev/null)" in
             1) ;;
             *) age=$NETINFO_MAC_TTL ;;
         esac

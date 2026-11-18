@@ -173,6 +173,9 @@ class State:
         return {
             "phy": r.get("NET_MAC_PHY", ""),
             "bw": r.get("NET_MAC_BW", ""),
+            "band": r.get("NET_MAC_BAND", ""),
+            "freq": r.get("NET_MAC_FREQ", ""),
+            "channel": r.get("NET_MAC_CHANNEL", ""),
             "mcs": r.get("NET_MAC_MCS", ""),
             "rssi": r.get("NET_MAC_RSSI", ""),
             "noise": r.get("NET_MAC_NOISE", ""),
@@ -221,6 +224,8 @@ class State:
             "ssid": self.raw.get("NET_MAC_SSID", ""),
             "rate": self.raw.get("NET_MAC_RATE", ""),
             "channel": self.raw.get("NET_MAC_CHANNEL", ""),
+            "band": self.raw.get("NET_MAC_BAND", ""),
+            "freq": self.raw.get("NET_MAC_FREQ", ""),
             "rssi": self.raw.get("NET_MAC_RSSI", ""),
             "battery": self.raw.get("NET_MAC_BATTERY", ""),
             "power": self.raw.get("NET_MAC_POWER", ""),
@@ -691,6 +696,50 @@ def link_rate_text(mbps):
     return "%.2f" % mbs
 
 
+def band_text(band):
+    """频段展示：脚本给的是 GHz 整数（"2" / "5" / "6"），2.4G 统一写成 2.4"""
+    return {"2": "2.4", "2.4": "2.4", "5": "5", "5.0": "5",
+            "6": "6", "6.0": "6"}.get(str(band or "").strip(), "")
+
+
+def band_from_freq(freq):
+    """手机只上报频率（MHz），据它反推频段；没有合法频率就不猜"""
+    try:
+        f = float(freq)
+    except (TypeError, ValueError):
+        return ""
+    if f >= 5925:
+        return "6"
+    if f >= 4900:
+        return "5"
+    if f >= 2400:
+        return "2.4"
+    return ""
+
+
+def radio_link_text(wq):
+    """拼出「无线链路」一行：PHY · 频段 · 信道（频率）· 带宽。
+
+    以前这几项只写在缓冲悬停提示里，终端界面什么都看不到。
+    """
+    if not wq:
+        return ""
+    parts = []
+    if wq.get("phy"):
+        parts.append(wq["phy"])
+    _band = band_text(wq.get("band"))
+    if _band:
+        parts.append("%s GHz" % _band)
+    if wq.get("channel"):
+        if wq.get("freq"):
+            parts.append("信道 %s（%s MHz）" % (wq["channel"], wq["freq"]))
+        else:
+            parts.append("信道 %s" % wq["channel"])
+    if wq.get("bw"):
+        parts.append("带宽 %s MHz" % wq["bw"])
+    return " · ".join(parts)
+
+
 def dwidth(text):
     """字符串在终端上的显示宽度"""
     w = 0
@@ -1001,6 +1050,11 @@ class App:
             # 纯 Wi-Fi 质量（Mac ↔ AP）：与 adb 链路分开，所有无线设备都受它影响
             wq = st.wifi_quality
             if wq:
+                # 无线链路物理参数：以前只在菜单栏的 tooltip 里，终端看不到
+                _link = radio_link_text(wq)
+                if _link and y < h - 6:
+                    self.addstr(y, 2, "无线链路 %s" % _link, curses.color_pair(C_DIM))
+                    y += 1
                 # 带宽三口径：理论峰值 / 当前协商 / 实际可用
                 try:
                     _theo = float(wq["theo"])
@@ -1009,7 +1063,7 @@ class App:
                     _ra = int(float(wq["rate_ratio"]))
                     _rl = "接近满速" if _ra >= 80 else ("部分降级" if _ra >= 50 else "严重降级")
                     _rs = 3 if _ra >= 80 else (2 if _ra >= 50 else 1)
-                    self.addstr(y, 2, "带宽 %s 理论 %.0f MB/s · 当前协商 %.1f · 实际可用 %.0f MB/s（达成率 %d%% %s）" % (
+                    self.addstr(y, 2, "带宽 %s 理论 %.0f MB/s · 当前协商 %.1f MB/s · 实际可用 %.0f MB/s（达成率 %d%% %s）" % (
                         meter(_rs, 3), _theo / 8, _now / 8, _us / 8, _ra, _rl),
                         curses.color_pair(C_INFO))
                     y += 1
@@ -1019,8 +1073,8 @@ class App:
                 try:
                     _snr = float(wq["snr"])
                     _sstep, _slbl = snr_grade(_snr)
-                    self.addstr(y, 2, "Wi-Fi %s %s · 信噪比 %.0f dB %s" % (
-                        wq["phy"] or "", ("%s MHz" % wq["bw"]) if wq["bw"] else "",
+                    # PHY / 带宽已经在上面的「无线链路」行给过，这里只说信噪比
+                    self.addstr(y, 2, "Wi-Fi 信噪比 %.0f dB %s" % (
                         _snr, meter(_sstep, 5)), curses.color_pair(C_INFO))
                     y += 1
                     if wq["rtt"]:
@@ -1036,6 +1090,11 @@ class App:
                         self.addstr(y, 2, "  Wi-Fi 延迟 %.1f ms %s%s" % (
                             _r, meter(_rs, 3), _jd), curses.color_pair(C_DIM))
                         y += 1
+                    elif wq["loss"] and y < h - 6:
+                        # 网关禁 ICMP 时全丢包：明确说"没有回应"，而不是什么都不显示
+                        self.addstr(y, 2, "  Wi-Fi 延迟 网关没有回应（丢包 %s%%）" % wq["loss"],
+                                    curses.color_pair(C_WARN))
+                        y += 1
                 except ValueError:
                     pass
 
@@ -1043,7 +1102,7 @@ class App:
             cc = st.channel_crowd
             if cc:
                 _lbl = {"low": "空闲", "medium": "一般", "high": "拥挤"}.get(cc["crowd"], "?")
-                _txt = "信道: %s  拥挤度: %d 个 AP（%s）" % (cc["channel"] or "-", cc["aps"], _lbl)
+                _txt = "同信道 AP: %d 个（%s）" % (cc["aps"], _lbl)
                 _attr = (curses.color_pair(C_WARN) if cc["crowd"] == "high"
                          else curses.color_pair(C_DIM))
                 self.addstr(y, 2, _txt, _attr)
@@ -1220,14 +1279,18 @@ class App:
 
                     # 窄终端放不下 AP 行时不显示，避免挤占诊断区
                     # BSSID 末段用于判断两台设备是否接在同一 AP（与菜单栏一致）
-                    if d["ssid"] and w >= 78 and y < h - 8:
+                    # 不把整行挂在 SSID 上：读不到 SSID 时频段/信道/BSSID 仍值得看
+                    if ((d["ssid"] or d.get("channel") or d.get("freq")
+                         or d.get("bssid")) and w >= 78 and y < h - 8):
                         bssid_short = "-"
                         if d.get("bssid"):
                             parts = d["bssid"].split(":")
                             bssid_short = ("…" + ":".join(parts[-2:])
                                            if len(parts) >= 2 else d["bssid"])
-                        line_ap = "AP %s · 信道 %s · %s MHz · BSSID %s" % (
-                            d["ssid"], d["channel"] or "-", d["freq"] or "-", bssid_short)
+                        line_ap = "AP %s · %s · 信道 %s（%s MHz）· BSSID %s" % (
+                            d["ssid"] or "-", (band_from_freq(d.get("freq")) + " GHz"
+                                               if band_from_freq(d.get("freq")) else "-"),
+                            d["channel"] or "-", d["freq"] or "-", bssid_short)
                         self.addstr(y, 4, line_ap, curses.color_pair(C_DIM))
                         y += 1
                     # 该设备的操作：与菜单栏设备子菜单一一对应。
@@ -1255,7 +1318,9 @@ class App:
                 except ValueError:
                     mac_rate = ml["rate"]
                 mac = "Mac  最高速度 %s · 信号 %s · 信道 %s" % (
-                    mac_rate, ml["rssi"] or "-", ml["channel"] or "-")
+                    mac_rate, ml["rssi"] or "-",
+                    ("%s（%s MHz）" % (ml["channel"], ml["freq"])
+                     if ml.get("channel") and ml.get("freq") else (ml["channel"] or "-")))
                 if ml["battery"]:
                     pw = {"charging": "充电中", "charged": "已充满",
                           "ac": "外接电源"}.get(ml["power"], "使用电池")
@@ -1968,13 +2033,17 @@ def cli_fallback():
                     "flaky": "无响应重试中", "blocked": "被屏蔽"}.get(_ms, "未知"))
     # 纯 Wi-Fi 质量（Mac ↔ AP）
     wq = st.wifi_quality
+    if wq:
+        _link = radio_link_text(wq)
+        if _link:
+            print("无线链路:", _link)
     if wq and wq["theo"]:
         try:
             _t = float(wq["theo"]); _n = float(wq["rate_now"])
             _u = float(wq["rate_usable"]); _r = int(float(wq["rate_ratio"]))
             _lb = "接近满速" if _r >= 80 else ("部分降级" if _r >= 50 else "严重降级")
             _s = 3 if _r >= 80 else (2 if _r >= 50 else 1)
-            print("带宽: %s 理论 %.0f MB/s · 当前协商 %.1f · 实际可用 %.0f MB/s（达成率 %d%% %s）" % (
+            print("带宽: %s 理论 %.0f MB/s · 当前协商 %.1f MB/s · 实际可用 %.0f MB/s（达成率 %d%% %s）" % (
                 meter(_s, 3), _t / 8, _n / 8, _u / 8, _r, _lb))
         except ValueError:
             pass
@@ -1982,9 +2051,7 @@ def cli_fallback():
         try:
             _snr = float(wq["snr"])
             _ss, _sl = snr_grade(_snr)
-            print("Wi-Fi: %s %s · 信噪比 %.0f dB %s %s" % (
-                wq["phy"] or "", ("%s MHz" % wq["bw"]) if wq["bw"] else "",
-                _snr, meter(_ss, 5), _sl))
+            print("Wi-Fi 信噪比: %.0f dB %s %s" % (_snr, meter(_ss, 5), _sl))
             if wq["rtt"]:
                 _r = float(wq["rtt"])
                 _rs, _rl = wifi_rtt_grade(_r)
@@ -1993,14 +2060,15 @@ def cli_fallback():
                     _extra = " · 抖动 %s ms %s" % (
                         wq["jitter"], jitter_grade(float(wq["jitter"])))
                 print("      延迟 %.1f ms %s %s%s" % (_r, meter(_rs, 3), _rl, _extra))
+            elif wq["loss"]:
+                print("      延迟 网关没有回应（丢包 %s%%）" % wq["loss"])
         except ValueError:
             pass
     # 信道拥塞：信号好但延迟抖动大时，最常见的根因
     cc = st.channel_crowd
     if cc:
         _lbl = {"low": "空闲", "medium": "一般", "high": "拥挤"}.get(cc["crowd"], "?")
-        print("信道: %s  拥挤度: %d 个 AP（%s）" % (
-            cc["channel"] or "-", cc["aps"], _lbl))
+        print("同信道 AP: %d 个（%s）" % (cc["aps"], _lbl))
         if cc["crowd"] == "high":
             _st = cc["strongest"].replace("|", " ")
             _bs = cc["best"].replace("|", "（空闲 ")
@@ -2066,14 +2134,16 @@ def cli_fallback():
                     print("    速度 上限 %s MB/s · 平均 %s MB/s · 最大 %s MB/s（%s %.0f%%）" % (
                         ceil_txt, avg_txt, link_rate_text(peak_v),
                         grade or "-", usage_v or 0))
-            if d["ssid"]:
+            if d["ssid"] or d.get("channel") or d.get("freq") or d.get("bssid"):
                 bssid_short = "-"
                 if d.get("bssid"):
                     bparts = d["bssid"].split(":")
                     bssid_short = ("…" + ":".join(bparts[-2:])
                                    if len(bparts) >= 2 else d["bssid"])
-                print("    AP %s · 信道 %s · %s MHz · BSSID %s" % (
-                    d["ssid"], d["channel"] or "-", d["freq"] or "-", bssid_short))
+                print("    AP %s · %s · 信道 %s（%s MHz）· BSSID %s" % (
+                    d["ssid"] or "-", (band_from_freq(d.get("freq")) + " GHz"
+                                       if band_from_freq(d.get("freq")) else "-"),
+                    d["channel"] or "-", d["freq"] or "-", bssid_short))
 
     print()
     for iss in issues:

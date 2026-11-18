@@ -587,6 +587,7 @@ so many devices cannot trigger a network storm.
 | | `NET_CHANNEL_STRONGEST` | Strongest same-channel interferer: `name\|signal dBm`; signal only when the name is redacted; line omitted when unknown |
 | | `NET_CHANNEL_BEST` | Suggested channel: `channel\|AP count on it` |
 | | `NET_MAC_PHY` / `NET_MAC_BW` / `NET_MAC_MCS` | Wi-Fi mode / channel width (MHz) / MCS index |
+| | `NET_MAC_BAND` / `NET_MAC_FREQ` | Mac current band (`2.4`/`5`/`6` GHz) / channel centre frequency (MHz) |
 | | `NET_MAC_NOISE` / `NET_MAC_SNR` | Noise floor (dBm) / SNR (dB) = RSSI − NOISE |
 | | `NET_WIFI_RTT_AVG/_MIN/_MAX` | Measured latency to the gateway (ms) — pure Wi-Fi hop |
 | | `NET_WIFI_JITTER` / `NET_WIFI_LOSS` | Jitter (ms, max−min) / packet loss (%) |
